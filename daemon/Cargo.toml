@@ -26,4 +26,4 @@ license-file = "../LICENSE"
 depends = "$auto, libapt-pkg7.0"
 section = "utils"
 priority = "optional"
-systemd-units = "cobblerd.service"
+systemd-units = { unit-name = "cobblerd.service" }
