@@ -58,7 +58,9 @@ jobs:
           fi
 
       - name: Install cargo-deb
-        uses: taiki-e/install-action@cargo-deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
 
       - name: Build and package
         env:
