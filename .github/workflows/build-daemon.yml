@@ -2,40 +2,80 @@ name: Build Daemon
 
 on:
   workflow_dispatch:
+
 jobs:
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    container:
+      image: rust:1.92-trixie
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
-            platform: linux/amd64
+            target: x86_64-unknown-linux-gnu
+            apt_arch: amd64
+            pkg_config_path: /usr/lib/x86_64-linux-gnu/pkgconfig
           - arch: arm64
-            platform: linux/arm64
+            target: aarch64-unknown-linux-gnu
+            apt_arch: arm64
+            gcc_pkg: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
           - arch: aarch64
-            platform: linux/arm64
+            target: aarch64-unknown-linux-gnu
+            apt_arch: arm64
+            gcc_pkg: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
           - arch: armhf
-            platform: linux/arm/v7
+            target: armv7-unknown-linux-gnueabihf
+            apt_arch: armhf
+            gcc_pkg: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+            cc: arm-linux-gnueabihf-gcc
+            cxx: arm-linux-gnueabihf-g++
+            pkg_config_path: /usr/lib/arm-linux-gnueabihf/pkgconfig
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y pkg-config build-essential
+          if [ "${{ matrix.apt_arch }}" != "amd64" ]; then
+            dpkg --add-architecture ${{ matrix.apt_arch }}
+            apt-get update
+            apt-get install -y ${{ matrix.gcc_pkg }} libapt-pkg-dev:${{ matrix.apt_arch }}
+          else
+            apt-get install -y libapt-pkg-dev
+          fi
+
+      - name: Install cargo-deb
+        uses: taiki-e/install-action@cargo-deb
 
       - name: Build and package
+        env:
+          PKG_CONFIG_ALLOW_CROSS: 1
+          PKG_CONFIG_PATH: ${{ matrix.pkg_config_path }}
         run: |
-          mkdir -p dist/${{ matrix.arch }}
-          docker buildx build \
-            --platform ${{ matrix.platform }} \
-            --file daemon/Containerfile.build \
-            --output type=local,dest=dist/${{ matrix.arch }} \
-            .
+          if [ -n "${{ matrix.cc }}" ]; then
+            TARGET_UPPER=$(echo ${{ matrix.target }} | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+            export CARGO_TARGET_${TARGET_UPPER}_LINKER=${{ matrix.cc }}
+            export CC=${{ matrix.cc }}
+            export CXX=${{ matrix.cxx }}
+          fi
+          
+          cd daemon
+          cargo deb --target ${{ matrix.target }}
+          mkdir -p ../dist/${{ matrix.arch }}
+          cp target/${{ matrix.target }}/debian/*.deb ../dist/${{ matrix.arch }}/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
