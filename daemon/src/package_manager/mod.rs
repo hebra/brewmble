@@ -9,7 +9,12 @@ pub trait PackageManager: Send + Sync {
 }
 
 pub mod apt;
+pub mod brew;
 
 pub fn get_package_manager() -> Box<dyn PackageManager> {
+    let brew = brew::Brew;
+    if brew.is_available() {
+        return Box::new(brew);
+    }
     Box::new(apt::Apt)
 }

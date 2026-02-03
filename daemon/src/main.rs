@@ -110,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let pm = get_package_manager();
+    info!("using {} package manager backend", pm.name());
     if !pm.is_available() {
         warn!("The current package manager ({}) is not available on this system.", pm.name());
     }
@@ -399,11 +400,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_handler_non_linux() {
-        // This test will likely run on non-linux (macOS) in this environment
-        // but we can't easily fake the output of `Command::new("apt")` without mocking.
-        // For now, let's just ensure it compiles and runs.
         let pm = get_package_manager();
         let pm_name = pm.name().to_string();
+        let is_available = pm.is_available();
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
@@ -418,18 +417,15 @@ mod tests {
             .await
             .unwrap();
 
-        // On macOS/Darwin, apt won't be available
-        #[cfg(target_os = "macos")]
-        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-        
-        let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        let status: StatusResponse = serde_json::from_slice(&body).unwrap();
-        
-        #[cfg(target_os = "macos")]
-        {
+        if !is_available {
+            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            let status: StatusResponse = serde_json::from_slice(&body).unwrap();
             assert_eq!(status.message, format!("the system is not a {} system", pm_name));
             assert!(status.updates.is_empty());
             assert!(!status.is_upgrading);
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
         }
     }
 
@@ -437,6 +433,7 @@ mod tests {
     async fn test_full_upgrade_handler_non_linux() {
         let pm = get_package_manager();
         let pm_name = pm.name().to_string();
+        let is_available = pm.is_available();
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
@@ -457,13 +454,13 @@ mod tests {
             .await
             .unwrap();
 
-        // On macOS/Darwin, apt won't be available
-        #[cfg(target_os = "macos")]
-        {
+        if !is_available {
             assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
             let body = to_bytes(response.into_body(), 1024).await.unwrap();
             let res: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(res["message"], format!("the system is not a {} system", pm_name));
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
         }
     }
 
