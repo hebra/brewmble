@@ -1,12 +1,14 @@
 # Cobbler Daemon
 
-The Cobbler Daemon (`cobblerd`) is a background service that runs on managed Linux nodes. It provides a REST API for system status and package management, specifically targeting Debian-based systems using APT.
+The Cobbler Daemon (`cobblerd`) is a background service that runs on managed nodes. It provides a REST API for system status and package management, supporting multiple backends like APT (Linux) and Homebrew (macOS).
 
 ## Features
 
 - **mDNS Registration**: Automatically announces itself on the local network as `_cobbler._tcp`.
+- **Multi-backend Support**: Automatically detects and uses the available package manager (APT or Homebrew).
 - **System Status**: Reports whether the system is up-to-date and lists available updates.
-- **Package Management**: Can trigger a full system upgrade via APT.
+- **Package Management**: Can trigger a full system upgrade via the detected package manager.
+- **Authentication**: Secure access via API keys.
 - **Port Hunting**: Automatically finds an available port starting from 8080 if not specified.
 
 ## Installation
@@ -37,7 +39,16 @@ Environment variables can be used for configuration:
 - `COBBLER_DAEMON_PORT`: Port to listen on.
 - `COBBLER_DAEMON_HOSTNAME`: Hostname to use for mDNS registration.
 - `COBBLER_DAEMON_IP`: Explicit IP address to use for mDNS registration.
+- `COBBLER_DAEMON_API_KEY`: API key for authentication. If not provided, one will be generated on startup and printed to the logs.
 - `RUST_LOG`: Logging level (e.g., `info`, `debug`).
+
+## Authentication
+
+All API endpoints require authentication via an `X-API-Key` header.
+
+```bash
+curl -H "X-API-Key: your-secret-api-key" http://localhost:8080/status
+```
 
 ## API Endpoints
 
@@ -56,7 +67,7 @@ Returns the current system status.
 
 ### `POST /packages/full-upgrade`
 
-Triggers a full system upgrade (`apt full-upgrade -y`). This operation is asynchronous.
+Triggers a full system upgrade (e.g., `apt full-upgrade -y` or `brew upgrade`). This operation is asynchronous.
 
 **Response:**
 ```json

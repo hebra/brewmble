@@ -1,13 +1,14 @@
 # Cobbler
 
-Cobbler is a powerful and flexible management tool for Linux systems.
+Cobbler is a powerful and flexible management tool for Linux and macOS systems.
 It centralises and automates the process of keeping systems up-to-date.
-The main use case for Cobbler is in small Raspberry Pi clusters,
+The main use case for Cobbler is in small Raspberry Pi clusters or home labs,
 where it simplifies the maintenance of multiple devices.
 
 ## Features
 
-- **Automated Updates**: Centralised management for system updates across multiple Linux nodes.
+- **Automated Updates**: Centralised management for system updates across multiple nodes.
+- **Multi-backend Support**: Supports different package managers (currently APT and Homebrew).
 - **mDNS Discovery**: Automatic discovery of Cobbler daemons on the local network.
 - **RESTful API**: Each node provides a REST API for status and management.
 - **CLI Tool**: A unified command-line interface to manage your entire cluster.
@@ -17,7 +18,7 @@ where it simplifies the maintenance of multiple devices.
 
 Cobbler consists of several key components:
 
-- **[Cobbler Daemon](./daemon)**: A background service (`cobblerd`) that runs on each managed node. It interacts with the local package manager (APT) and exposes a REST API.
+- **[Cobbler Daemon](./daemon)**: A background service (`cobblerd`) that runs on each managed node. It interacts with the local package manager (APT or Homebrew) and exposes a REST API.
 - **[Cobbler CLI](./cli)**: A command-line tool (`cobbler`) for humans to interact with one or more daemons.
 - **Cobbler REST**: The REST API specification used for communication between components.
 - **Cobbler Web**: (In development) A web-based dashboard for cluster overview.
@@ -27,7 +28,7 @@ Cobbler consists of several key components:
 ### Prerequisites
 
 - Rust (latest stable)
-- Debian-based Linux system (for the daemon)
+- Linux (APT) or macOS (Homebrew) system
 - mDNS/Avahi support (for discovery)
 
 ### Installation
