@@ -10,7 +10,6 @@ use clap::Parser;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::Serialize;
 use std::net::{IpAddr, SocketAddr};
-use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -18,6 +17,9 @@ use std::sync::{
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+mod package_manager;
+use package_manager::{get_package_manager, PackageManager};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
@@ -46,6 +48,7 @@ struct Cli {
 struct AppState {
     is_upgrading: Arc<AtomicBool>,
     api_key: String,
+    package_manager: Arc<Box<dyn PackageManager>>,
 }
 
 #[derive(Serialize, serde::Deserialize)]
@@ -106,9 +109,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key
     };
 
+    let pm = get_package_manager();
+    if !pm.is_available() {
+        warn!("The current package manager ({}) is not available on this system.", pm.name());
+    }
+
     let state = AppState {
         is_upgrading: Arc::new(AtomicBool::new(false)),
         api_key,
+        package_manager: Arc::new(pm),
     };
 
     let app = Router::new()
@@ -157,18 +166,18 @@ async fn auth_middleware(
 
 async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let is_upgrading = state.is_upgrading.load(Ordering::SeqCst);
-    if !is_apt_available() {
+    if !state.package_manager.is_available() {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(StatusResponse {
-                message: "the system is not a Debian-based Linux system".to_string(),
+                message: format!("the system is not a {} system", state.package_manager.name()),
                 updates: Vec::new(),
                 is_upgrading,
             }),
         );
     }
 
-    match get_apt_updates() {
+    match state.package_manager.get_updates().await {
         Ok(updates) => {
             let count = updates.len();
             let message = if count == 0 {
@@ -197,11 +206,11 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn full_upgrade_handler(State(state): State<AppState>) -> impl IntoResponse {
-    if !is_apt_available() {
+    if !state.package_manager.is_available() {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(serde_json::json!({
-                "message": "the system is not a Debian-based Linux system"
+                "message": format!("the system is not a {} system", state.package_manager.name())
             })),
         );
     }
@@ -221,25 +230,10 @@ async fn full_upgrade_handler(State(state): State<AppState>) -> impl IntoRespons
 
     tokio::spawn(async move {
         info!("starting full upgrade");
-        let output = Command::new("apt")
-            .args(["full-upgrade", "-y"])
-            .output();
+        let result = state.package_manager.full_upgrade().await;
 
-        match output {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("full upgrade completed successfully");
-                } else {
-                    error!(
-                        "full upgrade failed with status: {}. stderr: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-            }
-            Err(e) => {
-                error!("failed to execute full upgrade: {e}");
-            }
+        if let Err(e) = result {
+            error!("failed to execute full upgrade: {e}");
         }
         state.is_upgrading.store(false, Ordering::SeqCst);
     });
@@ -251,53 +245,6 @@ async fn full_upgrade_handler(State(state): State<AppState>) -> impl IntoRespons
         })),
     )
 }
-
-fn is_apt_available() -> bool {
-    Command::new("apt")
-        .arg("--version")
-        .output()
-        .is_ok()
-        || Command::new("apt-get")
-            .arg("--version")
-            .output()
-            .is_ok()
-}
-
-#[cfg(target_os = "linux")]
-fn get_apt_updates() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    use apt_pkg_native::Cache;
-
-    info!("updating apt cache...");
-    // To truly update we need to call 'apt-get update'.
-    let _ = Command::new("apt-get")
-        .arg("update")
-        .output();
-
-    info!("determining available updates...");
-    let mut updates = Vec::new();
-    let mut cache = Cache::get_singleton();
-
-    let mut packages = cache.iter();
-    while let Some(pkg) = packages.next() {
-        let release = pkg.current_version();
-        let candidate = pkg.candidate_version();
-
-        if let (Some(rel), Some(can)) = (release, candidate) {
-            if rel != can {
-                updates.push(pkg.name());
-            }
-        }
-    }
-
-    info!("found {} available updates", updates.len());
-    Ok(updates)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn get_apt_updates() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(vec![])
-}
-
 
 fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<ServiceDaemon> {
     let daemon = match ServiceDaemon::new() {
@@ -407,6 +354,7 @@ mod tests {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: api_key.clone(),
+            package_manager: Arc::new(get_package_manager()),
         };
         let app = Router::new()
             .route("/status", get(status_handler))
@@ -454,9 +402,12 @@ mod tests {
         // This test will likely run on non-linux (macOS) in this environment
         // but we can't easily fake the output of `Command::new("apt")` without mocking.
         // For now, let's just ensure it compiles and runs.
+        let pm = get_package_manager();
+        let pm_name = pm.name().to_string();
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
+            package_manager: Arc::new(pm),
         };
         let app = Router::new()
             .route("/status", get(status_handler))
@@ -476,7 +427,7 @@ mod tests {
         
         #[cfg(target_os = "macos")]
         {
-            assert_eq!(status.message, "the system is not a Debian-based Linux system");
+            assert_eq!(status.message, format!("the system is not a {} system", pm_name));
             assert!(status.updates.is_empty());
             assert!(!status.is_upgrading);
         }
@@ -484,9 +435,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_upgrade_handler_non_linux() {
+        let pm = get_package_manager();
+        let pm_name = pm.name().to_string();
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
+            package_manager: Arc::new(pm),
         };
         let app = Router::new()
             .route("/packages/full-upgrade", post(full_upgrade_handler))
@@ -509,7 +463,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
             let body = to_bytes(response.into_body(), 1024).await.unwrap();
             let res: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(res["message"], "the system is not a Debian-based Linux system");
+            assert_eq!(res["message"], format!("the system is not a {} system", pm_name));
         }
     }
 
@@ -520,6 +474,7 @@ mod tests {
             let state = AppState {
                 is_upgrading: Arc::new(AtomicBool::new(false)),
                 api_key: "test".to_string(),
+                package_manager: Arc::new(get_package_manager()),
             };
             let app = Router::new()
                 .route("/status", get(status_handler))

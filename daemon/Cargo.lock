@@ -235,6 +235,7 @@ name = "cobblerd"
 version = "0.1.0"
 dependencies = [
  "apt-pkg-native",
+ "async-trait",
  "axum",
  "clap",
  "gethostname",
