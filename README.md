@@ -68,6 +68,16 @@ See the individual component directories for specific development instructions:
 - [CLI Development](./cli/README.md)
 - [Daemon Development](./daemon/README.md)
 
+### CI/CD and Local Testing
+
+The GitHub Actions workflows can be tested locally using [act](https://github.com/nektos/act). 
+A `.actrc` file is provided to map `macos-latest` to a compatible Docker image.
+
+To run the daemon build workflow locally:
+```bash
+act workflow_dispatch
+```
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

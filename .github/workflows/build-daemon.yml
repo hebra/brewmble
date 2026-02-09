@@ -5,47 +5,70 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }}
-    runs-on: ubuntu-latest
-    container:
-      image: rust:1.92-trixie
+    name: Build ${{ matrix.arch }} (${{ matrix.os }})
+# Note: For local testing with 'act', macos-latest is mapped in .actrc
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container || '' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            target: x86_64-unknown-linux-gnu
-            apt_arch: amd64
-            pkg_config_path: /usr/lib/x86_64-linux-gnu/pkgconfig
+#          - arch: amd64
+#            os: ubuntu-latest
+#            container: "rust:1.92-trixie"
+#            target: x86_64-unknown-linux-gnu
+#            apt_arch: amd64
+#            pkg_config_path: /usr/lib/x86_64-linux-gnu/pkgconfig
+#            pkg_type: deb
+#          - arch: arm64
+#            os: ubuntu-latest
+#            container: "rust:1.92-trixie"
+#            target: aarch64-unknown-linux-gnu
+#            apt_arch: arm64
+#            gcc_pkg: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+#            cc: aarch64-linux-gnu-gcc
+#            cxx: aarch64-linux-gnu-g++
+#            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
+#            pkg_type: deb
+#          - arch: aarch64
+#            os: ubuntu-latest
+#            container: "rust:1.92-trixie"
+#            target: aarch64-unknown-linux-gnu
+#            apt_arch: arm64
+#            gcc_pkg: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+#            cc: aarch64-linux-gnu-gcc
+#            cxx: aarch64-linux-gnu-g++
+#            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
+#            pkg_type: deb
+#          - arch: armhf
+#            os: ubuntu-latest
+#            container: "rust:1.92-trixie"
+#            target: armv7-unknown-linux-gnueabihf
+#            apt_arch: armhf
+#            gcc_pkg: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+#            cc: arm-linux-gnueabihf-gcc
+#            cxx: arm-linux-gnueabihf-g++
+#            pkg_config_path: /usr/lib/arm-linux-gnueabihf/pkgconfig
+#            pkg_type: deb
+#          - arch: x86_64
+#            os: macos-latest
+#            target: x86_64-apple-darwin
+#            pkg_type: brew
           - arch: arm64
-            target: aarch64-unknown-linux-gnu
-            apt_arch: arm64
-            gcc_pkg: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-            cc: aarch64-linux-gnu-gcc
-            cxx: aarch64-linux-gnu-g++
-            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
-          - arch: aarch64
-            target: aarch64-unknown-linux-gnu
-            apt_arch: arm64
-            gcc_pkg: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-            cc: aarch64-linux-gnu-gcc
-            cxx: aarch64-linux-gnu-g++
-            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
-          - arch: armhf
-            target: armv7-unknown-linux-gnueabihf
-            apt_arch: armhf
-            gcc_pkg: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
-            cc: arm-linux-gnueabihf-gcc
-            cxx: arm-linux-gnueabihf-g++
-            pkg_config_path: /usr/lib/arm-linux-gnueabihf/pkgconfig
+            os: macos-latest
+            target: aarch64-apple-darwin
+            pkg_type: brew
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Install dependencies
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           apt-get update
           apt-get install -y pkg-config build-essential
@@ -58,11 +81,13 @@ jobs:
           fi
 
       - name: Install cargo-deb
+        if: matrix.pkg_type == 'deb'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deb
 
-      - name: Build and package
+      - name: Build and package (Linux)
+        if: matrix.pkg_type == 'deb'
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
           PKG_CONFIG_PATH: ${{ matrix.pkg_config_path }}
@@ -75,12 +100,20 @@ jobs:
           fi
           
           cd daemon
-          cargo deb --target ${{ matrix.target }}
+          cargo deb --target ${{ matrix.target }} --deb-revision linux-apt
           mkdir -p ../dist/${{ matrix.arch }}
           cp target/${{ matrix.target }}/debian/*.deb ../dist/${{ matrix.arch }}/
+
+      - name: Build and package (MacOS)
+        if: matrix.pkg_type == 'brew'
+        run: |
+          cd daemon
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p ../dist/${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/cobblerd ../dist/${{ matrix.arch }}/cobblerd-macos-brew
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cobblerd-${{ matrix.arch }}-deb
-          path: dist/${{ matrix.arch }}/*.deb
+          name: cobblerd-${{ matrix.arch }}-${{ matrix.pkg_type }}
+          path: dist/${{ matrix.arch }}/*
