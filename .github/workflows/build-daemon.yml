@@ -10,7 +10,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container || '' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
 #          - arch: amd64
@@ -30,34 +30,34 @@ jobs:
 #            cxx: aarch64-linux-gnu-g++
 #            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
 #            pkg_type: deb
-#          - arch: aarch64
-#            os: ubuntu-latest
-#            container: "rust:1.92-trixie"
-#            target: aarch64-unknown-linux-gnu
-#            apt_arch: arm64
-#            gcc_pkg: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-#            cc: aarch64-linux-gnu-gcc
-#            cxx: aarch64-linux-gnu-g++
-#            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
-#            pkg_type: deb
-#          - arch: armhf
-#            os: ubuntu-latest
-#            container: "rust:1.92-trixie"
-#            target: armv7-unknown-linux-gnueabihf
-#            apt_arch: armhf
-#            gcc_pkg: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
-#            cc: arm-linux-gnueabihf-gcc
-#            cxx: arm-linux-gnueabihf-g++
-#            pkg_config_path: /usr/lib/arm-linux-gnueabihf/pkgconfig
-#            pkg_type: deb
+          - arch: aarch64
+            os: ubuntu-latest
+            container: "rust:1.92-trixie"
+            target: aarch64-unknown-linux-gnu
+            apt_arch: arm64
+            gcc_pkg: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
+            pkg_type: deb
+          - arch: armhf
+            os: ubuntu-latest
+            container: "rust:1.92-trixie"
+            target: armv7-unknown-linux-gnueabihf
+            apt_arch: armhf
+            gcc_pkg: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+            cc: arm-linux-gnueabihf-gcc
+            cxx: arm-linux-gnueabihf-g++
+            pkg_config_path: /usr/lib/arm-linux-gnueabihf/pkgconfig
+            pkg_type: deb
 #          - arch: x86_64
 #            os: macos-latest
 #            target: x86_64-apple-darwin
 #            pkg_type: brew
-          - arch: arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            pkg_type: brew
+#          - arch: arm64
+#            os: macos-latest
+#            target: aarch64-apple-darwin
+#            pkg_type: brew
 
     steps:
       - uses: actions/checkout@v4
