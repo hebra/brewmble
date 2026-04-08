@@ -62,6 +62,23 @@ cd daemon && cargo build --release
    ./cli/target/release/cobbler packages --full-upgrade <target>
    ```
 
+## Configuration
+
+Cobbler can be configured using environment variables.
+
+### Environment Variables
+
+| Variable | Component | Description | Default |
+|:---|:---|:---|:---|
+| `COBBLER_DAEMON_PORT` | Daemon | Port for the daemon to listen on. If not specified, the daemon will search for a free port starting from 8080. | `8080` (auto-hunt) |
+| `COBBLER_DAEMON_HOSTNAME` | Daemon | Hostname to use for mDNS registration. | System hostname |
+| `COBBLER_DAEMON_IP` | Daemon | Explicit IP address to use for mDNS registration. | Automatically detected |
+| `COBBLER_DAEMON_API_KEY` | Daemon | API key for authentication. If not provided, a random UUID v4 will be generated and logged. | Generated |
+| `COBBLER_TIMEOUT` | CLI | Timeout for discovery and HTTP requests. Supports seconds or [humantime](https://docs.rs/humantime) (e.g., `1m`, `30s`). | `5s` (discovery), `60s` (HTTP) |
+| `COBBLER_CONFIG` | CLI | Path to the CLI configuration file. | `.cobbler.yaml` |
+| `RUST_LOG` | Daemon | Logging filter for the daemon (e.g., `info`, `debug`). | `cobblerd=info` |
+| `CONTAINER_TOOL` | Makefile | Tool used for container operations. | `podman` |
+
 ## Development
 
 See the individual component directories for specific development instructions:
