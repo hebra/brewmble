@@ -42,13 +42,15 @@ Environment variables can be used for configuration:
 - `COBBLER_DAEMON_API_KEY`: API key for authentication. If not provided, one will be generated on startup and printed to the logs.
 - `RUST_LOG`: Logging level (e.g., `info`, `debug`).
 
-## Authentication
+## Security and Authentication
 
 All API endpoints require authentication via an `X-API-Key` header.
 
 ```bash
 curl -H "X-API-Key: your-secret-api-key" http://localhost:8080/status
 ```
+
+For more advanced security options like HTTPS or SSH tunneling, see the [main Security section](../README.md#security).
 
 ## API Endpoints
 

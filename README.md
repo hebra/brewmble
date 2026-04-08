@@ -62,6 +62,35 @@ cd daemon && cargo build --release
    ./cli/target/release/cobbler packages --full-upgrade <target>
    ```
 
+## Security
+
+Cobbler provides several options to secure communication between the CLI and daemons:
+
+### 1. API Key Authentication (Built-in)
+
+The primary security layer is API Key authentication.
+- **Daemon**: Set `COBBLER_DAEMON_API_KEY`. If not provided, a random UUID v4 is generated and logged at startup.
+- **CLI**: Store keys in `.cobbler.yaml` for each node.
+- **Protocol**: All requests must include the `X-API-Key` header.
+
+### 2. HTTPS via Reverse Proxy
+
+For encrypted traffic over the network, you can use HTTPS:
+- **Setup**: Place a reverse proxy (e.g., Caddy, Nginx, or Traefik) in front of the daemon to handle TLS termination.
+- **CLI**: Use `https://` in the node address (e.g., `https://node1.example.com`).
+
+### 3. SSH Tunneling
+
+A simple way to secure communication without additional infrastructure:
+- **Setup**: Create a tunnel: `ssh -L 8080:localhost:8080 user@remote-node`
+- **CLI**: Connect to `localhost:8080`.
+
+### 4. Private Overlay Networks
+
+For clusters, using a private network layer is recommended:
+- **Tools**: Use Tailscale or ZeroTier to create an encrypted mesh network.
+- **Benefits**: Provides end-to-end encryption and isolates the daemon from the public local network.
+
 ## Configuration
 
 Cobbler can be configured using environment variables.
@@ -97,4 +126,4 @@ act workflow_dispatch
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0). See the [LICENSE](LICENSE) file for details.

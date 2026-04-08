@@ -51,6 +51,10 @@ cobbler packages --full-upgrade
 cobbler packages --full-upgrade <target> [<target> ...]
 ```
 
+## Security
+
+Cobbler CLI supports several secure communication methods, including API keys, HTTPS, and SSH tunneling. See the [main Security section](../README.md#security) for details.
+
 ## Configuration
 
 The CLI can be configured via a YAML configuration file (`.cobbler.yaml`) and environment variables.
