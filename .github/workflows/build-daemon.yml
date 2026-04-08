@@ -13,23 +13,23 @@ jobs:
       fail-fast: true
       matrix:
         include:
-#          - arch: amd64
-#            os: ubuntu-latest
-#            container: "rust:1.92-trixie"
-#            target: x86_64-unknown-linux-gnu
-#            apt_arch: amd64
-#            pkg_config_path: /usr/lib/x86_64-linux-gnu/pkgconfig
-#            pkg_type: deb
-#          - arch: arm64
-#            os: ubuntu-latest
-#            container: "rust:1.92-trixie"
-#            target: aarch64-unknown-linux-gnu
-#            apt_arch: arm64
-#            gcc_pkg: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-#            cc: aarch64-linux-gnu-gcc
-#            cxx: aarch64-linux-gnu-g++
-#            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
-#            pkg_type: deb
+          - arch: amd64
+            os: ubuntu-latest
+            container: "rust:1.92-trixie"
+            target: x86_64-unknown-linux-gnu
+            apt_arch: amd64
+            pkg_config_path: /usr/lib/x86_64-linux-gnu/pkgconfig
+            pkg_type: deb
+          - arch: arm64
+            os: ubuntu-latest
+            container: "rust:1.92-trixie"
+            target: aarch64-unknown-linux-gnu
+            apt_arch: arm64
+            gcc_pkg: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
+            pkg_type: deb
           - arch: aarch64
             os: ubuntu-latest
             container: "rust:1.92-trixie"
