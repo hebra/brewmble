@@ -111,6 +111,9 @@ Cobbler can be configured using environment variables.
 ## Development
 
 See the individual component directories for specific development instructions:
+- [Project Brief](./PROJECT_BRIEF.md)
+- [Architecture](./ARCHITECTURE.md)
+- [Roadmap](./ROADMAP.md)
 - [CLI Development](./cli/README.md)
 - [Daemon Development](./daemon/README.md)
 
