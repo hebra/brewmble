@@ -71,6 +71,16 @@ impl PackageManager for Apt {
         Ok(vec![])
     }
 
+    #[cfg(target_os = "linux")]
+    async fn dry_run_upgrade(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_updates().await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn dry_run_upgrade(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(vec![])
+    }
+
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("starting apt full upgrade");
         let output = self.runner.run("apt", &["full-upgrade", "-y"]);
@@ -152,6 +162,20 @@ mod tests {
             runner: Box::new(runner),
         };
         assert!(apt.is_available());
+    }
+
+    #[tokio::test]
+    async fn test_apt_dry_run_upgrade_success() {
+        let runner = MockRunner {
+            success: true,
+            stdout: "".to_string(),
+            stderr: "".to_string(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+        };
+        let result = apt.dry_run_upgrade().await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ pub trait PackageManager: Send + Sync {
     fn version(&self) -> String;
     fn is_available(&self) -> bool;
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn dry_run_upgrade(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 

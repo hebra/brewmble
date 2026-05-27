@@ -1,6 +1,6 @@
 use cobbler_rest::{
-    HealthResponse, StatusResponse, UpgradeResponse, API_KEY_HEADER, PATH_HEALTH, PATH_STATUS,
-    PATH_UPGRADE, SERVICE_FULL_TYPE,
+    HealthResponse, StatusResponse, UpgradeRequest, UpgradeResponse, API_KEY_HEADER, PATH_HEALTH,
+    PATH_STATUS, PATH_UPGRADE, SERVICE_FULL_TYPE,
 };
 use tower_http::trace::TraceLayer;
 use axum::{
@@ -220,14 +220,41 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn full_upgrade_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn full_upgrade_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<UpgradeRequest>,
+) -> impl IntoResponse {
     if !state.package_manager.is_available() {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(UpgradeResponse {
                 message: format!("the system is not a {} system", state.package_manager.name()),
+                updates: None,
             }),
         );
+    }
+
+    if payload.dry_run {
+        match state.package_manager.dry_run_upgrade().await {
+            Ok(updates) => {
+                return (
+                    StatusCode::OK,
+                    Json(UpgradeResponse {
+                        message: "dry-run completed".to_string(),
+                        updates: Some(updates),
+                    }),
+                );
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(UpgradeResponse {
+                        message: format!("dry-run failed: {}", err),
+                        updates: None,
+                    }),
+                );
+            }
+        }
     }
 
     if state
@@ -239,6 +266,7 @@ async fn full_upgrade_handler(State(state): State<AppState>) -> impl IntoRespons
             StatusCode::PRECONDITION_FAILED,
             Json(UpgradeResponse {
                 message: "a full upgrade is currently running".to_string(),
+                updates: None,
             }),
         );
     }
@@ -257,6 +285,7 @@ async fn full_upgrade_handler(State(state): State<AppState>) -> impl IntoRespons
         StatusCode::OK,
         Json(UpgradeResponse {
             message: "full upgrade triggered".to_string(),
+            updates: None,
         }),
     )
 }
@@ -485,7 +514,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(PATH_UPGRADE)
-                    .body(axum::body::Body::empty())
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap()))
                     .unwrap()
             )
             .await
@@ -517,7 +547,14 @@ mod tests {
 
             // 1. Start upgrade
             let response = app.clone()
-                .oneshot(Request::builder().method("POST").uri("/packages/full-upgrade").body(axum::body::Body::empty()).unwrap())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/packages/full-upgrade")
+                        .header("Content-Type", "application/json")
+                        .body(axum::body::Body::from(serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap()))
+                        .unwrap()
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -525,7 +562,14 @@ mod tests {
 
             // 2. Try starting upgrade again while one is running
             let response = app.clone()
-                .oneshot(Request::builder().method("POST").uri("/packages/full-upgrade").body(axum::body::Body::empty()).unwrap())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/packages/full-upgrade")
+                        .header("Content-Type", "application/json")
+                        .body(axum::body::Body::from(serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap()))
+                        .unwrap()
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);

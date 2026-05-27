@@ -24,9 +24,16 @@ pub struct HealthResponse {
     pub is_upgrading: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct UpgradeRequest {
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UpgradeResponse {
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updates: Option<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -76,11 +83,24 @@ mod tests {
     fn test_upgrade_response_serialization() {
         let resp = UpgradeResponse {
             message: "Upgrade started".to_string(),
+            updates: Some(vec!["pkg1".to_string()]),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"message\":\"Upgrade started\""));
+        assert!(json.contains("\"updates\":[\"pkg1\"]"));
 
         let decoded: UpgradeResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.message, resp.message);
+        assert_eq!(decoded.updates, resp.updates);
+    }
+
+    #[test]
+    fn test_upgrade_request_serialization() {
+        let req = UpgradeRequest { dry_run: true };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"dry_run\":true"));
+
+        let decoded: UpgradeRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.dry_run, req.dry_run);
     }
 }

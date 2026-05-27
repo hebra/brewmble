@@ -16,7 +16,7 @@ Adding more functionality and broadening the ecosystem.
 
 - [ ] **Web Dashboard (MVP)**: Develop a basic web interface in the `web/` directory to visualize node statuses and trigger updates from a browser.
 - [ ] **Additional Package Managers**: Add support for `dnf` (Fedora/RHEL) and `pacman` (Arch) to the daemon.
-- [ ] **Dry-run Support**: Allow users to see what updates *would* be applied without actually executing them.
+- [x] **Dry-run Support**: Allow users to see what updates *would* be applied without actually executing them.
 - [ ] **Filtering & Grouping**: Add CLI capabilities to target specific groups of nodes (e.g., `cobbler status --group raspberry-pis`).
 - [ ] **Automatic Updates**: Implement an optional "auto-pilot" mode in the daemon for scheduled updates.
 

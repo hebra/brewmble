@@ -72,12 +72,13 @@ Security is handled via a simple API Key mechanism.
 
 ### Upgrade Flow
 1. User executes `cobbler packages --full-upgrade <target>`.
-2. CLI sends a `POST /packages/full-upgrade` request to the target daemon.
+2. CLI sends a `POST /packages/full-upgrade` request to the target daemon with a JSON body: `{"dry_run": false}`.
 3. Daemon verifies the API key.
-4. Daemon sets an `is_upgrading` flag (AtomicBool) to prevent concurrent upgrades.
-5. Daemon spawns a background task to perform the upgrade (e.g., `apt-get dist-upgrade -y`).
-6. Daemon immediately returns `202 Accepted` to the CLI.
-7. The CLI informs the user that the upgrade has started.
+4. If `dry_run` is `true`, the daemon simulates the upgrade and returns the list of packages that would be changed.
+5. If `dry_run` is `false`, the daemon sets an `is_upgrading` flag (AtomicBool) to prevent concurrent upgrades.
+6. Daemon spawns a background task to perform the upgrade (e.g., `apt-get dist-upgrade -y`).
+7. Daemon immediately returns `200 OK` (with a "triggered" message) to the CLI.
+8. The CLI informs the user that the upgrade has started.
 
 ---
 

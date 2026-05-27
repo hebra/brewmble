@@ -233,6 +233,10 @@ enum Commands {
         #[arg(long, required = true)]
         full_upgrade: bool,
 
+        /// Show what would be upgraded without executing
+        #[arg(long)]
+        dry_run: bool,
+
         /// Targets (host:port)
         #[arg(num_args = 0..)]
         targets: Vec<String>,
@@ -290,12 +294,13 @@ fn main() {
         }
         Commands::Packages {
             full_upgrade,
+            dry_run,
             targets,
         } => {
             if targets.is_empty() && !config_exists {
                 println!("No config file was found or set.");
             }
-            run_packages(full_upgrade, targets, &config)
+            run_packages(full_upgrade, dry_run, targets, &config)
         }
         Commands::Profile { subcommand } => run_profile(subcommand, &mut config, &config_path),
     };
@@ -510,6 +515,40 @@ mod tests {
             assert!(update_config);
         } else {
             panic!("Wrong command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_packages_dry_run() {
+        let cli = Cli::parse_from(&["cobbler", "packages", "--full-upgrade", "--dry-run"]);
+        if let Commands::Packages {
+            full_upgrade,
+            dry_run,
+            targets,
+        } = cli.command
+        {
+            assert!(full_upgrade);
+            assert!(dry_run);
+            assert!(targets.is_empty());
+        } else {
+            panic!("Expected Packages command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_packages_no_dry_run() {
+        let cli = Cli::parse_from(&["cobbler", "packages", "--full-upgrade", "host:8080"]);
+        if let Commands::Packages {
+            full_upgrade,
+            dry_run,
+            targets,
+        } = cli.command
+        {
+            assert!(full_upgrade);
+            assert!(!dry_run);
+            assert_eq!(targets, vec!["host:8080"]);
+        } else {
+            panic!("Expected Packages command");
         }
     }
 
@@ -906,6 +945,7 @@ fn resolve_url(target: &str) -> String {
 
 fn run_packages(
     _full_upgrade: bool,
+    dry_run: bool,
     mut targets: Vec<String>,
     config: &Config,
 ) -> Result<(), Box<dyn Error>> {
@@ -935,7 +975,9 @@ fn run_packages(
         let url = resolve_url(&target);
         let upgrade_url = format!("{}{}", url, PATH_UPGRADE);
 
-        let mut request = client.post(&upgrade_url);
+        let mut request = client
+            .post(&upgrade_url)
+            .json(&cobbler_rest::UpgradeRequest { dry_run });
 
         if let Some(profile) = active_profile {
             if let Some(node) = profile
@@ -949,21 +991,26 @@ fn run_packages(
             }
         }
 
-        let (status, body) = match request.send() {
+        let (status, body, updates) = match request.send() {
             Ok(resp) => {
                 let status = resp.status().to_string();
-                let body = match resp.json::<UpgradeResponse>() {
-                    Ok(ur) => ur.message,
-                    Err(_) => "Upgrade triggered successfully".to_string(),
-                };
-                (status, body)
+                let ur: UpgradeResponse = resp.json().unwrap_or_else(|_| UpgradeResponse {
+                    message: "Unknown response".to_string(),
+                    updates: None,
+                });
+                (status, ur.message, ur.updates)
             }
-            Err(err) => (format!("Error: {}", err), "".to_string()),
+            Err(err) => (format!("Error: {}", err), "".to_string(), None),
         };
 
         writeln!(tw, "{}\t{}", target, status)?;
         if !body.is_empty() {
             writeln!(tw, "\t{}", body.replace('\n', "\n\t"))?;
+        }
+        if let Some(upds) = updates {
+            if !upds.is_empty() {
+                writeln!(tw, "\tUpdates ({}): {}", upds.len(), upds.join(", "))?;
+            }
         }
     }
 

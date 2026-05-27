@@ -57,10 +57,15 @@ impl PackageManager for Brew {
         let updates: Vec<String> = String::from_utf8_lossy(&output.stdout)
             .lines()
             .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
             .collect();
 
         info!("found {} available updates", updates.len());
         Ok(updates)
+    }
+
+    async fn dry_run_upgrade(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_updates().await
     }
 
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -176,6 +181,20 @@ mod tests {
         let result = brew.get_updates().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("brew error"));
+    }
+
+    #[tokio::test]
+    async fn test_brew_dry_run_upgrade_success() {
+        let runner = MockRunner {
+            success: true,
+            stdout: "pkg1\npkg2\n".to_string(),
+            stderr: "".to_string(),
+        };
+        let brew = Brew {
+            runner: Box::new(runner),
+        };
+        let updates = brew.dry_run_upgrade().await.unwrap();
+        assert_eq!(updates, vec!["pkg1", "pkg2"]);
     }
 
     #[tokio::test]
