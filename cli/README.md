@@ -51,6 +51,24 @@ cobbler packages --full-upgrade
 cobbler packages --full-upgrade <target> [<target> ...]
 ```
 
+### Profile Management
+
+Manage configuration profiles and secure API keys:
+
+```bash
+# List all profiles
+cobbler profile list
+
+# Create a new profile
+cobbler profile create <name>
+
+# Switch to a profile
+cobbler profile use <name>
+
+# Securely store an API key for a node in the system keyring
+cobbler profile set-key <node-address-or-name> <api-key>
+```
+
 ## Security
 
 Cobbler CLI supports several secure communication methods, including API keys, HTTPS, and SSH tunneling. See the [main Security section](../README.md#security) for details.
@@ -69,11 +87,16 @@ The CLI searches for a configuration file in the following order:
 #### Structure
 
 ```yaml
-nodes:
-  - name: production-1
-    address: 192.168.1.10:8080
-    api_key: your-secret-api-key
-  - address: 192.168.1.11:8080
+active_profile: default
+profiles:
+  default:
+    nodes:
+      - name: production-1
+        address: 192.168.1.10:8080
+        api_key: your-secret-api-key
+      - name: raspberry-pi
+        address: 192.168.1.50:8080
+        use_keyring: true # API key is stored in system keyring
 ```
 
 ### Environment Variables

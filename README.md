@@ -70,7 +70,7 @@ Cobbler provides several options to secure communication between the CLI and dae
 
 The primary security layer is API Key authentication.
 - **Daemon**: Set `COBBLER_DAEMON_API_KEY`. If not provided, a random UUID v4 is generated and logged at startup.
-- **CLI**: Store keys in `.cobbler.yaml` for each node.
+- **CLI**: Store keys in `.cobbler.yaml` for each node, or use the system keyring for better security.
 - **Protocol**: All requests must include the `X-API-Key` header.
 
 ### 2. HTTPS via Reverse Proxy

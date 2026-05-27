@@ -6,8 +6,9 @@ use clap::{Parser, Subcommand};
 use flume::RecvTimeoutError;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use keyring::Entry;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,8 +17,35 @@ use tabwriter::TabWriter;
 
 const TOKEN_PLACEHOLDER: &str = "REPLACE_WITH_ACTUAL_TOKEN";
 
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Config {
+    #[serde(default = "default_profile_name")]
+    active_profile: String,
+    #[serde(default)]
+    profiles: HashMap<String, ProfileConfig>,
+    // For migration from older versions
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    nodes: Vec<NodeConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let mut profiles = HashMap::new();
+        profiles.insert(default_profile_name(), ProfileConfig::default());
+        Self {
+            active_profile: default_profile_name(),
+            profiles,
+            nodes: Vec::new(),
+        }
+    }
+}
+
+fn default_profile_name() -> String {
+    "default".to_string()
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+struct ProfileConfig {
     #[serde(default)]
     nodes: Vec<NodeConfig>,
 }
@@ -29,6 +57,19 @@ struct NodeConfig {
     address: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
+    #[serde(default)]
+    use_keyring: bool,
+}
+
+impl NodeConfig {
+    fn get_api_key(&self) -> Option<String> {
+        if self.use_keyring {
+            let entry = Entry::new("cobbler-cli", &self.address).ok()?;
+            entry.get_password().ok()
+        } else {
+            self.api_key.clone()
+        }
+    }
 }
 
 fn resolve_config_path(explicit_path: Option<PathBuf>) -> (PathBuf, bool) {
@@ -62,7 +103,24 @@ fn load_config(path: &Path) -> Result<Config, Box<dyn Error>> {
         return Ok(Config::default());
     }
     let content = fs::read_to_string(path)?;
-    let config = serde_yaml::from_str(&content)?;
+    let mut config: Config = serde_yaml::from_str(&content)?;
+
+    // Migration: Move old nodes to default profile
+    if !config.nodes.is_empty() {
+        let profile = config
+            .profiles
+            .entry(default_profile_name())
+            .or_insert_with(ProfileConfig::default);
+        profile.nodes.extend(config.nodes.drain(..));
+    }
+
+    // Ensure active profile exists
+    if !config.profiles.contains_key(&config.active_profile) {
+        config
+            .profiles
+            .insert(config.active_profile.clone(), ProfileConfig::default());
+    }
+
     Ok(config)
 }
 
@@ -74,22 +132,31 @@ fn save_config(path: &Path, config: &Config) -> Result<(), Box<dyn Error>> {
 
 fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
     let mut updated = false;
+    let active_profile = config.active_profile.clone();
+    let profile = config
+        .profiles
+        .entry(active_profile)
+        .or_insert_with(ProfileConfig::default);
+
     for (addr, id) in discovered {
         let new_name = if id.is_empty() { None } else { Some(id) };
 
         // Try finding by name first if name is available
         let mut found_index = None;
         if let Some(ref name) = new_name {
-            found_index = config.nodes.iter().position(|n| n.name.as_ref() == Some(name));
+            found_index = profile
+                .nodes
+                .iter()
+                .position(|n| n.name.as_ref() == Some(name));
         }
 
         // If not found by name, try finding by address
         if found_index.is_none() {
-            found_index = config.nodes.iter().position(|n| n.address == addr);
+            found_index = profile.nodes.iter().position(|n| n.address == addr);
         }
 
         if let Some(index) = found_index {
-            let node = &mut config.nodes[index];
+            let node = &mut profile.nodes[index];
             let mut node_updated = false;
             if node.address != addr {
                 node.address = addr;
@@ -103,10 +170,11 @@ fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
                 updated = true;
             }
         } else {
-            config.nodes.push(NodeConfig {
+            profile.nodes.push(NodeConfig {
                 name: new_name,
                 address: addr,
                 api_key: Some(TOKEN_PLACEHOLDER.to_string()),
+                use_keyring: false,
             });
             updated = true;
         }
@@ -169,12 +237,39 @@ enum Commands {
         #[arg(num_args = 0..)]
         targets: Vec<String>,
     },
+    /// Manage configuration profiles
+    Profile {
+        #[command(subcommand)]
+        subcommand: ProfileCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommands {
+    /// List all profiles
+    List,
+    /// Set the active profile
+    Use { name: String },
+    /// Create a new profile
+    Create { name: String },
+    /// Delete a profile
+    Delete { name: String },
+    /// Set API key for a node in the keyring
+    SetKey {
+        /// Profile name (defaults to active profile)
+        #[arg(short, long)]
+        profile: Option<String>,
+        /// Node address or name
+        node: String,
+        /// API key
+        key: String,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
     let (config_path, config_exists) = resolve_config_path(cli.config);
-    let config = match load_config(&config_path) {
+    let mut config = match load_config(&config_path) {
         Ok(c) => c,
         Err(err) => {
             eprintln!("error: failed to load config: {err}");
@@ -202,12 +297,94 @@ fn main() {
             }
             run_packages(full_upgrade, targets, &config)
         }
+        Commands::Profile { subcommand } => run_profile(subcommand, &mut config, &config_path),
     };
 
     if let Err(err) = result {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
+}
+
+fn run_profile(
+    subcommand: ProfileCommands,
+    config: &mut Config,
+    config_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    match subcommand {
+        ProfileCommands::List => {
+            for name in config.profiles.keys() {
+                if name == &config.active_profile {
+                    println!("* {}", name);
+                } else {
+                    println!("  {}", name);
+                }
+            }
+        }
+        ProfileCommands::Use { name } => {
+            if config.profiles.contains_key(&name) {
+                config.active_profile = name;
+                save_config(config_path, config)?;
+                println!("Switched to profile '{}'", config.active_profile);
+            } else {
+                return Err(format!("Profile '{}' not found", name).into());
+            }
+        }
+        ProfileCommands::Create { name } => {
+            if config.profiles.contains_key(&name) {
+                return Err(format!("Profile '{}' already exists", name).into());
+            }
+            config.profiles.insert(name.clone(), ProfileConfig::default());
+            save_config(config_path, config)?;
+            println!("Created profile '{}'", name);
+        }
+        ProfileCommands::Delete { name } => {
+            if name == default_profile_name() {
+                return Err("Cannot delete the default profile".into());
+            }
+            if name == config.active_profile {
+                return Err("Cannot delete the active profile. Switch to another profile first.".into());
+            }
+            if config.profiles.remove(&name).is_some() {
+                save_config(config_path, config)?;
+                println!("Deleted profile '{}'", name);
+            } else {
+                return Err(format!("Profile '{}' not found", name).into());
+            }
+        }
+        ProfileCommands::SetKey {
+            profile: profile_name,
+            node: node_id,
+            key,
+        } => {
+            let p_name = profile_name.unwrap_or_else(|| config.active_profile.clone());
+            {
+                let profile = config
+                    .profiles
+                    .get_mut(&p_name)
+                    .ok_or_else(|| format!("Profile '{}' not found", p_name))?;
+
+                let node = profile
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.address == node_id || n.name.as_ref() == Some(&node_id))
+                    .ok_or_else(|| format!("Node '{}' not found in profile '{}'", node_id, p_name))?;
+
+                let entry = Entry::new("cobbler-cli", &node.address)?;
+                entry.set_password(&key)?;
+
+                node.use_keyring = true;
+                node.api_key = None; // Remove plain-text key if it was there
+            }
+
+            save_config(config_path, config)?;
+            println!(
+                "API key for node stored securely in keyring for profile '{}'",
+                p_name
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_discover(
@@ -361,13 +538,13 @@ mod tests {
 
     #[test]
     fn test_merge_nodes() {
-        let mut config = Config {
-            nodes: vec![NodeConfig {
-                name: None,
-                address: "1.1.1.1:8080".to_string(),
-                api_key: None,
-            }],
-        };
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
+            name: None,
+            address: "1.1.1.1:8080".to_string(),
+            api_key: None,
+            use_keyring: false,
+        }];
 
         let discovered = vec![
             ("1.1.1.1:8080".to_string(), "node1".to_string()),
@@ -376,91 +553,96 @@ mod tests {
 
         let updated = merge_nodes(&mut config, discovered);
         assert!(updated);
-        assert_eq!(config.nodes.len(), 2);
+        let nodes = &config.profiles.get("default").unwrap().nodes;
+        assert_eq!(nodes.len(), 2);
         
         // Existing node updated with name
-        assert_eq!(config.nodes[0].address, "1.1.1.1:8080");
-        assert_eq!(config.nodes[0].name, Some("node1".to_string()));
-        assert_eq!(config.nodes[0].api_key, None);
+        assert_eq!(nodes[0].address, "1.1.1.1:8080");
+        assert_eq!(nodes[0].name, Some("node1".to_string()));
+        assert_eq!(nodes[0].api_key, None);
 
         // New node added with name and placeholder token
-        assert_eq!(config.nodes[1].address, "2.2.2.2:8080");
-        assert_eq!(config.nodes[1].name, Some("node2".to_string()));
-        assert_eq!(config.nodes[1].api_key, Some(TOKEN_PLACEHOLDER.to_string()));
+        assert_eq!(nodes[1].address, "2.2.2.2:8080");
+        assert_eq!(nodes[1].name, Some("node2".to_string()));
+        assert_eq!(nodes[1].api_key, Some(TOKEN_PLACEHOLDER.to_string()));
     }
 
     #[test]
     fn test_merge_nodes_updates_name_but_preserves_token() {
-        let mut config = Config {
-            nodes: vec![NodeConfig {
-                name: Some("OldName".to_string()),
-                address: "1.1.1.1:8080".to_string(),
-                api_key: Some("secret".to_string()),
-            }],
-        };
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
+            name: Some("OldName".to_string()),
+            address: "1.1.1.1:8080".to_string(),
+            api_key: Some("secret".to_string()),
+            use_keyring: false,
+        }];
 
         let discovered = vec![("1.1.1.1:8080".to_string(), "NewName".to_string())];
 
         let updated = merge_nodes(&mut config, discovered);
         assert!(updated);
-        assert_eq!(config.nodes[0].name, Some("NewName".to_string()));
-        assert_eq!(config.nodes[0].api_key, Some("secret".to_string()));
+        let nodes = &config.profiles.get("default").unwrap().nodes;
+        assert_eq!(nodes[0].name, Some("NewName".to_string()));
+        assert_eq!(nodes[0].api_key, Some("secret".to_string()));
     }
 
     #[test]
     fn test_merge_nodes_updates_custom_name() {
-        let mut config = Config {
-            nodes: vec![NodeConfig {
-                name: Some("Custom".to_string()),
-                address: "1.1.1.1:8080".to_string(),
-                api_key: None,
-            }],
-        };
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
+            name: Some("Custom".to_string()),
+            address: "1.1.1.1:8080".to_string(),
+            api_key: None,
+            use_keyring: false,
+        }];
 
         let discovered = vec![("1.1.1.1:8080".to_string(), "node1".to_string())];
 
         let updated = merge_nodes(&mut config, discovered);
         assert!(updated);
-        assert_eq!(config.nodes[0].name, Some("node1".to_string()));
+        let nodes = &config.profiles.get("default").unwrap().nodes;
+        assert_eq!(nodes[0].name, Some("node1".to_string()));
     }
 
     #[test]
     fn test_merge_nodes_cleans_id_prefix_from_config() {
-        let mut config = Config {
-            nodes: vec![NodeConfig {
-                name: Some("id=raspi1".to_string()),
-                address: "1.1.1.1:8080".to_string(),
-                api_key: None,
-            }],
-        };
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
+            name: Some("id=raspi1".to_string()),
+            address: "1.1.1.1:8080".to_string(),
+            api_key: None,
+            use_keyring: false,
+        }];
 
         // Discovered node has the clean name
         let discovered = vec![("1.1.1.1:8080".to_string(), "raspi1".to_string())];
 
         let updated = merge_nodes(&mut config, discovered);
         assert!(updated);
-        assert_eq!(config.nodes[0].name, Some("raspi1".to_string()));
+        let nodes = &config.profiles.get("default").unwrap().nodes;
+        assert_eq!(nodes[0].name, Some("raspi1".to_string()));
     }
 
     #[test]
     fn test_merge_nodes_prevents_duplicate_by_name() {
-        let mut config = Config {
-            nodes: vec![NodeConfig {
-                name: Some("raspi1".to_string()),
-                address: "1.1.1.1:8080".to_string(),
-                api_key: Some("secret".to_string()),
-            }],
-        };
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
+            name: Some("raspi1".to_string()),
+            address: "1.1.1.1:8080".to_string(),
+            api_key: Some("secret".to_string()),
+            use_keyring: false,
+        }];
 
         // raspi1 changed IP
         let discovered = vec![("1.1.1.2:8080".to_string(), "raspi1".to_string())];
 
         let updated = merge_nodes(&mut config, discovered);
         assert!(updated);
-        assert_eq!(config.nodes.len(), 1);
-        assert_eq!(config.nodes[0].address, "1.1.1.2:8080");
-        assert_eq!(config.nodes[0].name, Some("raspi1".to_string()));
-        assert_eq!(config.nodes[0].api_key, Some("secret".to_string()));
+        let nodes = &config.profiles.get("default").unwrap().nodes;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].address, "1.1.1.2:8080");
+        assert_eq!(nodes[0].name, Some("raspi1".to_string()));
+        assert_eq!(nodes[0].api_key, Some("secret".to_string()));
     }
 
     #[test]
@@ -498,6 +680,37 @@ mod tests {
         assert_eq!(entry_host(&info), "node1.local");
         assert_eq!(entry_addresses(&info), "1.2.3.4");
         assert_eq!(entry_instance(&info), "cobblerd-node1");
+    }
+
+    #[test]
+    fn test_config_migration() {
+        let yaml = r#"
+nodes:
+  - name: legacy-node
+    address: "1.2.3.4:8080"
+    api_key: "secret-token"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        
+        // Before migration check
+        assert_eq!(config.nodes.len(), 1);
+        assert!(config.profiles.is_empty());
+
+        // Perform migration (as in load_config)
+        if !config.nodes.is_empty() {
+            let profile = config
+                .profiles
+                .entry(default_profile_name())
+                .or_insert_with(ProfileConfig::default);
+            profile.nodes.extend(config.nodes.drain(..));
+        }
+
+        assert_eq!(config.nodes.len(), 0);
+        assert_eq!(config.profiles.len(), 1);
+        let profile = config.profiles.get("default").unwrap();
+        assert_eq!(profile.nodes.len(), 1);
+        assert_eq!(profile.nodes[0].name, Some("legacy-node".to_string()));
+        assert_eq!(profile.nodes[0].api_key, Some("secret-token".to_string()));
     }
 }
 
@@ -552,9 +765,13 @@ fn run_status(
         targets.extend(discover_targets()?);
     }
 
+    let active_profile = config.profiles.get(&config.active_profile);
+
     if targets.is_empty() {
-        for node in &config.nodes {
-            targets.push(node.address.clone());
+        if let Some(profile) = active_profile {
+            for node in &profile.nodes {
+                targets.push(node.address.clone());
+            }
         }
     }
 
@@ -576,9 +793,15 @@ fn run_status(
 
         let mut request = client.get(&status_url);
 
-        if let Some(node) = config.nodes.iter().find(|n| n.address == target) {
-            if let Some(api_key) = &node.api_key {
-                request = request.header(API_KEY_HEADER, api_key);
+        if let Some(profile) = active_profile {
+            if let Some(node) = profile
+                .nodes
+                .iter()
+                .find(|n| n.address == target || n.name.as_ref() == Some(&target))
+            {
+                if let Some(api_key) = node.get_api_key() {
+                    request = request.header(API_KEY_HEADER, api_key);
+                }
             }
         }
 
@@ -686,9 +909,13 @@ fn run_packages(
     mut targets: Vec<String>,
     config: &Config,
 ) -> Result<(), Box<dyn Error>> {
+    let active_profile = config.profiles.get(&config.active_profile);
+
     if targets.is_empty() {
-        for node in &config.nodes {
-            targets.push(node.address.clone());
+        if let Some(profile) = active_profile {
+            for node in &profile.nodes {
+                targets.push(node.address.clone());
+            }
         }
     }
 
@@ -710,9 +937,15 @@ fn run_packages(
 
         let mut request = client.post(&upgrade_url);
 
-        if let Some(node) = config.nodes.iter().find(|n| n.address == target) {
-            if let Some(api_key) = &node.api_key {
-                request = request.header(API_KEY_HEADER, api_key);
+        if let Some(profile) = active_profile {
+            if let Some(node) = profile
+                .nodes
+                .iter()
+                .find(|n| n.address == target || n.name.as_ref() == Some(&target))
+            {
+                if let Some(api_key) = node.get_api_key() {
+                    request = request.header(API_KEY_HEADER, api_key);
+                }
             }
         }
 
