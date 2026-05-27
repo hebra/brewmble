@@ -149,7 +149,9 @@ name = "cobbler"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "cobbler-rest",
  "flume",
+ "home",
  "humantime",
  "mdns-sd",
  "reqwest",
@@ -157,6 +159,13 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tabwriter",
+]
+
+[[package]]
+name = "cobbler-rest"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -390,6 +399,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "home"
+version = "0.5.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "http"

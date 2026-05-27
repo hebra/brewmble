@@ -3,6 +3,7 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait PackageManager: Send + Sync {
     fn name(&self) -> &str;
+    fn version(&self) -> String;
     fn is_available(&self) -> bool;
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;

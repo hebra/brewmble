@@ -11,6 +11,21 @@ impl PackageManager for Apt {
         "apt"
     }
 
+    fn version(&self) -> String {
+        Command::new("apt")
+            .arg("--version")
+            .output()
+            .or_else(|_| Command::new("apt-get").arg("--version").output())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string()
+            })
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+
     fn is_available(&self) -> bool {
         Command::new("apt")
             .arg("--version")

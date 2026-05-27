@@ -1,3 +1,4 @@
+use cobbler_rest::StatusResponse;
 use clap::{Parser, Subcommand};
 use flume::RecvTimeoutError;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -34,11 +35,24 @@ fn resolve_config_path(explicit_path: Option<PathBuf>) -> (PathBuf, bool) {
         return (path, true);
     }
 
-    let default_path = PathBuf::from(".cobbler.yaml");
-    if default_path.exists() {
-        (default_path, true)
+    if let Some(mut home) = home::home_dir() {
+        home.push(".cobbler.yaml");
+        if home.exists() {
+            return (home, true);
+        }
+    }
+
+    let local_path = PathBuf::from(".cobbler.yaml");
+    if local_path.exists() {
+        (local_path, true)
     } else {
-        (default_path, false)
+        // Default to home dir if it exists
+        if let Some(mut home) = home::home_dir() {
+            home.push(".cobbler.yaml");
+            (home, false)
+        } else {
+            (local_path, false)
+        }
     }
 }
 
@@ -540,10 +554,29 @@ fn run_status(
         let (status, body) = match request.send() {
             Ok(resp) => {
                 let status = resp.status().to_string();
-                let body = match resp.json::<serde_json::Value>() {
-                    Ok(json) => serde_json::to_string_pretty(&json)
-                        .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
-                    Err(_) => "Could not parse response as JSON".to_string(),
+                let body = if resp.status().is_success() {
+                    match resp.json::<StatusResponse>() {
+                        Ok(sr) => {
+                            let mut s = format!("Message: {}\n", sr.message);
+                            s.push_str(&format!("Upgrading: {}\n", sr.is_upgrading));
+                            if !sr.updates.is_empty() {
+                                s.push_str("Updates:\n");
+                                for update in &sr.updates {
+                                    s.push_str(&format!("  - {}\n", update));
+                                }
+                            } else {
+                                s.push_str("No updates available.\n");
+                            }
+                            s
+                        }
+                        Err(_) => "Could not parse StatusResponse".to_string(),
+                    }
+                } else {
+                    match resp.json::<serde_json::Value>() {
+                        Ok(json) => serde_json::to_string_pretty(&json)
+                            .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
+                        Err(_) => "Could not parse response as JSON".to_string(),
+                    }
                 };
                 (status, body)
             }

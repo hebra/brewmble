@@ -1,3 +1,5 @@
+use cobbler_rest::{HealthResponse, StatusResponse};
+use tower_http::trace::TraceLayer;
 use axum::{
     extract::{Request, State},
     http::StatusCode,
@@ -8,7 +10,6 @@ use axum::{
 };
 use clap::Parser;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use serde::Serialize;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -51,21 +52,15 @@ struct AppState {
     package_manager: Arc<Box<dyn PackageManager>>,
 }
 
-#[derive(Serialize, serde::Deserialize)]
-struct StatusResponse {
-    message: String,
-    updates: Vec<String>,
-    is_upgrading: bool,
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cobblerd=info".into()),
+                .unwrap_or_else(|_| "cobblerd=info,tower_http=debug,axum::rejection=trace".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(true))
         .init();
 
     let cli = Cli::parse();
@@ -122,8 +117,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = Router::new()
+        .route("/health", get(health_handler))
         .route("/status", get(status_handler))
         .route("/packages/full-upgrade", post(full_upgrade_handler))
+        .layer(TraceLayer::new_for_http())
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state);
 
@@ -154,6 +151,11 @@ async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, StatusCode> {
+    // Allow public access to /health
+    if req.uri().path() == "/health" {
+        return Ok(next.run(req).await);
+    }
+
     let auth_header = req
         .headers()
         .get("X-API-Key")
@@ -163,6 +165,15 @@ async fn auth_middleware(
         Some(key) if key == state.api_key => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
+}
+
+async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        package_manager: state.package_manager.name().to_string(),
+        package_manager_version: state.package_manager.version(),
+        is_upgrading: state.is_upgrading.load(Ordering::SeqCst),
+    })
 }
 
 async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
