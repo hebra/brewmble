@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+pub const API_KEY_HEADER: &str = "X-API-Key";
+pub const SERVICE_TYPE: &str = "_cobbler._tcp";
+pub const SERVICE_DOMAIN: &str = "local.";
+pub const SERVICE_FULL_TYPE: &str = "_cobbler._tcp.local.";
+
+pub const PATH_STATUS: &str = "/status";
+pub const PATH_HEALTH: &str = "/health";
+pub const PATH_UPGRADE: &str = "/packages/full-upgrade";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StatusResponse {
     pub message: String,
@@ -13,6 +22,11 @@ pub struct HealthResponse {
     pub package_manager: String,
     pub package_manager_version: String,
     pub is_upgrading: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UpgradeResponse {
+    pub message: String,
 }
 
 #[cfg(test)]
@@ -56,5 +70,17 @@ mod tests {
         assert_eq!(decoded.package_manager, resp.package_manager);
         assert_eq!(decoded.package_manager_version, resp.package_manager_version);
         assert_eq!(decoded.is_upgrading, resp.is_upgrading);
+    }
+
+    #[test]
+    fn test_upgrade_response_serialization() {
+        let resp = UpgradeResponse {
+            message: "Upgrade started".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"message\":\"Upgrade started\""));
+
+        let decoded: UpgradeResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.message, resp.message);
     }
 }

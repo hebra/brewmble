@@ -1,4 +1,7 @@
-use cobbler_rest::{HealthResponse, StatusResponse};
+use cobbler_rest::{
+    HealthResponse, StatusResponse, UpgradeResponse, API_KEY_HEADER, PATH_HEALTH, PATH_STATUS,
+    PATH_UPGRADE, SERVICE_FULL_TYPE,
+};
 use tower_http::trace::TraceLayer;
 use axum::{
     extract::{Request, State},
@@ -117,9 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/status", get(status_handler))
-        .route("/packages/full-upgrade", post(full_upgrade_handler))
+        .route(PATH_HEALTH, get(health_handler))
+        .route(PATH_STATUS, get(status_handler))
+        .route(PATH_UPGRADE, post(full_upgrade_handler))
         .layer(TraceLayer::new_for_http())
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state);
@@ -152,13 +155,13 @@ async fn auth_middleware(
     next: Next,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Allow public access to /health
-    if req.uri().path() == "/health" {
+    if req.uri().path() == PATH_HEALTH {
         return Ok(next.run(req).await);
     }
 
     let auth_header = req
         .headers()
-        .get("X-API-Key")
+        .get(API_KEY_HEADER)
         .and_then(|header| header.to_str().ok());
 
     match auth_header {
@@ -221,9 +224,9 @@ async fn full_upgrade_handler(State(state): State<AppState>) -> impl IntoRespons
     if !state.package_manager.is_available() {
         return (
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({
-                "message": format!("the system is not a {} system", state.package_manager.name())
-            })),
+            Json(UpgradeResponse {
+                message: format!("the system is not a {} system", state.package_manager.name()),
+            }),
         );
     }
 
@@ -234,9 +237,9 @@ async fn full_upgrade_handler(State(state): State<AppState>) -> impl IntoRespons
     {
         return (
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({
-                "message": "a full upgrade is currently running"
-            })),
+            Json(UpgradeResponse {
+                message: "a full upgrade is currently running".to_string(),
+            }),
         );
     }
 
@@ -252,9 +255,9 @@ async fn full_upgrade_handler(State(state): State<AppState>) -> impl IntoRespons
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "message": "full upgrade triggered"
-        })),
+        Json(UpgradeResponse {
+            message: "full upgrade triggered".to_string(),
+        }),
     )
 }
 
@@ -283,7 +286,7 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
     let info = if let Some(ip) = ip_addr {
         info!("Using explicit IP: {}", ip);
         match ServiceInfo::new(
-            "_cobbler._tcp.local.",
+        SERVICE_FULL_TYPE,
             &instance,
             &host_name,
             ip,
@@ -298,7 +301,7 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
         }
     } else {
         match ServiceInfo::new(
-            "_cobbler._tcp.local.",
+        SERVICE_FULL_TYPE,
             &instance,
             &host_name,
             "",
@@ -369,13 +372,13 @@ mod tests {
             package_manager: Arc::new(get_package_manager()),
         };
         let app = Router::new()
-            .route("/status", get(status_handler))
+            .route(PATH_STATUS, get(status_handler))
             .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
             .with_state(state);
 
         // No API key
         let response = app.clone()
-            .oneshot(Request::builder().uri("/status").body(axum::body::Body::empty()).unwrap())
+            .oneshot(Request::builder().uri(PATH_STATUS).body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -384,8 +387,8 @@ mod tests {
         let response = app.clone()
             .oneshot(
                 Request::builder()
-                    .uri("/status")
-                    .header("X-API-Key", "wrong-key")
+                    .uri(PATH_STATUS)
+                    .header(API_KEY_HEADER, "wrong-key")
                     .body(axum::body::Body::empty())
                     .unwrap()
             )
@@ -397,8 +400,8 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/status")
-                    .header("X-API-Key", api_key)
+                    .uri(PATH_STATUS)
+                    .header(API_KEY_HEADER, api_key)
                     .body(axum::body::Body::empty())
                     .unwrap()
             )
@@ -420,11 +423,11 @@ mod tests {
             package_manager: Arc::new(pm),
         };
         let app = Router::new()
-            .route("/status", get(status_handler))
+            .route(PATH_STATUS, get(status_handler))
             .with_state(state);
         
         let response = app
-            .oneshot(Request::builder().uri("/status").body(axum::body::Body::empty()).unwrap())
+            .oneshot(Request::builder().uri(PATH_STATUS).body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -449,11 +452,11 @@ mod tests {
             package_manager: Arc::new(pm),
         };
         let app = Router::new()
-            .route("/health", get(health_handler))
+            .route(PATH_HEALTH, get(health_handler))
             .with_state(state);
         
         let response = app
-            .oneshot(Request::builder().uri("/health").body(axum::body::Body::empty()).unwrap())
+            .oneshot(Request::builder().uri(PATH_HEALTH).body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -474,14 +477,14 @@ mod tests {
             package_manager: Arc::new(pm),
         };
         let app = Router::new()
-            .route("/packages/full-upgrade", post(full_upgrade_handler))
+            .route(PATH_UPGRADE, post(full_upgrade_handler))
             .with_state(state);
         
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/packages/full-upgrade")
+                    .uri(PATH_UPGRADE)
                     .body(axum::body::Body::empty())
                     .unwrap()
             )

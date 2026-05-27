@@ -5,7 +5,7 @@ This roadmap outlines the planned development for Cobbler, categorized by priori
 ## Phase 1: Foundation & Stability (Short-term)
 Focus on solidifying the current CLI/Daemon interaction and improving the developer experience.
 
-- [ ] **Unified REST Crate**: Extract API models and common logic into the `rest/` directory as a shared Rust library used by both CLI and Daemon.
+- [x] **Unified REST Crate**: Extract API models and common logic into the `rest/` directory as a shared Rust library used by both CLI and Daemon.
 - [ ] **Daemon for macOS**: Expand the daemon to fully support macOS (Homebrew), allowing macOS nodes to be managed just like Linux nodes.
 - [ ] **Comprehensive Logging**: Implement structured logging (e.g., using `tracing`) in the daemon to facilitate debugging and auditing.
 - [ ] **Config Management**: Improve CLI configuration handling, including support for multiple profiles and better credential storage.

@@ -1,4 +1,7 @@
-use cobbler_rest::StatusResponse;
+use cobbler_rest::{
+    StatusResponse, UpgradeResponse, API_KEY_HEADER, PATH_STATUS, PATH_UPGRADE, SERVICE_DOMAIN,
+    SERVICE_TYPE,
+};
 use clap::{Parser, Subcommand};
 use flume::RecvTimeoutError;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -11,8 +14,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tabwriter::TabWriter;
 
-const SERVICE_TYPE: &str = "_cobbler._tcp";
-const SERVICE_DOMAIN: &str = "local.";
 const TOKEN_PLACEHOLDER: &str = "REPLACE_WITH_ACTUAL_TOKEN";
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -571,13 +572,13 @@ fn run_status(
 
     for target in targets {
         let url = resolve_url(&target);
-        let status_url = format!("{}/status", url);
+        let status_url = format!("{}{}", url, PATH_STATUS);
 
         let mut request = client.get(&status_url);
 
         if let Some(node) = config.nodes.iter().find(|n| n.address == target) {
             if let Some(api_key) = &node.api_key {
-                request = request.header("X-API-Key", api_key);
+                request = request.header(API_KEY_HEADER, api_key);
             }
         }
 
@@ -705,22 +706,21 @@ fn run_packages(
 
     for target in targets {
         let url = resolve_url(&target);
-        let upgrade_url = format!("{}/packages/full-upgrade", url);
+        let upgrade_url = format!("{}{}", url, PATH_UPGRADE);
 
         let mut request = client.post(&upgrade_url);
 
         if let Some(node) = config.nodes.iter().find(|n| n.address == target) {
             if let Some(api_key) = &node.api_key {
-                request = request.header("X-API-Key", api_key);
+                request = request.header(API_KEY_HEADER, api_key);
             }
         }
 
         let (status, body) = match request.send() {
             Ok(resp) => {
                 let status = resp.status().to_string();
-                let body = match resp.json::<serde_json::Value>() {
-                    Ok(json) => serde_json::to_string_pretty(&json)
-                        .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
+                let body = match resp.json::<UpgradeResponse>() {
+                    Ok(ur) => ur.message,
                     Err(_) => "Upgrade triggered successfully".to_string(),
                 };
                 (status, body)
