@@ -36,6 +36,7 @@ This file provides guidance to agents when working with code in this repository.
 - mDNS instance name format: "cobblerd-{hostname}" where hostname is first part before dot
 - Daemon uses AtomicBool for is_upgrading state to prevent concurrent upgrades
 - Full upgrade spawns tokio task and returns immediately (fire-and-forget pattern)
+- Aim for at least 90% test coverage for all new code and major refactors
 
 ## Project Debug Rules (Non-Obvious Only)
 

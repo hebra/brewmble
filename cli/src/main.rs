@@ -468,6 +468,36 @@ mod tests {
         assert_eq!(clean_node_id("raspi1"), "raspi1");
         assert_eq!(clean_node_id(""), "");
     }
+
+    #[test]
+    fn test_resolve_url() {
+        assert_eq!(resolve_url("1.2.3.4:8080"), "http://1.2.3.4:8080");
+        assert_eq!(resolve_url("http://1.2.3.4:8080"), "http://1.2.3.4:8080");
+        assert_eq!(resolve_url("https://example.com"), "https://example.com");
+        assert_eq!(resolve_url("example.com:80"), "http://example.com:80");
+        assert_eq!(resolve_url("::1:8080"), "http://[::1]:8080");
+        assert_eq!(resolve_url("[::1]:8080"), "http://[::1]:8080");
+        assert_eq!(resolve_url("localhost"), "http://localhost");
+        assert_eq!(resolve_url("1.2.3.4:8080/"), "http://1.2.3.4:8080");
+    }
+
+    #[test]
+    fn test_entry_helpers() {
+        let properties = [("id", "node1")];
+        let info = ServiceInfo::new(
+            "_cobbler._tcp.local.",
+            "cobblerd-node1",
+            "node1.local.",
+            "1.2.3.4",
+            8080,
+            &properties[..],
+        ).unwrap();
+
+        assert_eq!(entry_id(&info), "node1");
+        assert_eq!(entry_host(&info), "node1.local");
+        assert_eq!(entry_addresses(&info), "1.2.3.4");
+        assert_eq!(entry_instance(&info), "cobblerd-node1");
+    }
 }
 
 

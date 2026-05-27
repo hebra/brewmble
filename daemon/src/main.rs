@@ -441,6 +441,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_health_handler() {
+        let pm = get_package_manager();
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            api_key: "test".to_string(),
+            package_manager: Arc::new(pm),
+        };
+        let app = Router::new()
+            .route("/health", get(health_handler))
+            .with_state(state);
+        
+        let response = app
+            .oneshot(Request::builder().uri("/health").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let health: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health.status, "ok");
+    }
+
+    #[tokio::test]
     async fn test_full_upgrade_handler_non_linux() {
         let pm = get_package_manager();
         let pm_name = pm.name().to_string();

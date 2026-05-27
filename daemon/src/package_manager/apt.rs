@@ -1,9 +1,18 @@
-use super::PackageManager;
+use super::{CommandRunner, PackageManager, RealCommandRunner};
 use async_trait::async_trait;
-use std::process::Command;
 use tracing::{error, info};
 
-pub struct Apt;
+pub struct Apt {
+    pub runner: Box<dyn CommandRunner>,
+}
+
+impl Default for Apt {
+    fn default() -> Self {
+        Self {
+            runner: Box::new(RealCommandRunner),
+        }
+    }
+}
 
 #[async_trait]
 impl PackageManager for Apt {
@@ -12,10 +21,9 @@ impl PackageManager for Apt {
     }
 
     fn version(&self) -> String {
-        Command::new("apt")
-            .arg("--version")
-            .output()
-            .or_else(|_| Command::new("apt-get").arg("--version").output())
+        self.runner
+            .run("apt", &["--version"])
+            .or_else(|_| self.runner.run("apt-get", &["--version"]))
             .map(|output| {
                 String::from_utf8_lossy(&output.stdout)
                     .lines()
@@ -27,14 +35,8 @@ impl PackageManager for Apt {
     }
 
     fn is_available(&self) -> bool {
-        Command::new("apt")
-            .arg("--version")
-            .output()
-            .is_ok()
-            || Command::new("apt-get")
-                .arg("--version")
-                .output()
-                .is_ok()
+        self.runner.run("apt", &["--version"]).is_ok()
+            || self.runner.run("apt-get", &["--version"]).is_ok()
     }
 
     #[cfg(target_os = "linux")]
@@ -42,9 +44,7 @@ impl PackageManager for Apt {
         use apt_pkg_native::Cache;
 
         info!("updating apt cache...");
-        let _ = Command::new("apt-get")
-            .arg("update")
-            .output();
+        let _ = self.runner.run("apt-get", &["update"]);
 
         info!("determining available updates...");
         let mut updates = Vec::new();
@@ -73,9 +73,7 @@ impl PackageManager for Apt {
 
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("starting apt full upgrade");
-        let output = Command::new("apt")
-            .args(["full-upgrade", "-y"])
-            .output();
+        let output = self.runner.run("apt", &["full-upgrade", "-y"]);
 
         match output {
             Ok(output) => {
@@ -98,5 +96,89 @@ impl PackageManager for Apt {
                 Err(err_msg.into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+    use std::io;
+
+    struct MockRunner {
+        success: bool,
+        stdout: String,
+        stderr: String,
+    }
+
+    impl CommandRunner for MockRunner {
+        fn run(&self, _program: &str, _args: &[&str]) -> io::Result<Output> {
+            Ok(Output {
+                status: ExitStatus::from_raw(if self.success { 0 } else { 1 << 8 }),
+                stdout: self.stdout.as_bytes().to_vec(),
+                stderr: self.stderr.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_apt_name() {
+        let apt = Apt::default();
+        assert_eq!(apt.name(), "apt");
+    }
+
+    #[test]
+    fn test_apt_version() {
+        let runner = MockRunner {
+            success: true,
+            stdout: "apt 2.0.2 (amd64)\n".to_string(),
+            stderr: "".to_string(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+        };
+        assert_eq!(apt.version(), "apt 2.0.2 (amd64)");
+    }
+
+    #[test]
+    fn test_apt_is_available() {
+        let runner = MockRunner {
+            success: true,
+            stdout: "".to_string(),
+            stderr: "".to_string(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+        };
+        assert!(apt.is_available());
+    }
+
+    #[tokio::test]
+    async fn test_apt_full_upgrade_success() {
+        let runner = MockRunner {
+            success: true,
+            stdout: "".to_string(),
+            stderr: "".to_string(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+        };
+        assert!(apt.full_upgrade().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_apt_full_upgrade_failure() {
+        let runner = MockRunner {
+            success: false,
+            stdout: "".to_string(),
+            stderr: "dpkg error".to_string(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+        };
+        let result = apt.full_upgrade().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dpkg error"));
     }
 }

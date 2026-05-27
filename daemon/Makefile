@@ -1,4 +1,4 @@
-.PHONY: build run check fmt clippy clean container
+.PHONY: build run check fmt clippy test clean container
 
 CONTAINER_TOOL ?= podman
 IMAGE_NAME ?= cobblerd
@@ -17,6 +17,9 @@ fmt:
 
 clippy:
 	cargo clippy -- -D warnings
+
+test:
+	cargo test
 
 clean:
 	cargo clean

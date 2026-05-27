@@ -14,3 +14,47 @@ pub struct HealthResponse {
     pub package_manager_version: String,
     pub is_upgrading: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_response_serialization() {
+        let resp = StatusResponse {
+            message: "All good".to_string(),
+            updates: vec!["pkg1".to_string(), "pkg2".to_string()],
+            is_upgrading: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"message\":\"All good\""));
+        assert!(json.contains("\"updates\":[\"pkg1\",\"pkg2\"]"));
+        assert!(json.contains("\"is_upgrading\":false"));
+
+        let decoded: StatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.message, resp.message);
+        assert_eq!(decoded.updates, resp.updates);
+        assert_eq!(decoded.is_upgrading, resp.is_upgrading);
+    }
+
+    #[test]
+    fn test_health_response_serialization() {
+        let resp = HealthResponse {
+            status: "ok".to_string(),
+            package_manager: "apt".to_string(),
+            package_manager_version: "1.2.3".to_string(),
+            is_upgrading: true,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("\"package_manager\":\"apt\""));
+        assert!(json.contains("\"package_manager_version\":\"1.2.3\""));
+        assert!(json.contains("\"is_upgrading\":true"));
+
+        let decoded: HealthResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.status, resp.status);
+        assert_eq!(decoded.package_manager, resp.package_manager);
+        assert_eq!(decoded.package_manager_version, resp.package_manager_version);
+        assert_eq!(decoded.is_upgrading, resp.is_upgrading);
+    }
+}
