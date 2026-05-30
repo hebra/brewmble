@@ -21,12 +21,3 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower-http = { version = "0.5", features = ["trace"] }
-
-[package.metadata.deb]
-maintainer = "Hendrik Brandt <github.com.nanometer045@passmail.net>"
-copyright = "2026, Hendrik Brandt <github.com.nanometer045@passmail.net>"
-license-file = "../LICENSE"
-depends = "$auto, libapt-pkg7.0"
-section = "utils"
-priority = "optional"
-systemd-units = { unit-name = "cobblerd.service" }
