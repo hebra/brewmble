@@ -4,7 +4,7 @@ use brewmble_rest::{
 };
 use clap::{Parser, Subcommand};
 use flume::RecvTimeoutError;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ResolvedService};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -438,14 +438,14 @@ fn run_discover(
                             entry_id(&info),
                             entry_host(&info),
                             entry_addresses(&info),
-                            info.get_port(),
+                            info.port,
                             entry_instance(&info)
                         )?;
                         writer.flush()?;
 
-                        if let Some(addr) = info.get_addresses().iter().next() {
+                        if let Some(addr) = info.addresses.iter().next() {
                             discovered_nodes.push((
-                                format!("{}:{}", addr, info.get_port()),
+                                format!("{}:{}", addr, info.port),
                                 entry_id(&info),
                             ));
                         }
@@ -487,6 +487,7 @@ fn run_discover(
 mod tests {
     use super::*;
     use clap::Parser;
+    use mdns_sd::ServiceInfo;
 
     #[test]
     fn test_cli_parse_discover_default() {
@@ -718,10 +719,12 @@ mod tests {
             &properties[..],
         ).unwrap();
 
-        assert_eq!(entry_id(&info), "node1");
-        assert_eq!(entry_host(&info), "node1.local");
-        assert_eq!(entry_addresses(&info), "1.2.3.4");
-        assert_eq!(entry_instance(&info), "brewmbled-node1");
+        let resolved = info.as_resolved_service();
+
+        assert_eq!(entry_id(&resolved), "node1");
+        assert_eq!(entry_host(&resolved), "node1.local");
+        assert_eq!(entry_addresses(&resolved), "1.2.3.4");
+        assert_eq!(entry_instance(&resolved), "brewmbled-node1");
     }
 
     #[test]
@@ -761,32 +764,24 @@ fn clean_node_id(id: &str) -> &str {
     id.strip_prefix("id=").unwrap_or(id)
 }
 
-fn entry_id(entry: &ServiceInfo) -> String {
-    let props = entry.get_properties();
-    props
-        .get("id")
-        .map(|value| clean_node_id(&value.to_string()).to_string())
+fn entry_id(entry: &ResolvedService) -> String {
+    entry.txt_properties
+        .iter()
+        .find(|p| p.key() == "id")
+        .map(|p| clean_node_id(p.val_str()).to_string())
         .unwrap_or_default()
 }
 
-fn entry_host(entry: &ServiceInfo) -> String {
-    entry.get_hostname().trim_end_matches('.').to_string()
+fn entry_host(entry: &ResolvedService) -> String {
+    entry.host.trim_end_matches('.').to_string()
 }
 
-fn entry_addresses(entry: &ServiceInfo) -> String {
-    let mut parts = Vec::new();
-    let addrs = entry.get_addresses();
-    for addr in addrs.iter().filter(|addr| addr.is_ipv4()) {
-        parts.push(addr.to_string());
-    }
-    for addr in addrs.iter().filter(|addr| addr.is_ipv6()) {
-        parts.push(addr.to_string());
-    }
-    parts.join(",")
+fn entry_addresses(entry: &ResolvedService) -> String {
+    entry.addresses.iter().map(|addr| addr.to_string()).collect::<Vec<_>>().join(",")
 }
 
-fn entry_instance(entry: &ServiceInfo) -> String {
-    let fullname = entry.get_fullname();
+fn entry_instance(entry: &ResolvedService) -> String {
+    let fullname = &entry.fullname;
     let suffix = format!(
         ".{}.{}",
         SERVICE_TYPE.trim_end_matches('.'),
@@ -912,8 +907,8 @@ fn discover_targets() -> Result<Vec<String>, Box<dyn Error>> {
         match receiver.recv_timeout(remaining) {
             Ok(event) => {
                 if let ServiceEvent::ServiceResolved(info) = event {
-                    for addr in info.get_addresses() {
-                        let target = format!("{}:{}", addr, info.get_port());
+                    for addr in &info.addresses {
+                        let target = format!("{}:{}", addr, info.port);
                         if seen.insert(target.clone()) {
                             targets.push(target);
                         }

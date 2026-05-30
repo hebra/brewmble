@@ -35,8 +35,27 @@ Brewmble consists of several key components:
 
 #### Using cargo
 
+
+#### Create a local daemon user (Linux)
 ```shell
-cargo install --git https://git.cinerea.app/tools/brewmble
+sudo useradd -md /opt/brewmble brewmble
+sudo su brewmble
+```
+
+#### Install Rust and Cargo
+```shell
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.bashrc
+```
+
+
+
+```shell
+# CLI tools
+cargo install --git https://github.com/hebra/brewmble.git brewmble
+
+# Daemon
+cargo install --git https://github.com/hebra/brewmble.git brewmbled
 ```
 
 #### From cloned sources
