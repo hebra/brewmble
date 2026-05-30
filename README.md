@@ -1,27 +1,27 @@
-# Cobbler
+# Brewmble
 
-Cobbler is a powerful and flexible management tool for Linux and macOS systems.
+Brewmble is a powerful and flexible management tool for Linux and macOS systems.
 It centralises and automates the process of keeping systems up-to-date.
-The main use case for Cobbler is in small Raspberry Pi clusters or home labs,
+The main use case for Brewmble is in small Raspberry Pi clusters or home labs,
 where it simplifies the maintenance of multiple devices.
 
 ## Features
 
 - **Automated Updates**: Centralised management for system updates across multiple nodes.
 - **Multi-backend Support**: Supports different package managers (currently APT and Homebrew).
-- **mDNS Discovery**: Automatic discovery of Cobbler daemons on the local network.
+- **mDNS Discovery**: Automatic discovery of Brewmble daemons on the local network.
 - **RESTful API**: Each node provides a REST API for status and management.
 - **CLI Tool**: A unified command-line interface to manage your entire cluster.
 - **Containerized**: Ready to run as a container for easy deployment.
 
 ## Components
 
-Cobbler consists of several key components:
+Brewmble consists of several key components:
 
-- **[Cobbler Daemon](./daemon)**: A background service (`cobblerd`) that runs on each managed node. It interacts with the local package manager (APT or Homebrew) and exposes a REST API.
-- **[Cobbler CLI](./cli)**: A command-line tool (`cobbler`) for humans to interact with one or more daemons.
-- **Cobbler REST**: The REST API specification used for communication between components.
-- **Cobbler Web**: (In development) A web-based dashboard for cluster overview.
+- **[Brewmble Daemon](./daemon)**: A background service (`brewmbled`) that runs on each managed node. It interacts with the local package manager (APT or Homebrew) and exposes a REST API.
+- **[Brewmble CLI](./cli)**: A command-line tool (`brewmble`) for humans to interact with one or more daemons.
+- **Brewmble REST**: The REST API specification used for communication between components.
+- **Brewmble Web**: (In development) A web-based dashboard for cluster overview.
 
 ## Getting Started
 
@@ -32,6 +32,14 @@ Cobbler consists of several key components:
 - mDNS/Avahi support (for discovery)
 
 ### Installation
+
+#### Using cargo
+
+```shell
+cargo install --git https://git.cinerea.app/tools/brewmble
+```
+
+#### From cloned sources
 
 To build all components:
 
@@ -47,30 +55,30 @@ cd daemon && cargo build --release
 
 1. Start the daemon on your target nodes:
    ```bash
-   ./daemon/target/release/cobblerd
+   ./daemon/target/release/brewmbled
    ```
 
 2. Use the CLI to discover and manage nodes:
    ```bash
    # Discover nodes
-   ./cli/target/release/cobbler discover
+   ./cli/target/release/brewmble discover
 
    # Check status
-   ./cli/target/release/cobbler status --all
+   ./cli/target/release/brewmble status --all
 
    # Trigger upgrade
-   ./cli/target/release/cobbler packages --full-upgrade <target>
+   ./cli/target/release/brewmble packages --full-upgrade <target>
    ```
 
 ## Security
 
-Cobbler provides several options to secure communication between the CLI and daemons:
+Brewmble provides several options to secure communication between the CLI and daemons:
 
 ### 1. API Key Authentication (Built-in)
 
 The primary security layer is API Key authentication.
-- **Daemon**: Set `COBBLER_DAEMON_API_KEY`. If not provided, a random UUID v4 is generated and logged at startup.
-- **CLI**: Store keys in `.cobbler.yaml` for each node, or use the system keyring for better security.
+- **Daemon**: Set `BREWMBLE_DAEMON_API_KEY`. If not provided, a random UUID v4 is generated and logged at startup.
+- **CLI**: Store keys in `.brewmble.yaml` for each node, or use the system keyring for better security.
 - **Protocol**: All requests must include the `X-API-Key` header.
 
 ### 2. HTTPS via Reverse Proxy
@@ -93,19 +101,19 @@ For clusters, using a private network layer is recommended:
 
 ## Configuration
 
-Cobbler can be configured using environment variables.
+Brewmble can be configured using environment variables.
 
 ### Environment Variables
 
 | Variable | Component | Description | Default |
 |:---|:---|:---|:---|
-| `COBBLER_DAEMON_PORT` | Daemon | Port for the daemon to listen on. If not specified, the daemon will search for a free port starting from 8080. | `8080` (auto-hunt) |
-| `COBBLER_DAEMON_HOSTNAME` | Daemon | Hostname to use for mDNS registration. | System hostname |
-| `COBBLER_DAEMON_IP` | Daemon | Explicit IP address to use for mDNS registration. | Automatically detected |
-| `COBBLER_DAEMON_API_KEY` | Daemon | API key for authentication. If not provided, a random UUID v4 will be generated and logged. | Generated |
-| `COBBLER_TIMEOUT` | CLI | Timeout for discovery and HTTP requests. Supports seconds or [humantime](https://docs.rs/humantime) (e.g., `1m`, `30s`). | `5s` (discovery), `60s` (HTTP) |
-| `COBBLER_CONFIG` | CLI | Path to the CLI configuration file. | `.cobbler.yaml` |
-| `RUST_LOG` | Daemon | Logging filter for the daemon (e.g., `info`, `debug`). | `cobblerd=info` |
+| `BREWMBLE_DAEMON_PORT` | Daemon | Port for the daemon to listen on. If not specified, the daemon will search for a free port starting from 8080. | `8080` (auto-hunt) |
+| `BREWMBLE_DAEMON_HOSTNAME` | Daemon | Hostname to use for mDNS registration. | System hostname |
+| `BREWMBLE_DAEMON_IP` | Daemon | Explicit IP address to use for mDNS registration. | Automatically detected |
+| `BREWMBLE_DAEMON_API_KEY` | Daemon | API key for authentication. If not provided, a random UUID v4 will be generated and logged. | Generated |
+| `BREWMBLE_TIMEOUT` | CLI | Timeout for discovery and HTTP requests. Supports seconds or [humantime](https://docs.rs/humantime) (e.g., `1m`, `30s`). | `5s` (discovery), `60s` (HTTP) |
+| `BREWMBLE_CONFIG` | CLI | Path to the CLI configuration file. | `.brewmble.yaml` |
+| `RUST_LOG` | Daemon | Logging filter for the daemon (e.g., `info`, `debug`). | `brewmbled=info` |
 | `CONTAINER_TOOL` | Makefile | Tool used for container operations. | `podman` |
 
 ## Development

@@ -1,10 +1,10 @@
-# Cobbler Daemon
+# Brewmble Daemon
 
-The Cobbler Daemon (`cobblerd`) is a background service that runs on managed nodes. It provides a REST API for system status and package management, supporting multiple backends like APT (Linux) and Homebrew (macOS).
+The Brewmble Daemon (`brewmbled`) is a background service that runs on managed nodes. It provides a REST API for system status and package management, supporting multiple backends like APT (Linux) and Homebrew (macOS).
 
 ## Features
 
-- **mDNS Registration**: Automatically announces itself on the local network as `_cobbler._tcp`.
+- **mDNS Registration**: Automatically announces itself on the local network as `_brewmble._tcp`.
 - **Multi-backend Support**: Automatically detects and uses the available package manager (APT or Homebrew).
 - **System Status**: Reports whether the system is up-to-date and lists available updates.
 - **Package Management**: Can trigger a full system upgrade via the detected package manager.
@@ -19,15 +19,15 @@ The Cobbler Daemon (`cobblerd`) is a background service that runs on managed nod
 cargo build --release
 ```
 
-The binary will be located at `target/release/cobblerd`.
+The binary will be located at `target/release/brewmbled`.
 
 ### Using Docker/Podman
 
 A `Containerfile` is provided for building a container image:
 
 ```bash
-podman build -t cobblerd .
-podman run -d --net=host --cap-add=CAP_SYS_ADMIN cobblerd
+podman build -t brewmbled .
+podman run -d --net=host --cap-add=CAP_SYS_ADMIN brewmbled
 ```
 
 *Note: `--net=host` is required for mDNS discovery, and `CAP_SYS_ADMIN` (or equivalent) may be needed for APT operations depending on your configuration.*
@@ -36,10 +36,10 @@ podman run -d --net=host --cap-add=CAP_SYS_ADMIN cobblerd
 
 Environment variables can be used for configuration:
 
-- `COBBLER_DAEMON_PORT`: Port to listen on.
-- `COBBLER_DAEMON_HOSTNAME`: Hostname to use for mDNS registration.
-- `COBBLER_DAEMON_IP`: Explicit IP address to use for mDNS registration.
-- `COBBLER_DAEMON_API_KEY`: API key for authentication. If not provided, one will be generated on startup and printed to the logs.
+- `BREWMBLE_DAEMON_PORT`: Port to listen on.
+- `BREWMBLE_DAEMON_HOSTNAME`: Hostname to use for mDNS registration.
+- `BREWMBLE_DAEMON_IP`: Explicit IP address to use for mDNS registration.
+- `BREWMBLE_DAEMON_API_KEY`: API key for authentication. If not provided, one will be generated on startup and printed to the logs.
 - `RUST_LOG`: Logging level (e.g., `info`, `debug`).
 
 ## Security and Authentication

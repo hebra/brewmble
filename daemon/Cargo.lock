@@ -163,6 +163,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "812e12b5285cc515a9c72a5c1d3b6d46a19dac5acfef5265968c166106e31dd3"
 
 [[package]]
+name = "brewmble-rest"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "brewmbled"
+version = "0.1.0"
+dependencies = [
+ "apt-pkg-native",
+ "async-trait",
+ "axum",
+ "brewmble-rest",
+ "clap",
+ "gethostname",
+ "mdns-sd",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -229,34 +257,6 @@ name = "clap_lex"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
-
-[[package]]
-name = "cobbler-rest"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "cobblerd"
-version = "0.1.0"
-dependencies = [
- "apt-pkg-native",
- "async-trait",
- "axum",
- "clap",
- "cobbler-rest",
- "gethostname",
- "mdns-sd",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
 
 [[package]]
 name = "colorchoice"

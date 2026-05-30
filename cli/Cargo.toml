@@ -1,10 +1,10 @@
 [package]
-name = "cobbler"
+name = "brewmble"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cobbler-rest = { path = "../rest" }
+brewmble-rest = { path = "../rest" }
 clap = { version = "4", features = ["derive", "env"] }
 humantime = "2.1"
 flume = "0.10"

@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 pub const API_KEY_HEADER: &str = "X-API-Key";
-pub const SERVICE_TYPE: &str = "_cobbler._tcp";
+pub const SERVICE_TYPE: &str = "_brewmble._tcp";
 pub const SERVICE_DOMAIN: &str = "local.";
-pub const SERVICE_FULL_TYPE: &str = "_cobbler._tcp.local.";
+pub const SERVICE_FULL_TYPE: &str = "_brewmble._tcp.local.";
 
 pub const PATH_STATUS: &str = "/status";
 pub const PATH_HEALTH: &str = "/health";

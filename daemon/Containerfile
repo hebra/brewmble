@@ -17,5 +17,5 @@ RUN apt-get update \
     && apt-get install -y libapt-pkg7.0 \
     && apt full-upgrade -s
 
-COPY --from=builder /app/target/release/cobblerd /usr/local/bin/cobblerd
-ENTRYPOINT ["/usr/local/bin/cobblerd"]
+COPY --from=builder /app/target/release/brewmbled /usr/local/bin/brewmbled
+ENTRYPOINT ["/usr/local/bin/brewmbled"]

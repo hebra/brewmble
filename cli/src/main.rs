@@ -1,4 +1,4 @@
-use cobbler_rest::{
+use brewmble_rest::{
     StatusResponse, UpgradeResponse, API_KEY_HEADER, PATH_STATUS, PATH_UPGRADE, SERVICE_DOMAIN,
     SERVICE_TYPE,
 };
@@ -64,7 +64,7 @@ struct NodeConfig {
 impl NodeConfig {
     fn get_api_key(&self) -> Option<String> {
         if self.use_keyring {
-            let entry = Entry::new("cobbler-cli", &self.address).ok()?;
+            let entry = Entry::new("brewmble-cli", &self.address).ok()?;
             entry.get_password().ok()
         } else {
             self.api_key.clone()
@@ -78,19 +78,19 @@ fn resolve_config_path(explicit_path: Option<PathBuf>) -> (PathBuf, bool) {
     }
 
     if let Some(mut home) = home::home_dir() {
-        home.push(".cobbler.yaml");
+        home.push(".brewmble.yaml");
         if home.exists() {
             return (home, true);
         }
     }
 
-    let local_path = PathBuf::from(".cobbler.yaml");
+    let local_path = PathBuf::from(".brewmble.yaml");
     if local_path.exists() {
         (local_path, true)
     } else {
         // Default to home dir if it exists
         if let Some(mut home) = home::home_dir() {
-            home.push(".cobbler.yaml");
+            home.push(".brewmble.yaml");
             (home, false)
         } else {
             (local_path, false)
@@ -183,7 +183,7 @@ fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
 }
 
 fn get_default_timeout() -> Duration {
-    std::env::var("COBBLER_TIMEOUT")
+    std::env::var("BREWMBLE_TIMEOUT")
         .ok()
         .and_then(|v| {
             v.parse::<u64>()
@@ -195,11 +195,11 @@ fn get_default_timeout() -> Duration {
 }
 
 #[derive(Parser)]
-#[command(name = "cobbler")]
-#[command(about = "A CLI tool for cobbler", long_about = None)]
+#[command(name = "brewmble")]
+#[command(about = "A CLI tool for brewmble", long_about = None)]
 struct Cli {
     /// Path to the configuration file
-    #[arg(short, long, env = "COBBLER_CONFIG")]
+    #[arg(short, long, env = "BREWMBLE_CONFIG")]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -208,26 +208,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Discover cobbler daemons on the local network
+    /// Discover brewmble daemons on the local network
     Discover {
         /// Time to wait for responses in seconds
-        #[arg(short, long, default_value = "5", env = "COBBLER_TIMEOUT")]
+        #[arg(short, long, default_value = "5", env = "BREWMBLE_TIMEOUT")]
         timeout: u64,
 
         /// Create and/or update a config file with newly found daemons
         #[arg(short = 'u', long = "update-config")]
         update_config: bool,
     },
-    /// Show status of cobbler daemons
+    /// Show status of brewmble daemons
     Status {
-        /// Get status for all discovered cobbler daemons
+        /// Get status for all discovered brewmble daemons
         #[arg(short, long)]
         all: bool,
 
         /// Targets (host:port)
         targets: Vec<String>,
     },
-    /// Manage packages on cobbler daemons
+    /// Manage packages on brewmble daemons
     Packages {
         /// Perform a full system upgrade
         #[arg(long, required = true)]
@@ -375,7 +375,7 @@ fn run_profile(
                     .find(|n| n.address == node_id || n.name.as_ref() == Some(&node_id))
                     .ok_or_else(|| format!("Node '{}' not found in profile '{}'", node_id, p_name))?;
 
-                let entry = Entry::new("cobbler-cli", &node.address)?;
+                let entry = Entry::new("brewmble-cli", &node.address)?;
                 entry.set_password(&key)?;
 
                 node.use_keyring = true;
@@ -466,7 +466,7 @@ fn run_discover(
     let _ = mdns.shutdown();
 
     if !header_printed {
-        println!("No cobbler daemons found.");
+        println!("No brewmble daemons found.");
     }
 
     if update_config {
@@ -490,7 +490,8 @@ mod tests {
 
     #[test]
     fn test_cli_parse_discover_default() {
-        let cli = Cli::parse_from(&["cobbler", "discover"]);
+        std::env::remove_var("BREWMBLE_TIMEOUT");
+        let cli = Cli::parse_from(&["brewmble", "discover"]);
         if let Commands::Discover {
             timeout,
             update_config,
@@ -505,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_discover_timeout() {
-        let cli = Cli::parse_from(&["cobbler", "discover", "-t", "10", "-u"]);
+        let cli = Cli::parse_from(&["brewmble", "discover", "-t", "10", "-u"]);
         if let Commands::Discover {
             timeout,
             update_config,
@@ -520,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_packages_dry_run() {
-        let cli = Cli::parse_from(&["cobbler", "packages", "--full-upgrade", "--dry-run"]);
+        let cli = Cli::parse_from(&["brewmble", "packages", "--full-upgrade", "--dry-run"]);
         if let Commands::Packages {
             full_upgrade,
             dry_run,
@@ -537,7 +538,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_packages_no_dry_run() {
-        let cli = Cli::parse_from(&["cobbler", "packages", "--full-upgrade", "host:8080"]);
+        let cli = Cli::parse_from(&["brewmble", "packages", "--full-upgrade", "host:8080"]);
         if let Commands::Packages {
             full_upgrade,
             dry_run,
@@ -560,19 +561,21 @@ mod tests {
         assert!(exists);
 
         let (path, _) = resolve_config_path(None);
-        assert_eq!(path, PathBuf::from(".cobbler.yaml"));
+        assert!(path.to_string_lossy().contains(".brewmble.yaml"));
     }
 
     #[test]
     fn test_get_default_timeout() {
-        std::env::set_var("COBBLER_TIMEOUT", "15");
+        std::env::remove_var("BREWMBLE_TIMEOUT");
+        assert_eq!(get_default_timeout(), Duration::from_secs(60));
+
+        std::env::set_var("BREWMBLE_TIMEOUT", "15");
         assert_eq!(get_default_timeout(), Duration::from_secs(15));
 
-        std::env::set_var("COBBLER_TIMEOUT", "1m");
+        std::env::set_var("BREWMBLE_TIMEOUT", "1m");
         assert_eq!(get_default_timeout(), Duration::from_secs(60));
 
-        std::env::remove_var("COBBLER_TIMEOUT");
-        assert_eq!(get_default_timeout(), Duration::from_secs(60));
+        std::env::remove_var("BREWMBLE_TIMEOUT");
     }
 
     #[test]
@@ -594,7 +597,7 @@ mod tests {
         assert!(updated);
         let nodes = &config.profiles.get("default").unwrap().nodes;
         assert_eq!(nodes.len(), 2);
-        
+
         // Existing node updated with name
         assert_eq!(nodes[0].address, "1.1.1.1:8080");
         assert_eq!(nodes[0].name, Some("node1".to_string()));
@@ -707,8 +710,8 @@ mod tests {
     fn test_entry_helpers() {
         let properties = [("id", "node1")];
         let info = ServiceInfo::new(
-            "_cobbler._tcp.local.",
-            "cobblerd-node1",
+            "_brewmble._tcp.local.",
+            "brewmbled-node1",
             "node1.local.",
             "1.2.3.4",
             8080,
@@ -718,7 +721,7 @@ mod tests {
         assert_eq!(entry_id(&info), "node1");
         assert_eq!(entry_host(&info), "node1.local");
         assert_eq!(entry_addresses(&info), "1.2.3.4");
-        assert_eq!(entry_instance(&info), "cobblerd-node1");
+        assert_eq!(entry_instance(&info), "brewmbled-node1");
     }
 
     #[test]
@@ -730,7 +733,7 @@ nodes:
     api_key: "secret-token"
 "#;
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
-        
+
         // Before migration check
         assert_eq!(config.nodes.len(), 1);
         assert!(config.profiles.is_empty());
@@ -977,7 +980,7 @@ fn run_packages(
 
         let mut request = client
             .post(&upgrade_url)
-            .json(&cobbler_rest::UpgradeRequest { dry_run });
+            .json(&brewmble_rest::UpgradeRequest { dry_run });
 
         if let Some(profile) = active_profile {
             if let Some(node) = profile

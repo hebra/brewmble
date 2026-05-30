@@ -303,6 +303,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "brewmble"
+version = "0.1.0"
+dependencies = [
+ "brewmble-rest",
+ "clap",
+ "flume",
+ "home",
+ "humantime",
+ "keyring",
+ "mdns-sd",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tabwriter",
+]
+
+[[package]]
+name = "brewmble-rest"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -394,31 +419,6 @@ name = "clap_lex"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
-
-[[package]]
-name = "cobbler"
-version = "0.1.0"
-dependencies = [
- "clap",
- "cobbler-rest",
- "flume",
- "home",
- "humantime",
- "keyring",
- "mdns-sd",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "tabwriter",
-]
-
-[[package]]
-name = "cobbler-rest"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "colorchoice"

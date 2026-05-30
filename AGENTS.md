@@ -14,14 +14,14 @@ This file provides guidance to agents when working with code in this repository.
 ## Non-Obvious Project Patterns
 
 - Daemon requires Linux systems (apt-pkg-native dependency fails on other platforms)
-- Uses mDNS service discovery with "_cobbler._tcp.local." service type for automatic daemon discovery
-- Environment variables control daemon configuration: COBBLER_DAEMON_PORT (default 8080), COBBLER_DAEMON_HOSTNAME, COBBLER_DAEMON_IP, COBBLER_DAEMON_API_KEY
-- COBBLER_TIMEOUT env var accepts both seconds (integer) or humantime format (e.g., "1m", "30s")
+- Uses mDNS service discovery with "_brewmble._tcp.local." service type for automatic daemon discovery
+- Environment variables control daemon configuration: BREWMBLE_DAEMON_PORT (default 8080), BREWMBLE_DAEMON_HOSTNAME, BREWMBLE_DAEMON_IP, BREWMBLE_DAEMON_API_KEY
+- BREWMBLE_TIMEOUT env var accepts both seconds (integer) or humantime format (e.g., "1m", "30s")
 - Daemon runs 'apt-get update' on every status check (not cached) - see get_apt_updates()
 - CLI uses blocking HTTP client (reqwest with blocking feature) while daemon uses async Axum framework
 - Different Rust editions: CLI uses 2021, daemon uses 2024
 - Container builds use podman with ports 8080 (HTTP) and 5353 (mDNS)
-- Daemon auto-hunts for free port starting from 8080 if COBBLER_DAEMON_PORT not set
+- Daemon auto-hunts for free port starting from 8080 if BREWMBLE_DAEMON_PORT not set
 - API authentication uses X-API-Key header (not Authorization header)
 - If no API key provided, daemon generates UUID v4 and logs it
 
@@ -33,7 +33,7 @@ This file provides guidance to agents when working with code in this repository.
 - Service discovery timeout handling with flume channels (see cli/src/main.rs discover_targets)
 - TabWriter for formatted CLI output with custom padding (2 spaces)
 - IPv6 addresses in URLs must be wrapped in brackets: `http://[::1]:8080` (see resolve_url function)
-- mDNS instance name format: "cobblerd-{hostname}" where hostname is first part before dot
+- mDNS instance name format: "brewmbled-{hostname}" where hostname is first part before dot
 - Daemon uses AtomicBool for is_upgrading state to prevent concurrent upgrades
 - Full upgrade spawns tokio task and returns immediately (fire-and-forget pattern)
 - Aim for at least 90% test coverage for all new code and major refactors

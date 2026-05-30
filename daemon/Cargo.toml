@@ -1,5 +1,5 @@
 [package]
-name = "cobblerd"
+name = "brewmbled"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,7 +7,7 @@ edition = "2024"
 apt-pkg-native = "0.3.3"
 
 [dependencies]
-cobbler-rest = { path = "../rest" }
+brewmble-rest = { path = "../rest" }
 clap = { version = "4", features = ["derive", "env"] }
 axum = "0.7"
 gethostname = "0.5"

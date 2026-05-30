@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "cobbler-rest"
+name = "brewmble-rest"
 version = "0.1.0"
 dependencies = [
  "serde",

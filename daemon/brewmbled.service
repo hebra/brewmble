@@ -1,11 +1,11 @@
 [Unit]
-Description=Cobbler Daemon
+Description=Brewmble Daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/cobblerd
+ExecStart=/usr/bin/brewmbled
 Restart=on-failure
 User=root
 

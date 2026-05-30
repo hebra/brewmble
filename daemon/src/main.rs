@@ -1,4 +1,4 @@
-use cobbler_rest::{
+use brewmble_rest::{
     HealthResponse, StatusResponse, UpgradeRequest, UpgradeResponse, API_KEY_HEADER, PATH_HEALTH,
     PATH_STATUS, PATH_UPGRADE, SERVICE_FULL_TYPE,
 };
@@ -28,23 +28,23 @@ use package_manager::{get_package_manager, PackageManager};
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
 #[derive(Parser)]
-#[command(name = "cobblerd")]
-#[command(about = "Cobbler daemon", long_about = None)]
+#[command(name = "brewmbled")]
+#[command(about = "Brewmble daemon", long_about = None)]
 struct Cli {
     /// Port to listen on. If not specified, the daemon will search for a free port starting from 8080.
-    #[arg(short, long, env = "COBBLER_DAEMON_PORT")]
+    #[arg(short, long, env = "BREWMBLE_DAEMON_PORT")]
     port: Option<u16>,
 
     /// Hostname to use for mDNS registration. Defaults to the system hostname.
-    #[arg(long, env = "COBBLER_DAEMON_HOSTNAME")]
+    #[arg(long, env = "BREWMBLE_DAEMON_HOSTNAME")]
     hostname: Option<String>,
 
     /// Explicit IP address to use for mDNS registration.
-    #[arg(long, env = "COBBLER_DAEMON_IP")]
+    #[arg(long, env = "BREWMBLE_DAEMON_IP")]
     ip: Option<IpAddr>,
 
     /// API key for authentication. If not provided, one will be generated.
-    #[arg(long, env = "COBBLER_DAEMON_API_KEY")]
+    #[arg(long, env = "BREWMBLE_DAEMON_API_KEY")]
     api_key: Option<String>,
 }
 
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cobblerd=info,tower_http=debug,axum::rejection=trace".into()),
+                .unwrap_or_else(|_| "brewmbled=info,tower_http=debug,axum::rejection=trace".into()),
         )
         .with(tracing_subscriber::fmt::layer().with_ansi(true))
         .init();
@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
 
     info!(
-        "cobbler daemon listening on {}",
+        "brewmble daemon listening on {}",
         listener.local_addr()?
     );
 
@@ -303,7 +303,7 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
     };
 
     let instance_hostname = hostname.split('.').next().unwrap_or(hostname);
-    let instance = format!("cobblerd-{instance_hostname}");
+    let instance = format!("brewmbled-{instance_hostname}");
     let host_name = format!("{instance_hostname}.local.");
     let properties = [("id", hostname)];
 
@@ -436,7 +436,7 @@ mod tests {
             )
             .await
             .unwrap();
-        
+
         // It should pass middleware. Whether it's 200 or 412 depends on OS
         assert!(response.status() == StatusCode::OK || response.status() == StatusCode::PRECONDITION_FAILED);
     }
@@ -454,7 +454,7 @@ mod tests {
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
             .with_state(state);
-        
+
         let response = app
             .oneshot(Request::builder().uri(PATH_STATUS).body(axum::body::Body::empty()).unwrap())
             .await
@@ -483,7 +483,7 @@ mod tests {
         let app = Router::new()
             .route(PATH_HEALTH, get(health_handler))
             .with_state(state);
-        
+
         let response = app
             .oneshot(Request::builder().uri(PATH_HEALTH).body(axum::body::Body::empty()).unwrap())
             .await
@@ -508,7 +508,7 @@ mod tests {
         let app = Router::new()
             .route(PATH_UPGRADE, post(full_upgrade_handler))
             .with_state(state);
-        
+
         let response = app
             .oneshot(
                 Request::builder()
@@ -591,12 +591,12 @@ mod tests {
     #[tokio::test]
     async fn test_port_hunting() {
         use tokio::net::TcpListener;
-        
+
         // Bind to a random port first to simulate it being in use
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bound_addr = listener.local_addr().unwrap();
         let bound_port = bound_addr.port();
-        
+
         // Now try to find a port starting from bound_port. It should find bound_port + 1 or higher.
         let mut port = bound_port;
         let found_port = loop {
@@ -610,39 +610,39 @@ mod tests {
                 }
             }
         };
-        
+
         assert!(found_port > bound_port);
-        
+
         drop(listener);
     }
 
     #[tokio::test]
     async fn test_port_fail_if_env_set() {
         use tokio::net::TcpListener;
-        
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bound_port = listener.local_addr().unwrap().port();
-        
+
         // Set environment variable
-        unsafe { std::env::set_var("COBBLER_DAEMON_PORT", bound_port.to_string()); }
-        
-        let port_env = std::env::var("COBBLER_DAEMON_PORT").ok();
+        unsafe { std::env::set_var("BREWMBLE_DAEMON_PORT", bound_port.to_string()); }
+
+        let port_env = std::env::var("BREWMBLE_DAEMON_PORT").ok();
         assert!(port_env.is_some());
-        
+
         let port_str = port_env.unwrap();
         let port = port_str.parse::<u16>().unwrap();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let result = TcpListener::bind(addr).await;
-        
+
         assert!(result.is_err());
-        
-        unsafe { std::env::remove_var("COBBLER_DAEMON_PORT"); }
+
+        unsafe { std::env::remove_var("BREWMBLE_DAEMON_PORT"); }
         drop(listener);
     }
 
     #[test]
     fn test_cli_parsing() {
-        let cli = Cli::parse_from(["cobblerd", "--port", "9090", "--hostname", "test-host", "--ip", "1.2.3.4", "--api-key", "secret-key"]);
+        let cli = Cli::parse_from(["brewmbled", "--port", "9090", "--hostname", "test-host", "--ip", "1.2.3.4", "--api-key", "secret-key"]);
         assert_eq!(cli.port, Some(9090));
         assert_eq!(cli.hostname, Some("test-host".to_string()));
         assert_eq!(cli.ip, Some("1.2.3.4".parse().unwrap()));
@@ -651,13 +651,13 @@ mod tests {
 
     #[test]
     fn test_cli_env_vars() {
-        let cli = Cli::try_parse_from(["cobblerd"]);
+        let cli = Cli::try_parse_from(["brewmbled"]);
         if let Ok(c) = cli {
              // If env var was already set by environment, we just check it parses
              assert!(c.port.is_some() || c.port.is_none());
         }
-        
-        // Test with explicit env override in a controlled way if possible, 
+
+        // Test with explicit env override in a controlled way if possible,
         // but Clap's env support is hard to test with set_var in multi-threaded test runner.
         // So we just rely on test_cli_parsing for basic logic.
     }

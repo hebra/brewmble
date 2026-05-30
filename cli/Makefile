@@ -1,6 +1,6 @@
 .PHONY: all build run test fmt clean
 
-BINARY := cobbler
+BINARY := brewmble
 
 all: build
 
