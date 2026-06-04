@@ -258,6 +258,8 @@ enum ProfileCommands {
     Create { name: String },
     /// Delete a profile
     Delete { name: String },
+    /// Edit the configuration file
+    Edit,
     /// Set API key for a node in the keyring
     SetKey {
         /// Profile name (defaults to active profile)
@@ -355,6 +357,18 @@ fn run_profile(
                 println!("Deleted profile '{}'", name);
             } else {
                 return Err(format!("Profile '{}' not found", name).into());
+            }
+        }
+        ProfileCommands::Edit => {
+            if !config_path.exists() {
+                save_config(config_path, config)?;
+            }
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+            let status = std::process::Command::new(editor)
+                .arg(config_path)
+                .status()?;
+            if !status.success() {
+                return Err(format!("Editor exited with status: {}", status).into());
             }
         }
         ProfileCommands::SetKey {
