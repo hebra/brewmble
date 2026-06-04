@@ -391,6 +391,34 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+    use brewmble_rest::StatusResponse;
+
+    struct MockPackageManager {
+        name: String,
+        available: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl PackageManager for MockPackageManager {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn version(&self) -> String {
+            "1.0.0".to_string()
+        }
+        fn is_available(&self) -> bool {
+            self.available
+        }
+        async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec!["pkg1".to_string()])
+        }
+        async fn dry_run_upgrade(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec!["pkg1".to_string()])
+        }
+        async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn test_auth_middleware() {
@@ -398,7 +426,10 @@ mod tests {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: api_key.clone(),
-            package_manager: Arc::new(get_package_manager()),
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -437,19 +468,19 @@ mod tests {
             .await
             .unwrap();
 
-        // It should pass middleware. Whether it's 200 or 412 depends on OS
-        assert!(response.status() == StatusCode::OK || response.status() == StatusCode::PRECONDITION_FAILED);
+        // It should pass middleware.
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_status_handler_non_linux() {
-        let pm = get_package_manager();
-        let pm_name = pm.name().to_string();
-        let is_available = pm.is_available();
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
-            package_manager: Arc::new(pm),
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -460,25 +491,47 @@ mod tests {
             .await
             .unwrap();
 
-        if !is_available {
-            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-            let body = to_bytes(response.into_body(), 1024).await.unwrap();
-            let status: StatusResponse = serde_json::from_slice(&body).unwrap();
-            assert_eq!(status.message, format!("the system is not a {} system", pm_name));
-            assert!(status.updates.is_empty());
-            assert!(!status.is_upgrading);
-        } else {
-            assert_eq!(response.status(), StatusCode::OK);
-        }
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.updates.len(), 1);
+        assert_eq!(status.updates[0], "pkg1");
+    }
+
+    #[tokio::test]
+    async fn test_status_handler_unavailable() {
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            api_key: "test".to_string(),
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: false,
+            })),
+        };
+        let app = Router::new()
+            .route(PATH_STATUS, get(status_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(Request::builder().uri(PATH_STATUS).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.message, "the system is not a mock system");
     }
 
     #[tokio::test]
     async fn test_health_handler() {
-        let pm = get_package_manager();
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
-            package_manager: Arc::new(pm),
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
         };
         let app = Router::new()
             .route(PATH_HEALTH, get(health_handler))
@@ -493,17 +546,18 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         let health: HealthResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(health.status, "ok");
+        assert_eq!(health.package_manager, "mock");
     }
 
     #[tokio::test]
-    async fn test_full_upgrade_handler_non_linux() {
-        let pm = get_package_manager();
-        let pm_name = pm.name().to_string();
-        let is_available = pm.is_available();
+    async fn test_full_upgrade_handler_mock() {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
-            package_manager: Arc::new(pm),
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
         };
         let app = Router::new()
             .route(PATH_UPGRADE, post(full_upgrade_handler))
@@ -521,14 +575,7 @@ mod tests {
             .await
             .unwrap();
 
-        if !is_available {
-            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-            let body = to_bytes(response.into_body(), 1024).await.unwrap();
-            let res: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(res["message"], format!("the system is not a {} system", pm_name));
-        } else {
-            assert_eq!(response.status(), StatusCode::OK);
-        }
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

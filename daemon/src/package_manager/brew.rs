@@ -39,7 +39,13 @@ impl PackageManager for Brew {
 
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         info!("updating brew formulae...");
-        let _ = self.runner.run("brew", &["update"]);
+        let output = self.runner.run("brew", &["update"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let err_msg = format!("brew update failed with status: {}. stderr: {}", output.status, stderr);
+            error!("{}", err_msg);
+            return Err(err_msg.into());
+        }
 
         info!("determining available updates...");
         let output = self.runner.run("brew", &["outdated", "--quiet"])?;

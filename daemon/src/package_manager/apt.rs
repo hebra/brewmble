@@ -44,7 +44,17 @@ impl PackageManager for Apt {
         use apt_pkg_native::Cache;
 
         info!("updating apt cache...");
-        let _ = self.runner.run("apt-get", &["update"]);
+        let output = self.runner.run("apt-get", &["update"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let err_msg = if stderr.contains("Permission denied") || stderr.contains("Are you root") {
+                format!("Permission denied when updating apt cache. Are you running as root? stderr: {}", stderr)
+            } else {
+                format!("Failed to update apt cache: {}. stderr: {}", output.status, stderr)
+            };
+            error!("{}", err_msg);
+            return Err(err_msg.into());
+        }
 
         info!("determining available updates...");
         let mut updates = Vec::new();
@@ -204,5 +214,37 @@ mod tests {
         let result = apt.full_upgrade().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("dpkg error"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_apt_get_updates_permission_denied() {
+        let runner = MockRunner {
+            success: false,
+            stdout: "".to_string(),
+            stderr: "E: Could not open lock file /var/lib/apt/lists/lock - open (13: Permission denied)".to_string(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+        };
+        let result = apt.get_updates().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Permission denied"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_apt_get_updates_other_failure() {
+        let runner = MockRunner {
+            success: false,
+            stdout: "".to_string(),
+            stderr: "network error".to_string(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+        };
+        let result = apt.get_updates().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Failed to update apt cache"));
     }
 }
