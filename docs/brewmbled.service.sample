@@ -1,0 +1,36 @@
+[Unit]
+Description=Brewmble Daemon
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/digio/brewmble
+
+[Service]
+Type=simple
+# Path to the brewmbled binary.
+# If you installed via 'cargo install', it might be in /root/.cargo/bin/brewmbled
+# For system-wide installation, /usr/local/bin/brewmbled is recommended.
+ExecStart=/usr/local/bin/brewmbled
+Restart=on-failure
+# The daemon needs root privileges for APT operations on Linux.
+User=root
+
+# Configuration via environment variables.
+# Uncomment and set these as needed for your environment.
+
+# Port to listen on (default: 8080).
+# Environment=BREWMBLE_DAEMON_PORT=8080
+
+# Hostname for mDNS registration (default: system hostname).
+# Environment=BREWMBLE_DAEMON_HOSTNAME=my-node
+
+# Explicit IP address for mDNS registration.
+# Environment=BREWMBLE_DAEMON_IP=192.168.1.10
+
+# API key for authentication. If not set, a random one is generated on startup.
+# Environment=BREWMBLE_DAEMON_API_KEY=your-secure-api-key
+
+# Logging level (error, warn, info, debug, trace).
+# Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

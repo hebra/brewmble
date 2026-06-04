@@ -32,6 +32,25 @@ podman run -d --net=host --cap-add=CAP_SYS_ADMIN brewmbled
 
 *Note: `--net=host` is required for mDNS discovery, and `CAP_SYS_ADMIN` (or equivalent) may be needed for APT operations depending on your configuration.*
 
+### Running as a systemd service (Linux)
+
+For Linux systems, a sample systemd service file is provided in the `docs` folder.
+
+1.  Copy the sample file to `/etc/systemd/system/`:
+    ```bash
+    sudo cp ../docs/brewmbled.service.sample /etc/systemd/system/brewmbled.service
+    ```
+2.  Edit the file to set the correct path to your `brewmbled` binary and any environment variables:
+    ```bash
+    sudo nano /etc/systemd/system/brewmbled.service
+    ```
+3.  Reload systemd, enable and start the service:
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable brewmbled
+    sudo systemctl start brewmbled
+    ```
+
 ## Configuration
 
 Environment variables can be used for configuration:

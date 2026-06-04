@@ -1,0 +1,7 @@
+nodes:
+- name: sam
+  address: 10.0.0.209:8080
+  api_key: REPLACE_WITH_ACTUAL_TOKEN
+- name: Bilbo.local
+  address: localhost:8080
+  api_key: cb77a2c2-4907-4fc8-a55c-68ac5513d187
