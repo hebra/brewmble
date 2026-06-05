@@ -34,7 +34,7 @@ podman run -d --net=host --cap-add=CAP_SYS_ADMIN brewmbled
 
 ### Running as a systemd service (Linux)
 
-For Linux systems, a sample systemd service file is provided in the `docs` folder.
+For Linux systems, a sample systemd service file is provided in the `docs` folder. See the [Documentation README](../docs/README.md#sudo-configuration) for setup instructions and sudo configuration.
 
 1.  Copy the sample file to `/etc/systemd/system/`:
     ```bash

@@ -13,7 +13,7 @@ This file provides guidance to agents when working with code in this repository.
 
 ## Non-Obvious Project Patterns
 
-- Daemon requires Linux systems (apt-pkg-native dependency fails on other platforms)
+- Daemon APT functionality requires Linux systems (Debian-based with apt)
 - Uses mDNS service discovery with "_brewmble._tcp.local." service type for automatic daemon discovery
 - Environment variables control daemon configuration: BREWMBLE_DAEMON_PORT (default 8080), BREWMBLE_DAEMON_HOSTNAME, BREWMBLE_DAEMON_IP, BREWMBLE_DAEMON_API_KEY
 - BREWMBLE_TIMEOUT env var accepts both seconds (integer) or humantime format (e.g., "1m", "30s")

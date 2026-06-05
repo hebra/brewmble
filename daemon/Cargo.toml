@@ -3,9 +3,6 @@ name = "brewmbled"
 version = "0.1.0"
 edition = "2024"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-apt-pkg-native = "0.3.3"
-
 [dependencies]
 brewmble-rest = { path = "../rest" }
 clap = { version = "4", features = ["derive", "env"] }

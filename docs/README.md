@@ -55,3 +55,24 @@ To run the `brewmbled` daemon as a system service on Linux, you can use the prov
   ```bash
   sudo journalctl -u brewmbled
   ```
+
+## Sudo Configuration
+
+The `brewmbled` daemon runs as the `brewmble` user but needs to perform package management operations that require root privileges. To enable this, you must configure `sudo` to allow the `brewmble` user to run `apt` commands without a password.
+
+1. **Create a sudoers file**:
+   It is recommended to create a separate file in `/etc/sudoers.d/`:
+   ```bash
+   sudo nano /etc/sudoers.d/brewmble
+   ```
+
+2. **Add the following content**:
+   ```text
+   brewmble ALL=(root) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get
+   ```
+
+3. **Set correct permissions**:
+   The file must have strict permissions:
+   ```bash
+   sudo chmod 440 /etc/sudoers.d/brewmble
+   ```

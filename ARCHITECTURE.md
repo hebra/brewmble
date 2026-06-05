@@ -93,6 +93,6 @@ Security is handled via a simple API Key mechanism.
 
 ## Platform Specifics
 
-- **Linux**: Uses `apt-pkg-native` or executes `apt-get` commands. Requires a Debian-based system.
+- **Linux**: Uses CLI commands like `apt-get`. Requires a Debian-based system.
 - **macOS**: Planned support for Homebrew (`brew`).
 - **Conditional Compilation**: Extensive use of `#[cfg(target_os = "linux")]` and `#[cfg(target_os = "macos")]` to handle package manager differences.

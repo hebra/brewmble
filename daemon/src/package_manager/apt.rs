@@ -41,10 +41,8 @@ impl PackageManager for Apt {
 
     #[cfg(target_os = "linux")]
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        use apt_pkg_native::Cache;
-
         info!("updating apt cache...");
-        let output = self.runner.run("apt-get", &["update"])?;
+        let output = self.runner.run("sudo", &["apt-get", "update"])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let err_msg = if stderr.contains("Permission denied") || stderr.contains("Are you root") {
@@ -57,20 +55,23 @@ impl PackageManager for Apt {
         }
 
         info!("determining available updates...");
-        let mut updates = Vec::new();
-        let mut cache = Cache::get_singleton();
-
-        let mut packages = cache.iter();
-        while let Some(pkg) = packages.next() {
-            let release = pkg.current_version();
-            let candidate = pkg.candidate_version();
-
-            if let (Some(rel), Some(can)) = (release, candidate) {
-                if rel != can {
-                    updates.push(pkg.name());
-                }
-            }
+        // Use simulated dist-upgrade to find which packages would be upgraded.
+        // This requires sudo because apt needs to lock the cache even for simulated upgrades
+        // if run as a non-root user.
+        let output = self.runner.run("sudo", &["apt-get", "-s", "dist-upgrade"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let err_msg = format!("Failed to determine available updates: {}. stderr: {}", output.status, stderr);
+            error!("{}", err_msg);
+            return Err(err_msg.into());
         }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let updates: Vec<String> = stdout
+            .lines()
+            .filter(|line| line.starts_with("Inst "))
+            .filter_map(|line| line.split_whitespace().nth(1).map(|s| s.to_string()))
+            .collect();
 
         info!("found {} available updates", updates.len());
         Ok(updates)
@@ -93,7 +94,7 @@ impl PackageManager for Apt {
 
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("starting apt full upgrade");
-        let output = self.runner.run("apt", &["full-upgrade", "-y"]);
+        let output = self.runner.run("sudo", &["apt", "full-upgrade", "-y"]);
 
         match output {
             Ok(output) => {
@@ -214,6 +215,25 @@ mod tests {
         let result = apt.full_upgrade().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("dpkg error"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_apt_get_updates_success() {
+        let runner = MockRunner {
+            success: true,
+            stdout: "Inst pkg1 (1.0)\nInst pkg2 (2.0)\n".to_string(),
+            stderr: "".to_string(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+        };
+        let result = apt.get_updates().await;
+        assert!(result.is_ok());
+        let updates = result.unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0], "pkg1");
+        assert_eq!(updates[1], "pkg2");
     }
 
     #[cfg(target_os = "linux")]

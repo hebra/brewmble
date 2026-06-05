@@ -42,6 +42,8 @@ sudo useradd -md /opt/brewmble brewmble
 sudo su brewmble
 ```
 
+*Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` commands. See the [Sudo Configuration section in docs/README.md](./docs/README.md#sudo-configuration) for details.*
+
 #### Install Rust and Cargo
 ```shell
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
