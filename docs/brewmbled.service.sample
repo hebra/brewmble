@@ -28,5 +28,9 @@ User=brewmble
 # Logging level (error, warn, info, debug, trace).
 # Environment=RUST_LOG=info
 
+# Interval in minutes between 'apt-get update' calls (Linux only).
+# Default is 360 (6 hours). Set to 0 to force an update on every status check.
+# Environment=BREWMBLE_APT_UPDATE_INTERVAL=360
+
 [Install]
 WantedBy=multi-user.target
