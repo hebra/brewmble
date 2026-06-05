@@ -66,7 +66,7 @@ Security is handled via a simple API Key mechanism.
 1. User executes `brewmble status --all`.
 2. CLI browses mDNS to find all `brewmbled` instances.
 3. For each discovered instance, the CLI sends a `GET /status` request (concurrently).
-4. Each `brewmbled` queries the local package manager (e.g., `apt-get update && apt-get upgrade --simulate`).
+4. Each `brewmbled` queries the local package manager. On Linux, it runs `apt-get update` only if the cache is older than the configured `BREWMBLE_APT_UPDATE_INTERVAL`. It then runs `apt-get -s dist-upgrade` to determine available updates.
 5. `brewmbled` returns a JSON response with the update count and details.
 6. CLI aggregates and displays the results in a formatted table.
 

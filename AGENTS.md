@@ -15,9 +15,9 @@ This file provides guidance to agents when working with code in this repository.
 
 - Daemon APT functionality requires Linux systems (Debian-based with apt)
 - Uses mDNS service discovery with "_brewmble._tcp.local." service type for automatic daemon discovery
-- Environment variables control daemon configuration: BREWMBLE_DAEMON_PORT (default 8080), BREWMBLE_DAEMON_HOSTNAME, BREWMBLE_DAEMON_IP, BREWMBLE_DAEMON_API_KEY
+- Environment variables control daemon configuration: BREWMBLE_DAEMON_PORT (default 8080), BREWMBLE_DAEMON_HOSTNAME, BREWMBLE_DAEMON_IP, BREWMBLE_DAEMON_API_KEY, BREWMBLE_APT_UPDATE_INTERVAL (default 360)
 - BREWMBLE_TIMEOUT env var accepts both seconds (integer) or humantime format (e.g., "1m", "30s")
-- Daemon runs 'apt-get update' on every status check (not cached) - see get_apt_updates()
+- Daemon caches 'apt-get update' results based on BREWMBLE_APT_UPDATE_INTERVAL (default 360 mins) - see get_apt_updates()
 - CLI uses blocking HTTP client (reqwest with blocking feature) while daemon uses async Axum framework
 - Different Rust editions: CLI uses 2021, daemon uses 2024
 - Container builds use podman with ports 8080 (HTTP) and 5353 (mDNS)
