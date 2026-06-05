@@ -195,15 +195,19 @@ fn get_default_timeout() -> Duration {
 }
 
 #[derive(Parser)]
-#[command(name = "brewmble")]
+#[command(name = "brewmble", version, disable_version_flag = true)]
 #[command(about = "A CLI tool for brewmble", long_about = None)]
 struct Cli {
     /// Path to the configuration file
     #[arg(short, long, env = "BREWMBLE_CONFIG")]
     config: Option<PathBuf>,
 
+    /// Print version information
+    #[arg(short = 'v', long = "version")]
+    version: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -246,6 +250,8 @@ enum Commands {
         #[command(subcommand)]
         subcommand: ProfileCommands,
     },
+    /// Show version information for CLI and daemons
+    Version,
 }
 
 #[derive(Subcommand)]
@@ -272,8 +278,12 @@ enum ProfileCommands {
     },
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    if cli.version {
+        println!("brewmble {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let (config_path, config_exists) = resolve_config_path(cli.config);
     let mut config = match load_config(&config_path) {
         Ok(c) => c,
@@ -284,33 +294,43 @@ fn main() {
     };
 
     let result = match cli.command {
-        Commands::Discover {
+        Some(Commands::Discover {
             timeout,
             update_config,
-        } => run_discover(Duration::from_secs(timeout), update_config, &config_path),
-        Commands::Status { all, targets } => {
+        }) => run_discover(Duration::from_secs(timeout), update_config, &config_path),
+        Some(Commands::Status { all, targets }) => {
             if targets.is_empty() && !all && !config_exists {
                 println!("No config file was found or set.");
             }
             run_status(all, targets, &config)
         }
-        Commands::Packages {
+        Some(Commands::Packages {
             full_upgrade,
             dry_run,
             targets,
-        } => {
+        }) => {
             if targets.is_empty() && !config_exists {
                 println!("No config file was found or set.");
             }
             run_packages(full_upgrade, dry_run, targets, &config)
         }
-        Commands::Profile { subcommand } => run_profile(subcommand, &mut config, &config_path),
+        Some(Commands::Profile { subcommand }) => run_profile(subcommand, &mut config, &config_path),
+        Some(Commands::Version) => run_version(&config),
+        None => {
+            // This case might be reached if only options are provided but no command.
+            // However, clap handles --help and --version automatically.
+            // If we want to show help by default when no command is provided:
+            use clap::CommandFactory;
+            Cli::command().print_help()?;
+            println!();
+            return Ok(());
+        }
     };
 
     if let Err(err) = result {
-        eprintln!("error: {err}");
-        std::process::exit(1);
+        return Err(err);
     }
+    Ok(())
 }
 
 fn run_profile(
@@ -805,6 +825,46 @@ fn entry_instance(entry: &ResolvedService) -> String {
         .strip_suffix(&suffix)
         .unwrap_or(fullname)
         .to_string()
+}
+
+fn run_version(config: &Config) -> Result<(), Box<dyn Error>> {
+    let mut tw = TabWriter::new(std::io::stdout());
+    writeln!(tw, "COMPONENT\tVERSION")?;
+    writeln!(tw, "CLI (local)\t{}", env!("CARGO_PKG_VERSION"))?;
+
+    let active_profile = config.profiles.get(&config.active_profile);
+    if let Some(profile) = active_profile {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(get_default_timeout())
+            .build()?;
+
+        for node in &profile.nodes {
+            let url = resolve_url(&node.address);
+            let status_url = format!("{}{}", url, PATH_STATUS);
+            let mut request = client.get(&status_url);
+
+            if let Some(api_key) = node.get_api_key() {
+                request = request.header(API_KEY_HEADER, api_key);
+            }
+
+            let version = match request.send() {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<StatusResponse>() {
+                        Ok(sr) => sr.daemon_version.unwrap_or_else(|| "Unknown".to_string()),
+                        Err(_) => "Unknown (Parse Error)".to_string(),
+                    }
+                }
+                Ok(resp) => format!("Error ({})", resp.status()),
+                Err(_) => "Unreachable".to_string(),
+            };
+
+            let name = node.name.as_deref().unwrap_or(&node.address);
+            writeln!(tw, "{}\t{}", name, version)?;
+        }
+    }
+
+    tw.flush()?;
+    Ok(())
 }
 
 fn run_status(

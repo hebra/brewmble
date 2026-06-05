@@ -14,6 +14,8 @@ pub struct StatusResponse {
     pub message: String,
     pub updates: Vec<String>,
     pub is_upgrading: bool,
+    #[serde(default)]
+    pub daemon_version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -46,16 +48,27 @@ mod tests {
             message: "All good".to_string(),
             updates: vec!["pkg1".to_string(), "pkg2".to_string()],
             is_upgrading: false,
+            daemon_version: Some("0.1.0".to_string()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"message\":\"All good\""));
         assert!(json.contains("\"updates\":[\"pkg1\",\"pkg2\"]"));
         assert!(json.contains("\"is_upgrading\":false"));
+        assert!(json.contains("\"daemon_version\":\"0.1.0\""));
 
         let decoded: StatusResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.message, resp.message);
         assert_eq!(decoded.updates, resp.updates);
         assert_eq!(decoded.is_upgrading, resp.is_upgrading);
+        assert_eq!(decoded.daemon_version, resp.daemon_version);
+    }
+
+    #[test]
+    fn test_status_response_deserialization_missing_version() {
+        let json = r#"{"message":"Old daemon","updates":[],"is_upgrading":false}"#;
+        let decoded: StatusResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.message, "Old daemon");
+        assert_eq!(decoded.daemon_version, None);
     }
 
     #[test]

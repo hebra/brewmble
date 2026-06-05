@@ -28,7 +28,7 @@ use package_manager::{get_package_manager, PackageManager};
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
 #[derive(Parser)]
-#[command(name = "brewmbled")]
+#[command(name = "brewmbled", version, disable_version_flag = true)]
 #[command(about = "Brewmble daemon", long_about = None)]
 struct Cli {
     /// Port to listen on. If not specified, the daemon will search for a free port starting from 8080.
@@ -46,6 +46,10 @@ struct Cli {
     /// API key for authentication. If not provided, one will be generated.
     #[arg(long, env = "BREWMBLE_DAEMON_API_KEY")]
     api_key: Option<String>,
+
+    /// Print version information
+    #[arg(short = 'v', long, action = clap::ArgAction::Version)]
+    version: bool,
 }
 
 #[derive(Clone)]
@@ -67,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    info!("Starting brewmbled version {}", env!("CARGO_PKG_VERSION"));
 
     let (listener, http_port) = if let Some(port) = cli.port {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -188,6 +193,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
                 message: format!("the system is not a {} system", state.package_manager.name()),
                 updates: Vec::new(),
                 is_upgrading,
+                daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
         );
     }
@@ -206,6 +212,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
                     message,
                     updates,
                     is_upgrading,
+                    daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 }),
             )
         }
@@ -215,6 +222,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
                 message: format!("Failed to check for updates: {}", err),
                 updates: Vec::new(),
                 is_upgrading,
+                daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
         ),
     }
