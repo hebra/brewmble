@@ -1,26 +1,33 @@
 use super::{CommandRunner, PackageManager, RealCommandRunner};
 use async_trait::async_trait;
+#[cfg(any(target_os = "linux", test))]
 use std::sync::Mutex;
+#[cfg(any(target_os = "linux", test))]
 use std::time::{Duration, Instant};
 use tracing::{error, info};
 
 pub struct Apt {
     pub runner: Box<dyn CommandRunner>,
+    #[cfg(any(target_os = "linux", test))]
     pub last_update: Mutex<Option<Instant>>,
+    #[cfg(any(target_os = "linux", test))]
     pub cache_ttl: Duration,
 }
 
 impl Default for Apt {
     fn default() -> Self {
-        let ttl_mins = std::env::var("BREWMBLE_APT_UPDATE_INTERVAL")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(360); // Default to 6 hours
-
         Self {
             runner: Box::new(RealCommandRunner),
+            #[cfg(any(target_os = "linux", test))]
             last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(ttl_mins * 60),
+            #[cfg(any(target_os = "linux", test))]
+            cache_ttl: {
+                let ttl_mins = std::env::var("BREWMBLE_APT_UPDATE_INTERVAL")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(360); // Default to 6 hours
+                Duration::from_secs(ttl_mins * 60)
+            },
         }
     }
 }

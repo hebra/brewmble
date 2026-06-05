@@ -48,7 +48,7 @@ struct Cli {
     api_key: Option<String>,
 
     /// Print version information
-    #[arg(short = 'v', long, action = clap::ArgAction::Version)]
+    #[arg(short = 'v', long)]
     version: bool,
 }
 
@@ -71,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    if cli.version {
+        println!("brewmbled {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     info!("Starting brewmbled version {}", env!("CARGO_PKG_VERSION"));
 
     let (listener, http_port) = if let Some(port) = cli.port {
