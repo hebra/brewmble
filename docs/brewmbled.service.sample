@@ -2,17 +2,13 @@
 Description=Brewmble Daemon
 After=network-online.target
 Wants=network-online.target
-Documentation=https://github.com/digio/brewmble
+Documentation=https://github.com/hebra/brewmble
 
 [Service]
 Type=simple
-# Path to the brewmbled binary.
-# If you installed via 'cargo install', it might be in /root/.cargo/bin/brewmbled
-# For system-wide installation, /usr/local/bin/brewmbled is recommended.
-ExecStart=/usr/local/bin/brewmbled
+ExecStart=/opt/brewmble/.cargo/bin/brewmbled
 Restart=on-failure
-# The daemon needs root privileges for APT operations on Linux.
-User=root
+User=brewmble
 
 # Configuration via environment variables.
 # Uncomment and set these as needed for your environment.
