@@ -527,10 +527,10 @@ mod tests {
     fn test_cli_parse_discover_default() {
         std::env::remove_var("BREWMBLE_TIMEOUT");
         let cli = Cli::parse_from(&["brewmble", "discover"]);
-        if let Commands::Discover {
+        if let Some(Commands::Discover {
             timeout,
             update_config,
-        } = cli.command
+        }) = cli.command
         {
             assert_eq!(timeout, 5);
             assert!(!update_config);
@@ -542,10 +542,10 @@ mod tests {
     #[test]
     fn test_cli_parse_discover_timeout() {
         let cli = Cli::parse_from(&["brewmble", "discover", "-t", "10", "-u"]);
-        if let Commands::Discover {
+        if let Some(Commands::Discover {
             timeout,
             update_config,
-        } = cli.command
+        }) = cli.command
         {
             assert_eq!(timeout, 10);
             assert!(update_config);
@@ -557,11 +557,11 @@ mod tests {
     #[test]
     fn test_cli_parse_packages_dry_run() {
         let cli = Cli::parse_from(&["brewmble", "packages", "--full-upgrade", "--dry-run"]);
-        if let Commands::Packages {
+        if let Some(Commands::Packages {
             full_upgrade,
             dry_run,
             targets,
-        } = cli.command
+        }) = cli.command
         {
             assert!(full_upgrade);
             assert!(dry_run);
@@ -574,11 +574,11 @@ mod tests {
     #[test]
     fn test_cli_parse_packages_no_dry_run() {
         let cli = Cli::parse_from(&["brewmble", "packages", "--full-upgrade", "host:8080"]);
-        if let Commands::Packages {
+        if let Some(Commands::Packages {
             full_upgrade,
             dry_run,
             targets,
-        } = cli.command
+        }) = cli.command
         {
             assert!(full_upgrade);
             assert!(!dry_run);
@@ -923,6 +923,9 @@ fn run_status(
                     match resp.json::<StatusResponse>() {
                         Ok(sr) => {
                             let mut s = format!("Message: {}\n", sr.message);
+                            if let Some(version) = sr.daemon_version {
+                                s.push_str(&format!("Daemon version: {}\n", version));
+                            }
                             s.push_str(&format!("Upgrading: {}\n", sr.is_upgrading));
                             if !sr.updates.is_empty() {
                                 s.push_str("Updates:\n");
