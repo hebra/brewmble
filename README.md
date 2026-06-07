@@ -5,6 +5,23 @@ It centralises and automates the process of keeping systems up-to-date.
 The main use case for Brewmble is in small Raspberry Pi clusters or home labs,
 where it simplifies the maintenance of multiple devices.
 
+## Table of Contents
+
+- [Features](#features)
+- [Components](#components)
+- [Getting Started](#getting-started)
+  - [Prerequisites](#prerequisites)
+  - [Installation](#installation)
+- [Usage](#usage)
+- [Security](#security)
+  - [1. API Key Authentication (Built-in)](#1-api-key-authentication-built-in)
+  - [2. HTTPS via Reverse Proxy](#2-https-via-reverse-proxy)
+  - [3. SSH Tunneling](#3-ssh-tunneling)
+  - [4. Private Overlay Networks](#4-private-overlay-networks)
+- [Configuration](#configuration)
+- [Development](#development)
+- [License](#license)
+
 ## Features
 
 - **Automated Updates**: Centralised management for system updates across multiple nodes.
@@ -42,7 +59,7 @@ sudo useradd -md /opt/brewmble brewmble
 sudo su brewmble
 ```
 
-*Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` commands. See the [Sudo Configuration section in docs/README.md](./docs/README.md#sudo-configuration) for details.*
+*Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` commands. See the [Sudo Configuration section in the Daemon README](./daemon/README.md#sudo-configuration) for details.*
 
 #### Install Rust and Cargo
 ```shell

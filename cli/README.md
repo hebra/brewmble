@@ -2,6 +2,20 @@
 
 The Brewmble CLI (`brewmble`) is a command-line interface for managing Brewmble daemons across your network. It uses mDNS for automatic discovery and interacts with daemons via their REST API.
 
+## Table of Contents
+
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Discovery](#discovery)
+  - [Status](#status)
+  - [Package Management](#package-management)
+  - [Profile Management](#profile-management)
+- [Security](#security)
+- [Configuration](#configuration)
+  - [Configuration File](#configuration-file)
+  - [Environment Variables](#environment-variables)
+- [Development](#development)
+
 ## Installation
 
 To build the CLI:

@@ -2,6 +2,23 @@
 
 The Brewmble Daemon (`brewmbled`) is a background service that runs on managed nodes. It provides a REST API for system status and package management, supporting multiple backends like APT (Linux) and Homebrew (macOS).
 
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+  - [From Source](#from-source)
+  - [Using Docker/Podman](#using-dockerpodman)
+  - [Running as a systemd service (Linux)](#running-as-a-systemd-service-linux)
+  - [Running as a Launch Agent (macOS)](#running-as-a-launch-agent-macos)
+  - [Sudo Configuration](#sudo-configuration)
+- [Configuration](#configuration)
+- [Security and Authentication](#security-and-authentication)
+- [API Endpoints](#api-endpoints)
+  - [`GET /status`](#get-status)
+  - [`POST /packages/full-upgrade`](#post-packagesfull-upgrade)
+- [Development](#development)
+  - [Running Tests](#running-tests)
+
 ## Features
 
 - **mDNS Registration**: Automatically announces itself on the local network as `_brewmble._tcp`.
@@ -34,22 +51,131 @@ podman run -d --net=host --cap-add=CAP_SYS_ADMIN brewmbled
 
 ### Running as a systemd service (Linux)
 
-For Linux systems, a sample systemd service file is provided in the `docs` folder. See the [Documentation README](../docs/README.md#sudo-configuration) for setup instructions and sudo configuration.
+For Linux systems, a sample systemd service file is provided in the `docs` folder.
 
-1.  Copy the sample file to `/etc/systemd/system/`:
-    ```bash
-    sudo cp ../docs/brewmbled.service.sample /etc/systemd/system/brewmbled.service
-    ```
-2.  Edit the file to set the correct path to your `brewmbled` binary and any environment variables:
-    ```bash
-    sudo nano /etc/systemd/system/brewmbled.service
-    ```
-3.  Reload systemd, enable and start the service:
-    ```bash
-    sudo systemctl daemon-reload
-    sudo systemctl enable brewmbled
-    sudo systemctl start brewmbled
-    ```
+#### Setup
+
+1. **Copy the service file**:
+   ```bash
+   sudo cp ../docs/brewmbled.service.sample /etc/systemd/system/brewmbled.service
+   ```
+
+2. **Configure the service**:
+   Open the file in an editor to adjust the `ExecStart` path and any environment variables (like `BREWMBLE_DAEMON_API_KEY`):
+   ```bash
+   sudo nano /etc/systemd/system/brewmbled.service
+   ```
+
+3. **Reload systemd**:
+   ```bash
+   sudo systemctl daemon-reload
+   ```
+
+#### Managing the Service
+
+- **Start the daemon**:
+  ```bash
+  sudo systemctl start brewmbled
+  ```
+
+- **Stop the daemon**:
+  ```bash
+  sudo systemctl stop brewmbled
+  ```
+
+- **Enable auto-start on boot**:
+  ```bash
+  sudo systemctl enable brewmbled
+  ```
+
+- **Disable auto-start on boot**:
+  ```bash
+  sudo systemctl disable brewmbled
+  ```
+
+- **Check status**:
+  ```bash
+  sudo systemctl status brewmbled
+  ```
+
+- **View logs**:
+  ```bash
+  sudo journalctl -u brewmbled
+  ```
+
+### Running as a Launch Agent (macOS)
+
+For macOS, you can run `brewmbled` as a background service for the logged-in user using `launchd`. A sample plist file is provided in the `docs` folder.
+
+#### Setup
+
+1. **Copy the plist file**:
+   ```bash
+   mkdir -p ~/Library/LaunchAgents
+   cp ../docs/com.github.hebra.brewmble.brewmbled.plist.sample ~/Library/LaunchAgents/com.github.hebra.brewmble.brewmbled.plist
+   ```
+
+2. **Configure the service**:
+   Open the file in an editor to adjust the `ProgramArguments` path and any environment variables:
+   ```bash
+   nano ~/Library/LaunchAgents/com.github.hebra.brewmble.brewmbled.plist
+   ```
+
+   > **Note**: You must update the path in `ProgramArguments` to point to your actual `brewmbled` binary (e.g., replace `USERNAME` in the sample path with your actual macOS username). You can also adjust the default values for the environment variables in the `EnvironmentVariables` section.
+
+3. **Load the service**:
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.github.hebra.brewmble.brewmbled.plist
+   ```
+
+#### Managing the Service
+
+- **Start the daemon**:
+  ```bash
+  launchctl start com.github.hebra.brewmble.brewmbled
+  ```
+
+- **Stop the daemon**:
+  ```bash
+  launchctl stop com.github.hebra.brewmble.brewmbled
+  ```
+
+- **Unload the service** (prevents auto-start):
+  ```bash
+  launchctl unload ~/Library/LaunchAgents/com.github.hebra.brewmble.brewmbled.plist
+  ```
+
+- **Check status**:
+  ```bash
+  launchctl list | grep brewmble
+  ```
+
+- **View logs**:
+  ```bash
+  tail -f /tmp/com.github.hebra.brewmble.brewmbled.out
+  tail -f /tmp/com.github.hebra.brewmble.brewmbled.err
+  ```
+
+### Sudo Configuration
+
+The `brewmbled` daemon runs as the `brewmble` user but needs to perform package management operations that require root privileges. To enable this, you must configure `sudo` to allow the `brewmble` user to run `apt` commands without a password.
+
+1. **Create a sudoers file**:
+   It is recommended to create a separate file in `/etc/sudoers.d/`:
+   ```bash
+   sudo nano /etc/sudoers.d/brewmble
+   ```
+
+2. **Add the following content**:
+   ```text
+   brewmble ALL=(root) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get
+   ```
+
+3. **Set correct permissions**:
+   The file must have strict permissions:
+   ```bash
+   sudo chmod 440 /etc/sudoers.d/brewmble
+   ```
 
 ## Configuration
 

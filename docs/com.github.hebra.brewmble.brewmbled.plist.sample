@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.github.hebra.brewmble.brewmbled</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/USERNAME/.cargo/bin/brewmbled</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BREWMBLE_DAEMON_PORT</key>
+        <string>8998</string>
+        <key>BREWMBLE_DAEMON_API_KEY</key>
+        <string>REPLACE_WITH_SECRET_KEY</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.github.hebra.brewmble.brewmbled.err</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/com.github.hebra.brewmble.brewmbled.out</string>
+</dict>
+</plist>
