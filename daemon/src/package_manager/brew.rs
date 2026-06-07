@@ -1,5 +1,7 @@
 use super::{CommandRunner, PackageManager, RealCommandRunner};
 use async_trait::async_trait;
+use std::io;
+use std::process::Output;
 use tracing::{error, info};
 
 pub struct Brew {
@@ -14,6 +16,22 @@ impl Default for Brew {
     }
 }
 
+impl Brew {
+    fn run_brew(&self, args: &[&str]) -> io::Result<Output> {
+        let paths = ["brew", "/opt/homebrew/bin/brew", "/usr/local/bin/brew"];
+        let mut last_err = None;
+
+        for path in paths {
+            match self.runner.run(path, args) {
+                Ok(output) => return Ok(output),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "brew not found")))
+    }
+}
+
 #[async_trait]
 impl PackageManager for Brew {
     fn name(&self) -> &str {
@@ -21,8 +39,7 @@ impl PackageManager for Brew {
     }
 
     fn version(&self) -> String {
-        self.runner
-            .run("brew", &["--version"])
+        self.run_brew(&["--version"])
             .map(|output| {
                 String::from_utf8_lossy(&output.stdout)
                     .lines()
@@ -34,12 +51,12 @@ impl PackageManager for Brew {
     }
 
     fn is_available(&self) -> bool {
-        self.runner.run("brew", &["--version"]).is_ok()
+        self.run_brew(&["--version"]).is_ok()
     }
 
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         info!("updating brew formulae...");
-        let output = self.runner.run("brew", &["update"])?;
+        let output = self.run_brew(&["update"])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let err_msg = format!("brew update failed with status: {}. stderr: {}", output.status, stderr);
@@ -48,7 +65,7 @@ impl PackageManager for Brew {
         }
 
         info!("determining available updates...");
-        let output = self.runner.run("brew", &["outdated", "--quiet"])?;
+        let output = self.run_brew(&["outdated", "--quiet"])?;
 
         if !output.status.success() {
             let err_msg = format!(
@@ -76,7 +93,7 @@ impl PackageManager for Brew {
 
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("starting brew upgrade");
-        let output = self.runner.run("brew", &["upgrade"]);
+        let output = self.run_brew(&["upgrade"]);
 
         match output {
             Ok(output) => {

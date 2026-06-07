@@ -10,6 +10,8 @@
     </array>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>BREWMBLE_DAEMON_PORT</key>
         <string>8998</string>
         <key>BREWMBLE_DAEMON_API_KEY</key>

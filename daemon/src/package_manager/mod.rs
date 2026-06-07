@@ -28,9 +28,17 @@ pub mod apt;
 pub mod brew;
 
 pub fn get_package_manager() -> Box<dyn PackageManager> {
-    let brew = brew::Brew::default();
-    if brew.is_available() {
-        return Box::new(brew);
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(brew::Brew::default())
     }
-    Box::new(apt::Apt::default())
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let brew = brew::Brew::default();
+        if brew.is_available() {
+            return Box::new(brew);
+        }
+        Box::new(apt::Apt::default())
+    }
 }
