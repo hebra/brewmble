@@ -234,7 +234,7 @@ enum Commands {
     /// Manage packages on brewmble daemons
     Packages {
         /// Perform a full system upgrade
-        #[arg(long, required = true)]
+        #[arg(short = 'u', long, required = true)]
         full_upgrade: bool,
 
         /// Show what would be upgraded without executing
@@ -551,6 +551,21 @@ mod tests {
             assert!(update_config);
         } else {
             panic!("Wrong command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_packages_short_upgrade() {
+        let cli = Cli::parse_from(&["brewmble", "packages", "-u"]);
+        if let Some(Commands::Packages {
+            full_upgrade,
+            dry_run: _,
+            targets: _,
+        }) = cli.command
+        {
+            assert!(full_upgrade);
+        } else {
+            panic!("Expected Packages command");
         }
     }
 
