@@ -1,6 +1,7 @@
 COMPONENTS := cli daemon rest web
+REPO_URL := https://github.com/hebra/brewmble.git
 
-.PHONY: all build test clean $(COMPONENTS)
+.PHONY: all build test clean install install-cli install-daemon $(COMPONENTS)
 
 all: build
 
@@ -21,3 +22,11 @@ clean:
 		echo "Cleaning $$component..."; \
 		$(MAKE) -C $$component clean; \
 	done
+
+install: install-cli install-daemon
+
+install-cli:
+	cargo install --git $(REPO_URL) brewmble --force
+
+install-daemon:
+	cargo install --git $(REPO_URL) brewmbled --force
