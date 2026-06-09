@@ -12,6 +12,7 @@ use std::error::Error;
 use keyring::Entry;
 use std::fs;
 use std::io::{self, Write};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -894,19 +895,32 @@ fn run_status(
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈")
         .template("{spinner:.green} {msg}")?;
 
-    let (target_tx, target_rx) = flume::unbounded();
+    let (target_tx, target_rx) = flume::unbounded::<(String, Option<String>)>();
+
+    let active_profile = config.profiles.get(&config.active_profile);
 
     // 1. Collect explicit targets and profile nodes
     let mut initial_targets = HashSet::new();
     for t in targets {
-        initial_targets.insert(t);
+        let mut name = None;
+        let mut addr = t.clone();
+        if let Some(profile) = active_profile {
+            if let Some(node) = profile
+                .nodes
+                .iter()
+                .find(|n| n.address == t || n.name.as_ref() == Some(&t))
+            {
+                addr = node.address.clone();
+                name = node.name.clone();
+            }
+        }
+        initial_targets.insert((addr, name));
     }
 
-    let active_profile = config.profiles.get(&config.active_profile);
     if initial_targets.is_empty() && !discover_all {
         if let Some(profile) = active_profile {
             for node in &profile.nodes {
-                initial_targets.insert(node.address.clone());
+                initial_targets.insert((node.address.clone(), node.name.clone()));
             }
         }
     }
@@ -924,8 +938,8 @@ fn run_status(
         std::thread::spawn(move || {
             let timeout = Duration::from_secs(5);
             if let Ok(targets) = discover_targets_with_timeout(timeout) {
-                for t in targets {
-                    let _ = tx.send(t);
+                for (addr, name) in targets {
+                    let _ = tx.send((addr, Some(name)));
                 }
             }
             pb.finish_and_clear();
@@ -938,14 +952,8 @@ fn run_status(
         .timeout(get_default_timeout())
         .build()?;
 
-    let tw = Arc::new(Mutex::new(TabWriter::new(io::stdout())));
-    {
-        let mut tw_l = tw.lock().unwrap();
-        writeln!(tw_l, "TARGET\tSTATUS")?;
-        multi.suspend(|| tw_l.flush())?;
-    }
-
     let seen_targets = Arc::new(Mutex::new(HashSet::new()));
+    let node_reports = Arc::new(Mutex::new(Vec::<(String, bool, bool)>::new()));
     let active_profile_arc = Arc::new(active_profile.cloned());
 
     let pb = multi.add(ProgressBar::new(0));
@@ -957,38 +965,82 @@ fn run_status(
     pb.set_message("Querying status...");
 
     rayon::scope(|s| {
-        while let Ok(target) = target_rx.recv() {
+        while let Ok((target_addr, target_name)) = target_rx.recv() {
             let client = client.clone();
-            let tw = Arc::clone(&tw);
             let seen_targets = Arc::clone(&seen_targets);
+            let node_reports = Arc::clone(&node_reports);
             let profile = Arc::clone(&active_profile_arc);
             let pb = pb.clone();
 
             pb.inc_length(1);
 
             s.spawn(move |_| {
-                if !seen_targets.lock().unwrap().insert(target.clone()) {
+                if !seen_targets.lock().unwrap().insert(target_addr.clone()) {
                     pb.inc_length(0); // Adjust length if skipped
                     pb.inc(1);
                     return;
                 }
 
-                let (status, body) = query_status(&client, &target, profile.as_ref().as_ref());
+                let (status, message, details, failed, outdated) =
+                    query_status(&client, &target_addr, profile.as_ref().as_ref());
 
-                {
-                    let mut tw_l = tw.lock().unwrap();
-                    let _ = writeln!(tw_l, "{}\t{}", target, status);
-                    if !body.is_empty() {
-                        let _ = writeln!(tw_l, "\t{}", body.replace('\n', "\n\t"));
-                    }
-                    let _ = pb.suspend(|| tw_l.flush());
+                let mut output = String::new();
+                let name = target_name.as_deref().unwrap_or(&target_addr);
+                let _ = writeln!(output, "Node: {}", name);
+                let _ = writeln!(output, "Address: {}", target_addr);
+                if !message.is_empty() {
+                    let _ = writeln!(output, "{}", message);
                 }
+                let _ = writeln!(output, "Details:");
+                let _ = writeln!(output, "    Status: {}", status);
+                if !details.is_empty() {
+                    let _ = writeln!(output, "    {}", details.trim().replace('\n', "\n    "));
+                }
+                let _ = writeln!(output);
+                pb.println(output);
+
+                node_reports.lock().unwrap().push((name.to_string(), failed, outdated));
                 pb.inc(1);
             });
         }
     });
 
     pb.finish_and_clear();
+
+    let reports = node_reports.lock().unwrap();
+    if !reports.is_empty() {
+        println!("Summary:");
+        let outdated_nodes: Vec<_> = reports
+            .iter()
+            .filter(|(_, _, outdated)| *outdated)
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+
+        if outdated_nodes.is_empty() {
+            println!("- All nodes are up to date.");
+        } else {
+            println!(
+                "- {} node(s) are outdated: {}",
+                outdated_nodes.len(),
+                outdated_nodes.join(", ")
+            );
+        }
+
+        let failed_nodes: Vec<_> = reports
+            .iter()
+            .filter(|(_, failed, _)| *failed)
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+
+        if !failed_nodes.is_empty() {
+            println!(
+                "- {} node(s) failed to respond: {}",
+                failed_nodes.len(),
+                failed_nodes.join(", ")
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -996,7 +1048,7 @@ fn query_status(
     client: &reqwest::blocking::Client,
     target: &str,
     active_profile: Option<&ProfileConfig>,
-) -> (String, String) {
+) -> (String, String, String, bool, bool) {
     let url = resolve_url(target);
     let status_url = format!("{}{}", url, PATH_STATUS);
 
@@ -1017,40 +1069,62 @@ fn query_status(
     match request.send() {
         Ok(resp) => {
             let status = resp.status().to_string();
-            let body = if resp.status().is_success() {
+            if resp.status().is_success() {
                 match resp.json::<StatusResponse>() {
                     Ok(sr) => {
-                        let mut s = format!("Message: {}\n", sr.message);
+                        let message = sr.message;
+                        let mut details = String::new();
                         if let Some(version) = sr.daemon_version {
-                            s.push_str(&format!("Daemon version: {}\n", version));
+                            details.push_str(&format!("Daemon version: {}\n", version));
                         }
-                        s.push_str(&format!("Upgrading: {}\n", sr.is_upgrading));
+                        details.push_str(&format!("Upgrading: {}\n", sr.is_upgrading));
                         if !sr.updates.is_empty() {
-                            s.push_str("Updates:\n");
+                            details.push_str("Updates:\n");
                             for update in &sr.updates {
-                                s.push_str(&format!("  - {}\n", update));
+                                details.push_str(&format!("  - {}\n", update));
                             }
                         } else {
-                            s.push_str("No updates available.\n");
+                            details.push_str("No updates available.\n");
                         }
-                        s
+                        let outdated = !sr.updates.is_empty();
+                        (status, message, details, false, outdated)
                     }
-                    Err(_) => "Could not parse StatusResponse".to_string(),
+                    Err(_) => (
+                        status,
+                        "Could not parse StatusResponse".to_string(),
+                        "".to_string(),
+                        false,
+                        false,
+                    ),
                 }
             } else {
                 match resp.json::<serde_json::Value>() {
-                    Ok(json) => serde_json::to_string_pretty(&json)
-                        .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
-                    Err(_) => "Could not parse response as JSON".to_string(),
+                    Ok(json) => {
+                        let details = serde_json::to_string_pretty(&json)
+                            .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string());
+                        (status, "".to_string(), details, false, false)
+                    }
+                    Err(_) => (
+                        status,
+                        "Could not parse response as JSON".to_string(),
+                        "".to_string(),
+                        false,
+                        false,
+                    ),
                 }
-            };
-            (status, body)
+            }
         }
-        Err(err) => (format!("Error: {}", err), "".to_string()),
+        Err(err) => (
+            format!("Error: {}", err),
+            "".to_string(),
+            "".to_string(),
+            true,
+            false,
+        ),
     }
 }
 
-fn discover_targets_with_timeout(timeout: Duration) -> Result<Vec<String>, Box<dyn Error>> {
+fn discover_targets_with_timeout(timeout: Duration) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     let mut targets = Vec::new();
     let mdns = ServiceDaemon::new().map_err(|err| format!("create resolver: {err}"))?;
     let service_name = format!("{}.{}", SERVICE_TYPE.trim_end_matches('.'), SERVICE_DOMAIN);
@@ -1071,10 +1145,11 @@ fn discover_targets_with_timeout(timeout: Duration) -> Result<Vec<String>, Box<d
         match receiver.recv_timeout(remaining) {
             Ok(event) => {
                 if let ServiceEvent::ServiceResolved(info) = event {
+                    let name = entry_instance(&info);
                     for addr in &info.addresses {
                         let target = format!("{}:{}", addr, info.port);
                         if seen.insert(target.clone()) {
-                            targets.push(target);
+                            targets.push((target, name.clone()));
                         }
                     }
                 }
