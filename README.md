@@ -71,10 +71,10 @@ source ~/.bashrc
 
 ```shell
 # CLI tools
-cargo install --git https://github.com/hebra/brewmble.git brewmble
+cargo install --git https://codeberg.org/heb/brewmble.git brewmble
 
 # Daemon
-cargo install --git https://github.com/hebra/brewmble.git brewmbled
+cargo install --git https://codeberg.org/heb/brewmble.git brewmbled
 ```
 
 #### From cloned sources

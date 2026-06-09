@@ -1,6 +1,6 @@
-# Cobbler Roadmap
+# Brewmble Roadmap
 
-This roadmap outlines the planned development for Cobbler, categorized by priority and timeframe.
+This roadmap outlines the planned development for Brewmble, categorized by priority and timeframe.
 
 ## Phase 1: Foundation & Stability (Short-term)
 Focus on solidifying the current CLI/Daemon interaction and improving the developer experience.

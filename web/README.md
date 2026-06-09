@@ -1,4 +1,4 @@
-# Cobbler Web UI
+# Brewmble Web UI
 
-A web interface into the Cobbler nodes cluster.
+A web interface into the Brewmble nodes cluster.
 

@@ -1,5 +1,5 @@
 COMPONENTS := cli daemon rest web
-REPO_URL := https://github.com/hebra/brewmble.git
+REPO_URL := https://codeberg.org/heb/brewmble.git
 
 .PHONY: all build test clean install install-cli install-daemon $(COMPONENTS)
 
