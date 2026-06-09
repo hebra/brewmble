@@ -5,6 +5,7 @@ use brewmble_rest::{
 use clap::{Parser, Subcommand};
 use flume::RecvTimeoutError;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ResolvedService};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -12,6 +13,7 @@ use keyring::Entry;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tabwriter::TabWriter;
 
@@ -884,100 +886,171 @@ fn run_version(config: &Config) -> Result<(), Box<dyn Error>> {
 
 fn run_status(
     discover_all: bool,
-    mut targets: Vec<String>,
+    targets: Vec<String>,
     config: &Config,
 ) -> Result<(), Box<dyn Error>> {
-    if discover_all {
-        targets.extend(discover_targets()?);
+    let multi = MultiProgress::new();
+    let spinner_style = ProgressStyle::default_spinner()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈")
+        .template("{spinner:.green} {msg}")?;
+
+    let (target_tx, target_rx) = flume::unbounded();
+
+    // 1. Collect explicit targets and profile nodes
+    let mut initial_targets = HashSet::new();
+    for t in targets {
+        initial_targets.insert(t);
     }
 
     let active_profile = config.profiles.get(&config.active_profile);
-
-    if targets.is_empty() {
+    if initial_targets.is_empty() && !discover_all {
         if let Some(profile) = active_profile {
             for node in &profile.nodes {
-                targets.push(node.address.clone());
+                initial_targets.insert(node.address.clone());
             }
         }
     }
 
-    if targets.is_empty() {
-        println!("No targets found.");
-        return Ok(());
+    for t in initial_targets {
+        target_tx.send(t)?;
     }
+
+    // 2. Start discovery in background if requested
+    if discover_all {
+        let pb = multi.add(ProgressBar::new_spinner());
+        pb.set_style(spinner_style.clone());
+        pb.set_message("Discovering nodes...");
+        let tx = target_tx.clone();
+        std::thread::spawn(move || {
+            let timeout = Duration::from_secs(5);
+            if let Ok(targets) = discover_targets_with_timeout(timeout) {
+                for t in targets {
+                    let _ = tx.send(t);
+                }
+            }
+            pb.finish_and_clear();
+        });
+    }
+
+    drop(target_tx); // Close tx so rx finishes when discovery is done
 
     let client = reqwest::blocking::Client::builder()
         .timeout(get_default_timeout())
         .build()?;
 
-    let mut tw = TabWriter::new(io::stdout());
-    writeln!(tw, "TARGET\tSTATUS")?;
-
-    for target in targets {
-        let url = resolve_url(&target);
-        let status_url = format!("{}{}", url, PATH_STATUS);
-
-        let mut request = client.get(&status_url);
-
-        if let Some(profile) = active_profile {
-            if let Some(node) = profile
-                .nodes
-                .iter()
-                .find(|n| n.address == target || n.name.as_ref() == Some(&target))
-            {
-                if let Some(api_key) = node.get_api_key() {
-                    request = request.header(API_KEY_HEADER, api_key);
-                }
-            }
-        }
-
-        let (status, body) = match request.send() {
-            Ok(resp) => {
-                let status = resp.status().to_string();
-                let body = if resp.status().is_success() {
-                    match resp.json::<StatusResponse>() {
-                        Ok(sr) => {
-                            let mut s = format!("Message: {}\n", sr.message);
-                            if let Some(version) = sr.daemon_version {
-                                s.push_str(&format!("Daemon version: {}\n", version));
-                            }
-                            s.push_str(&format!("Upgrading: {}\n", sr.is_upgrading));
-                            if !sr.updates.is_empty() {
-                                s.push_str("Updates:\n");
-                                for update in &sr.updates {
-                                    s.push_str(&format!("  - {}\n", update));
-                                }
-                            } else {
-                                s.push_str("No updates available.\n");
-                            }
-                            s
-                        }
-                        Err(_) => "Could not parse StatusResponse".to_string(),
-                    }
-                } else {
-                    match resp.json::<serde_json::Value>() {
-                        Ok(json) => serde_json::to_string_pretty(&json)
-                            .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
-                        Err(_) => "Could not parse response as JSON".to_string(),
-                    }
-                };
-                (status, body)
-            }
-            Err(err) => (format!("Error: {}", err), "".to_string()),
-        };
-
-        writeln!(tw, "{}\t{}", target, status)?;
-        if !body.is_empty() {
-            writeln!(tw, "\t{}", body.replace('\n', "\n\t"))?;
-        }
+    let tw = Arc::new(Mutex::new(TabWriter::new(io::stdout())));
+    {
+        let mut tw_l = tw.lock().unwrap();
+        writeln!(tw_l, "TARGET\tSTATUS")?;
+        multi.suspend(|| tw_l.flush())?;
     }
 
-    tw.flush()?;
+    let seen_targets = Arc::new(Mutex::new(HashSet::new()));
+    let active_profile_arc = Arc::new(active_profile.cloned());
 
+    let pb = multi.add(ProgressBar::new(0));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")?
+            .progress_chars("#>-"),
+    );
+    pb.set_message("Querying status...");
+
+    rayon::scope(|s| {
+        while let Ok(target) = target_rx.recv() {
+            let client = client.clone();
+            let tw = Arc::clone(&tw);
+            let seen_targets = Arc::clone(&seen_targets);
+            let profile = Arc::clone(&active_profile_arc);
+            let pb = pb.clone();
+
+            pb.inc_length(1);
+
+            s.spawn(move |_| {
+                if !seen_targets.lock().unwrap().insert(target.clone()) {
+                    pb.inc_length(0); // Adjust length if skipped
+                    pb.inc(1);
+                    return;
+                }
+
+                let (status, body) = query_status(&client, &target, profile.as_ref().as_ref());
+
+                {
+                    let mut tw_l = tw.lock().unwrap();
+                    let _ = writeln!(tw_l, "{}\t{}", target, status);
+                    if !body.is_empty() {
+                        let _ = writeln!(tw_l, "\t{}", body.replace('\n', "\n\t"));
+                    }
+                    let _ = pb.suspend(|| tw_l.flush());
+                }
+                pb.inc(1);
+            });
+        }
+    });
+
+    pb.finish_and_clear();
     Ok(())
 }
 
-fn discover_targets() -> Result<Vec<String>, Box<dyn Error>> {
+fn query_status(
+    client: &reqwest::blocking::Client,
+    target: &str,
+    active_profile: Option<&ProfileConfig>,
+) -> (String, String) {
+    let url = resolve_url(target);
+    let status_url = format!("{}{}", url, PATH_STATUS);
+
+    let mut request = client.get(&status_url);
+
+    if let Some(profile) = active_profile {
+        if let Some(node) = profile
+            .nodes
+            .iter()
+            .find(|n| n.address == target || n.name.as_ref() == Some(&target.to_string()))
+        {
+            if let Some(api_key) = node.get_api_key() {
+                request = request.header(API_KEY_HEADER, api_key);
+            }
+        }
+    }
+
+    match request.send() {
+        Ok(resp) => {
+            let status = resp.status().to_string();
+            let body = if resp.status().is_success() {
+                match resp.json::<StatusResponse>() {
+                    Ok(sr) => {
+                        let mut s = format!("Message: {}\n", sr.message);
+                        if let Some(version) = sr.daemon_version {
+                            s.push_str(&format!("Daemon version: {}\n", version));
+                        }
+                        s.push_str(&format!("Upgrading: {}\n", sr.is_upgrading));
+                        if !sr.updates.is_empty() {
+                            s.push_str("Updates:\n");
+                            for update in &sr.updates {
+                                s.push_str(&format!("  - {}\n", update));
+                            }
+                        } else {
+                            s.push_str("No updates available.\n");
+                        }
+                        s
+                    }
+                    Err(_) => "Could not parse StatusResponse".to_string(),
+                }
+            } else {
+                match resp.json::<serde_json::Value>() {
+                    Ok(json) => serde_json::to_string_pretty(&json)
+                        .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
+                    Err(_) => "Could not parse response as JSON".to_string(),
+                }
+            };
+            (status, body)
+        }
+        Err(err) => (format!("Error: {}", err), "".to_string()),
+    }
+}
+
+fn discover_targets_with_timeout(timeout: Duration) -> Result<Vec<String>, Box<dyn Error>> {
     let mut targets = Vec::new();
     let mdns = ServiceDaemon::new().map_err(|err| format!("create resolver: {err}"))?;
     let service_name = format!("{}.{}", SERVICE_TYPE.trim_end_matches('.'), SERVICE_DOMAIN);
@@ -985,7 +1058,6 @@ fn discover_targets() -> Result<Vec<String>, Box<dyn Error>> {
         .browse(&service_name)
         .map_err(|err| format!("browse: {err}"))?;
 
-    let timeout = get_default_timeout();
     let deadline = Instant::now() + timeout;
     let mut seen = HashSet::new();
 
@@ -1011,6 +1083,7 @@ fn discover_targets() -> Result<Vec<String>, Box<dyn Error>> {
             Err(err) => return Err(format!("mDNS error: {err}").into()),
         }
     }
+    let _ = mdns.shutdown();
     Ok(targets)
 }
 
