@@ -186,6 +186,7 @@ Environment variables can be used for configuration:
 - `BREWMBLE_DAEMON_IP`: Explicit IP address to use for mDNS registration.
 - `BREWMBLE_DAEMON_API_KEY`: API key for authentication. If not provided, one will be generated on startup and printed to the logs.
 - `BREWMBLE_APT_UPDATE_INTERVAL`: Interval in minutes between `apt-get update` calls (Linux only). Defaults to 360 (6 hours). Set to 0 to force an update on every status check.
+- `BREWMBLE_BREW_UPDATE_INTERVAL`: Interval in minutes between `brew update` calls (macOS only). Defaults to 360 (6 hours). Set to 0 to force an update on every status check.
 - `RUST_LOG`: Logging level (e.g., `info`, `debug`).
 
 ## Security and Authentication

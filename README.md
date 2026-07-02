@@ -150,6 +150,7 @@ Brewmble can be configured using environment variables.
 | `BREWMBLE_DAEMON_IP` | Daemon | Explicit IP address to use for mDNS registration. | Automatically detected |
 | `BREWMBLE_DAEMON_API_KEY` | Daemon | API key for authentication. If not provided, a random UUID v4 will be generated and logged. | Generated |
 | `BREWMBLE_APT_UPDATE_INTERVAL` | Daemon | Interval in minutes between `apt-get update` calls. Set to `0` to always update. | `360` (6 hours) |
+| `BREWMBLE_BREW_UPDATE_INTERVAL` | Daemon | Interval in minutes between `brew update` calls. Set to `0` to always update. | `360` (6 hours) |
 | `BREWMBLE_TIMEOUT` | CLI | Timeout for discovery and HTTP requests. Supports seconds or [humantime](https://docs.rs/humantime) (e.g., `1m`, `30s`). | `5s` (discovery), `60s` (HTTP) |
 | `BREWMBLE_CONFIG` | CLI | Path to the CLI configuration file. | `.brewmble.yaml` |
 | `RUST_LOG` | Daemon | Logging filter for the daemon (e.g., `info`, `debug`). | `brewmbled=info` |

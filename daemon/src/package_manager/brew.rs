@@ -2,16 +2,28 @@ use super::{CommandRunner, PackageManager, RealCommandRunner};
 use async_trait::async_trait;
 use std::io;
 use std::process::Output;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::{error, info};
 
 pub struct Brew {
     pub runner: Box<dyn CommandRunner>,
+    pub last_update: Mutex<Option<Instant>>,
+    pub cache_ttl: Duration,
 }
 
 impl Default for Brew {
     fn default() -> Self {
         Self {
             runner: Box::new(RealCommandRunner),
+            last_update: Mutex::new(None),
+            cache_ttl: {
+                let ttl_mins = std::env::var("BREWMBLE_BREW_UPDATE_INTERVAL")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(360); // Default to 6 hours
+                Duration::from_secs(ttl_mins * 60)
+            },
         }
     }
 }
@@ -55,13 +67,31 @@ impl PackageManager for Brew {
     }
 
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        info!("updating brew formulae...");
-        let output = self.run_brew(&["update"])?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let err_msg = format!("brew update failed with status: {}. stderr: {}", output.status, stderr);
-            error!("{}", err_msg);
-            return Err(err_msg.into());
+        let should_update = {
+            let last_update = self.last_update.lock().unwrap();
+            match *last_update {
+                Some(last) if self.cache_ttl.as_secs() > 0 => last.elapsed() >= self.cache_ttl,
+                _ => true,
+            }
+        };
+
+        if should_update {
+            info!("updating brew formulae...");
+            let output = self.run_brew(&["update"])?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let err_msg = format!("brew update failed with status: {}. stderr: {}", output.status, stderr);
+                error!("{}", err_msg);
+                return Err(err_msg.into());
+            }
+            // Update the last update time
+            let mut last_update = self.last_update.lock().unwrap();
+            *last_update = Some(Instant::now());
+        } else {
+            info!(
+                "brew cache is still valid (TTL: {} mins), skipping update",
+                self.cache_ttl.as_secs() / 60
+            );
         }
 
         info!("determining available updates...");
@@ -173,6 +203,8 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
         };
         assert_eq!(brew.version(), "Homebrew 3.3.16");
     }
@@ -186,6 +218,8 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
         };
         let updates = brew.get_updates().await.unwrap();
         assert_eq!(updates, vec!["pkg1", "pkg2"]);
@@ -200,6 +234,8 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
         };
         let result = brew.get_updates().await;
         assert!(result.is_err());
@@ -215,6 +251,8 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
         };
         let updates = brew.dry_run_upgrade().await.unwrap();
         assert_eq!(updates, vec!["pkg1", "pkg2"]);
@@ -229,7 +267,73 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
         };
         assert!(brew.full_upgrade().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_brew_get_updates_caching() {
+        use std::sync::Arc;
+
+        struct TrackingRunner {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl CommandRunner for TrackingRunner {
+            fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(format!("{} {}", program, args.join(" ")));
+                Ok(Output {
+                    status: ExitStatus::from_raw(0),
+                    stdout: b"pkg1\n".to_vec(),
+                    stderr: b"".to_vec(),
+                })
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = TrackingRunner {
+            calls: calls.clone(),
+        };
+        let brew = Brew {
+            runner: Box::new(runner),
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(60), // 1 minute
+        };
+
+        // First call - should run update
+        let _ = brew.get_updates().await.unwrap();
+        {
+            let c = calls.lock().unwrap();
+            assert!(c.iter().any(|s| s.contains("brew update")));
+            assert_eq!(c.len(), 2); // update and outdated
+        }
+
+        // Second call - should NOT run update
+        calls.lock().unwrap().clear();
+        let _ = brew.get_updates().await.unwrap();
+        {
+            let c = calls.lock().unwrap();
+            assert!(!c.iter().any(|s| s.contains("brew update")));
+            assert!(c.iter().any(|s| s.contains("outdated")));
+            assert_eq!(c.len(), 1);
+        }
+
+        // Force update with TTL 0
+        let calls2 = Arc::new(Mutex::new(Vec::new()));
+        let runner2 = TrackingRunner {
+            calls: calls2.clone(),
+        };
+        let brew2 = Brew {
+            runner: Box::new(runner2),
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(0),
+        };
+        let _ = brew2.get_updates().await.unwrap();
+        {
+            let c = calls2.lock().unwrap();
+            assert!(c.iter().any(|s| s.contains("brew update")));
+        }
     }
 }

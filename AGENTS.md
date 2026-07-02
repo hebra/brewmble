@@ -15,9 +15,9 @@ This file provides guidance to agents when working with code in this repository.
 
 - Daemon APT functionality requires Linux systems (Debian-based with apt)
 - Uses mDNS service discovery with "_brewmble._tcp.local." service type for automatic daemon discovery
-- Environment variables control daemon configuration: BREWMBLE_DAEMON_PORT (default 8080), BREWMBLE_DAEMON_HOSTNAME, BREWMBLE_DAEMON_IP, BREWMBLE_DAEMON_API_KEY, BREWMBLE_APT_UPDATE_INTERVAL (default 360)
+- Environment variables control daemon configuration: BREWMBLE_DAEMON_PORT (default 8080), BREWMBLE_DAEMON_HOSTNAME, BREWMBLE_DAEMON_IP, BREWMBLE_DAEMON_API_KEY, BREWMBLE_APT_UPDATE_INTERVAL (default 360), BREWMBLE_BREW_UPDATE_INTERVAL (default 360)
 - BREWMBLE_TIMEOUT env var accepts both seconds (integer) or humantime format (e.g., "1m", "30s")
-- Daemon caches 'apt-get update' results based on BREWMBLE_APT_UPDATE_INTERVAL (default 360 mins) - see get_apt_updates()
+- Daemon caches 'apt-get update' and 'brew update' results based on their respective update intervals (default 360 mins) - see get_updates()
 - CLI uses blocking HTTP client (reqwest with blocking feature) while daemon uses async Axum framework
 - Different Rust editions: CLI uses 2021, daemon uses 2024
 - Container builds use podman with ports 8080 (HTTP) and 5353 (mDNS)
@@ -50,7 +50,7 @@ This file provides guidance to agents when working with code in this repository.
 ## Project Documentation Rules (Non-Obvious Only)
 
 - CLI discovers daemons via mDNS, daemon serves status via HTTP API
-- Daemon only runs on Linux (Debian-based systems with apt)
+- Daemon runs on Linux (Debian-based systems with apt) and macOS (with Homebrew)
 - Environment variables configure daemon networking and identity
 - REST and web components are planned but not yet implemented (empty directories)
 - Container builds require both HTTP (8080) and mDNS (5353) ports
@@ -58,9 +58,9 @@ This file provides guidance to agents when working with code in this repository.
 ## Project Architecture Rules (Non-Obvious Only)
 
 - Multi-component system: CLI discovers via mDNS, daemon serves HTTP status API
-- Daemon architecture requires Linux (Debian-based) for apt package management
+- Daemon architecture supports Linux (Debian-based) for apt and macOS for Homebrew
 - Environment-based configuration replaces traditional config files
 - mDNS service discovery enables automatic cluster discovery
 - Container architecture requires both HTTP and mDNS networking
 - Daemon uses middleware pattern for authentication (auth_middleware)
-- Status handler returns 412 PRECONDITION_FAILED on non-Debian systems
+- Status handler returns 412 PRECONDITION_FAILED on systems without a supported package manager
