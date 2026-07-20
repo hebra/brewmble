@@ -1,18 +1,18 @@
 use brewmble_rest::{
-    StatusResponse, UpgradeResponse, API_KEY_HEADER, PATH_STATUS, PATH_UPGRADE, SERVICE_DOMAIN,
-    SERVICE_TYPE,
+    RebootResponse, StatusResponse, UpgradeResponse, API_KEY_HEADER, PATH_REBOOT, PATH_STATUS,
+    PATH_UPGRADE, SERVICE_DOMAIN, SERVICE_TYPE,
 };
 use clap::{Parser, Subcommand};
 use flume::RecvTimeoutError;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ResolvedService};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use keyring::Entry;
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use keyring::Entry;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -234,14 +234,19 @@ enum Commands {
         /// Targets (host:port)
         targets: Vec<String>,
     },
-    /// Manage packages on brewmble daemons
-    Packages {
+    /// Manage brewmble nodes
+    #[command(visible_alias = "packages")]
+    Node {
         /// Perform a full system upgrade
-        #[arg(short = 'u', long, required = true)]
+        #[arg(short = 'u', long)]
         full_upgrade: bool,
 
+        /// Reboot the node
+        #[arg(short = 'r', long)]
+        reboot: bool,
+
         /// Show what would be upgraded without executing
-        #[arg(long)]
+        #[arg(long, conflicts_with = "reboot", requires = "full_upgrade")]
         dry_run: bool,
 
         /// Targets (host:port)
@@ -307,17 +312,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             run_status(all, targets, &config)
         }
-        Some(Commands::Packages {
+        Some(Commands::Node {
             full_upgrade,
+            reboot,
             dry_run,
             targets,
         }) => {
             if targets.is_empty() && !config_exists {
                 println!("No config file was found or set.");
             }
-            run_packages(full_upgrade, dry_run, targets, &config)
+            run_node(full_upgrade, reboot, dry_run, targets, &config)
         }
-        Some(Commands::Profile { subcommand }) => run_profile(subcommand, &mut config, &config_path),
+        Some(Commands::Profile { subcommand }) => {
+            run_profile(subcommand, &mut config, &config_path)
+        }
         Some(Commands::Version) => run_version(&config),
         None => {
             // This case might be reached if only options are provided but no command.
@@ -364,7 +372,9 @@ fn run_profile(
             if config.profiles.contains_key(&name) {
                 return Err(format!("Profile '{}' already exists", name).into());
             }
-            config.profiles.insert(name.clone(), ProfileConfig::default());
+            config
+                .profiles
+                .insert(name.clone(), ProfileConfig::default());
             save_config(config_path, config)?;
             println!("Created profile '{}'", name);
         }
@@ -373,7 +383,9 @@ fn run_profile(
                 return Err("Cannot delete the default profile".into());
             }
             if name == config.active_profile {
-                return Err("Cannot delete the active profile. Switch to another profile first.".into());
+                return Err(
+                    "Cannot delete the active profile. Switch to another profile first.".into(),
+                );
             }
             if config.profiles.remove(&name).is_some() {
                 save_config(config_path, config)?;
@@ -410,7 +422,9 @@ fn run_profile(
                     .nodes
                     .iter_mut()
                     .find(|n| n.address == node_id || n.name.as_ref() == Some(&node_id))
-                    .ok_or_else(|| format!("Node '{}' not found in profile '{}'", node_id, p_name))?;
+                    .ok_or_else(|| {
+                        format!("Node '{}' not found in profile '{}'", node_id, p_name)
+                    })?;
 
                 let entry = Entry::new("brewmble-cli", &node.address)?;
                 entry.set_password(&key)?;
@@ -436,11 +450,7 @@ fn run_discover(
 ) -> Result<(), Box<dyn Error>> {
     println!("Discovery will take {} seconds", timeout.as_secs());
     let mdns = ServiceDaemon::new().map_err(|err| format!("create resolver: {err}"))?;
-    let service_name = format!(
-        "{}.{}",
-        SERVICE_TYPE.trim_end_matches('.'),
-        SERVICE_DOMAIN
-    );
+    let service_name = format!("{}.{}", SERVICE_TYPE.trim_end_matches('.'), SERVICE_DOMAIN);
     let receiver = mdns
         .browse(&service_name)
         .map_err(|err| format!("browse: {err}"))?;
@@ -481,10 +491,8 @@ fn run_discover(
                         writer.flush()?;
 
                         if let Some(addr) = info.addresses.iter().next() {
-                            discovered_nodes.push((
-                                format!("{}:{}", addr, info.port),
-                                entry_id(&info),
-                            ));
+                            discovered_nodes
+                                .push((format!("{}:{}", addr, info.port), entry_id(&info)));
                         }
                     }
                 }
@@ -518,7 +526,6 @@ fn run_discover(
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -558,52 +565,109 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_parse_packages_short_upgrade() {
-        let cli = Cli::parse_from(&["brewmble", "packages", "-u"]);
-        if let Some(Commands::Packages {
+    fn test_cli_parse_node_short_upgrade() {
+        let cli = Cli::parse_from(&["brewmble", "node", "-u"]);
+        if let Some(Commands::Node {
             full_upgrade,
+            reboot,
             dry_run: _,
             targets: _,
         }) = cli.command
         {
             assert!(full_upgrade);
+            assert!(!reboot);
         } else {
-            panic!("Expected Packages command");
+            panic!("Expected Node command");
         }
     }
 
     #[test]
-    fn test_cli_parse_packages_dry_run() {
-        let cli = Cli::parse_from(&["brewmble", "packages", "--full-upgrade", "--dry-run"]);
-        if let Some(Commands::Packages {
+    fn test_cli_parse_node_dry_run() {
+        let cli = Cli::parse_from(&["brewmble", "node", "--full-upgrade", "--dry-run"]);
+        if let Some(Commands::Node {
             full_upgrade,
+            reboot,
             dry_run,
             targets,
         }) = cli.command
         {
             assert!(full_upgrade);
+            assert!(!reboot);
             assert!(dry_run);
             assert!(targets.is_empty());
         } else {
-            panic!("Expected Packages command");
+            panic!("Expected Node command");
         }
     }
 
     #[test]
-    fn test_cli_parse_packages_no_dry_run() {
-        let cli = Cli::parse_from(&["brewmble", "packages", "--full-upgrade", "host:8080"]);
-        if let Some(Commands::Packages {
+    fn test_cli_parse_node_no_dry_run() {
+        let cli = Cli::parse_from(&["brewmble", "node", "--full-upgrade", "host:8080"]);
+        if let Some(Commands::Node {
             full_upgrade,
+            reboot,
             dry_run,
             targets,
         }) = cli.command
         {
             assert!(full_upgrade);
+            assert!(!reboot);
             assert!(!dry_run);
             assert_eq!(targets, vec!["host:8080"]);
         } else {
-            panic!("Expected Packages command");
+            panic!("Expected Node command");
         }
+    }
+
+    #[test]
+    fn test_cli_parse_node_reboot() {
+        let cli = Cli::parse_from(&["brewmble", "node", "-r", "host:8080"]);
+        if let Some(Commands::Node {
+            full_upgrade,
+            reboot,
+            dry_run,
+            targets,
+        }) = cli.command
+        {
+            assert!(!full_upgrade);
+            assert!(reboot);
+            assert!(!dry_run);
+            assert_eq!(targets, vec!["host:8080"]);
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_packages_alias() {
+        let cli = Cli::parse_from(&["brewmble", "packages", "--full-upgrade", "host:8080"]);
+        if let Some(Commands::Node {
+            full_upgrade,
+            reboot,
+            dry_run,
+            targets,
+        }) = cli.command
+        {
+            assert!(full_upgrade);
+            assert!(!reboot);
+            assert!(!dry_run);
+            assert_eq!(targets, vec!["host:8080"]);
+        } else {
+            panic!("Expected Node command via packages alias");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_node_reboot_conflicts_with_dry_run() {
+        let result = Cli::try_parse_from(&["brewmble", "node", "--reboot", "--dry-run"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parse_node_requires_action() {
+        let result = Cli::try_parse_from(&["brewmble", "node", "host:8080"]);
+        // Clap does not know the mutual requirement, so parsing succeeds and run_node errors.
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -769,7 +833,8 @@ mod tests {
             "1.2.3.4",
             8080,
             &properties[..],
-        ).unwrap();
+        )
+        .unwrap();
 
         let resolved = info.as_resolved_service();
 
@@ -811,13 +876,13 @@ nodes:
     }
 }
 
-
 fn clean_node_id(id: &str) -> &str {
     id.strip_prefix("id=").unwrap_or(id)
 }
 
 fn entry_id(entry: &ResolvedService) -> String {
-    entry.txt_properties
+    entry
+        .txt_properties
         .iter()
         .find(|p| p.key() == "id")
         .map(|p| clean_node_id(p.val_str()).to_string())
@@ -829,16 +894,17 @@ fn entry_host(entry: &ResolvedService) -> String {
 }
 
 fn entry_addresses(entry: &ResolvedService) -> String {
-    entry.addresses.iter().map(|addr| addr.to_string()).collect::<Vec<_>>().join(",")
+    entry
+        .addresses
+        .iter()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn entry_instance(entry: &ResolvedService) -> String {
     let fullname = &entry.fullname;
-    let suffix = format!(
-        ".{}.{}",
-        SERVICE_TYPE.trim_end_matches('.'),
-        SERVICE_DOMAIN
-    );
+    let suffix = format!(".{}.{}", SERVICE_TYPE.trim_end_matches('.'), SERVICE_DOMAIN);
     fullname
         .strip_suffix(&suffix)
         .unwrap_or(fullname)
@@ -866,12 +932,10 @@ fn run_version(config: &Config) -> Result<(), Box<dyn Error>> {
             }
 
             let version = match request.send() {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.json::<StatusResponse>() {
-                        Ok(sr) => sr.daemon_version.unwrap_or_else(|| "Unknown".to_string()),
-                        Err(_) => "Unknown (Parse Error)".to_string(),
-                    }
-                }
+                Ok(resp) if resp.status().is_success() => match resp.json::<StatusResponse>() {
+                    Ok(sr) => sr.daemon_version.unwrap_or_else(|| "Unknown".to_string()),
+                    Err(_) => "Unknown (Parse Error)".to_string(),
+                },
                 Ok(resp) => format!("Error ({})", resp.status()),
                 Err(_) => "Unreachable".to_string(),
             };
@@ -959,7 +1023,9 @@ fn run_status(
     let pb = multi.add(ProgressBar::new(0));
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")?
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+            )?
             .progress_chars("#>-"),
     );
     pb.set_message("Querying status...");
@@ -999,7 +1065,10 @@ fn run_status(
                 let _ = writeln!(output);
                 pb.println(output);
 
-                node_reports.lock().unwrap().push((name.to_string(), failed, outdated));
+                node_reports
+                    .lock()
+                    .unwrap()
+                    .push((name.to_string(), failed, outdated));
                 pb.inc(1);
             });
         }
@@ -1078,6 +1147,9 @@ fn query_status(
                             details.push_str(&format!("Daemon version: {}\n", version));
                         }
                         details.push_str(&format!("Upgrading: {}\n", sr.is_upgrading));
+                        details.push_str(&format!("Allow reboot: {}\n", sr.allow_reboot));
+                        details.push_str(&format!("Auto clean: {}\n", sr.auto_clean));
+                        details.push_str(&format!("Auto remove: {}\n", sr.auto_remove));
                         if !sr.updates.is_empty() {
                             details.push_str("Updates:\n");
                             for update in &sr.updates {
@@ -1124,7 +1196,9 @@ fn query_status(
     }
 }
 
-fn discover_targets_with_timeout(timeout: Duration) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+fn discover_targets_with_timeout(
+    timeout: Duration,
+) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     let mut targets = Vec::new();
     let mdns = ServiceDaemon::new().map_err(|err| format!("create resolver: {err}"))?;
     let service_name = format!("{}.{}", SERVICE_TYPE.trim_end_matches('.'), SERVICE_DOMAIN);
@@ -1165,7 +1239,14 @@ fn discover_targets_with_timeout(timeout: Duration) -> Result<Vec<(String, Strin
 fn resolve_url(target: &str) -> String {
     if target.starts_with("http://") || target.starts_with("https://") {
         target.trim_end_matches('/').to_string()
-    } else if target.contains(':') && target.split(':').last().unwrap().chars().all(|c| c.is_ascii_digit()) {
+    } else if target.contains(':')
+        && target
+            .split(':')
+            .last()
+            .unwrap()
+            .chars()
+            .all(|c| c.is_ascii_digit())
+    {
         let parts: Vec<&str> = target.split(':').collect();
         let host = parts[..parts.len() - 1].join(":");
         let port = parts.last().unwrap();
@@ -1180,13 +1261,21 @@ fn resolve_url(target: &str) -> String {
     }
 }
 
-
-fn run_packages(
-    _full_upgrade: bool,
+fn run_node(
+    full_upgrade: bool,
+    reboot: bool,
     dry_run: bool,
     mut targets: Vec<String>,
     config: &Config,
 ) -> Result<(), Box<dyn Error>> {
+    if !full_upgrade && !reboot {
+        return Err("either --full-upgrade (-u) or --reboot (-r) must be specified".into());
+    }
+
+    if dry_run && !full_upgrade {
+        return Err("--dry-run can only be used with --full-upgrade".into());
+    }
+
     let active_profile = config.profiles.get(&config.active_profile);
 
     if targets.is_empty() {
@@ -1211,34 +1300,64 @@ fn run_packages(
 
     for target in targets {
         let url = resolve_url(&target);
-        let upgrade_url = format!("{}{}", url, PATH_UPGRADE);
 
-        let mut request = client
-            .post(&upgrade_url)
-            .json(&brewmble_rest::UpgradeRequest { dry_run });
+        let (status, body, updates) = if reboot {
+            let reboot_url = format!("{}{}", url, PATH_REBOOT);
+            let mut request = client
+                .post(&reboot_url)
+                .json(&brewmble_rest::RebootRequest::default());
 
-        if let Some(profile) = active_profile {
-            if let Some(node) = profile
-                .nodes
-                .iter()
-                .find(|n| n.address == target || n.name.as_ref() == Some(&target))
-            {
-                if let Some(api_key) = node.get_api_key() {
-                    request = request.header(API_KEY_HEADER, api_key);
+            if let Some(profile) = active_profile {
+                if let Some(node) = profile
+                    .nodes
+                    .iter()
+                    .find(|n| n.address == target || n.name.as_ref() == Some(&target))
+                {
+                    if let Some(api_key) = node.get_api_key() {
+                        request = request.header(API_KEY_HEADER, api_key);
+                    }
                 }
             }
-        }
 
-        let (status, body, updates) = match request.send() {
-            Ok(resp) => {
-                let status = resp.status().to_string();
-                let ur: UpgradeResponse = resp.json().unwrap_or_else(|_| UpgradeResponse {
-                    message: "Unknown response".to_string(),
-                    updates: None,
-                });
-                (status, ur.message, ur.updates)
+            match request.send() {
+                Ok(resp) => {
+                    let status = resp.status().to_string();
+                    let rr: RebootResponse = resp.json().unwrap_or_else(|_| RebootResponse {
+                        message: "Unknown response".to_string(),
+                    });
+                    (status, rr.message, None)
+                }
+                Err(err) => (format!("Error: {}", err), "".to_string(), None),
             }
-            Err(err) => (format!("Error: {}", err), "".to_string(), None),
+        } else {
+            let upgrade_url = format!("{}{}", url, PATH_UPGRADE);
+            let mut request = client
+                .post(&upgrade_url)
+                .json(&brewmble_rest::UpgradeRequest { dry_run });
+
+            if let Some(profile) = active_profile {
+                if let Some(node) = profile
+                    .nodes
+                    .iter()
+                    .find(|n| n.address == target || n.name.as_ref() == Some(&target))
+                {
+                    if let Some(api_key) = node.get_api_key() {
+                        request = request.header(API_KEY_HEADER, api_key);
+                    }
+                }
+            }
+
+            match request.send() {
+                Ok(resp) => {
+                    let status = resp.status().to_string();
+                    let ur: UpgradeResponse = resp.json().unwrap_or_else(|_| UpgradeResponse {
+                        message: "Unknown response".to_string(),
+                        updates: None,
+                    });
+                    (status, ur.message, ur.updates)
+                }
+                Err(err) => (format!("Error: {}", err), "".to_string(), None),
+            }
         };
 
         writeln!(tw, "{}\t{}", target, status)?;
@@ -1256,4 +1375,3 @@ fn run_packages(
 
     Ok(())
 }
-

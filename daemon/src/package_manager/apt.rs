@@ -4,20 +4,24 @@ use async_trait::async_trait;
 use std::sync::Mutex;
 #[cfg(any(target_os = "linux", test))]
 use std::time::{Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct Apt {
     pub runner: Box<dyn CommandRunner>,
+    pub auto_clean: bool,
+    pub auto_remove: bool,
     #[cfg(any(target_os = "linux", test))]
     pub last_update: Mutex<Option<Instant>>,
     #[cfg(any(target_os = "linux", test))]
     pub cache_ttl: Duration,
 }
 
-impl Default for Apt {
-    fn default() -> Self {
+impl Apt {
+    pub fn new(auto_clean: bool, auto_remove: bool) -> Self {
         Self {
             runner: Box::new(RealCommandRunner),
+            auto_clean,
+            auto_remove,
             #[cfg(any(target_os = "linux", test))]
             last_update: Mutex::new(None),
             #[cfg(any(target_os = "linux", test))]
@@ -29,6 +33,12 @@ impl Default for Apt {
                 Duration::from_secs(ttl_mins * 60)
             },
         }
+    }
+}
+
+impl Default for Apt {
+    fn default() -> Self {
+        Self::new(false, false)
     }
 }
 
@@ -72,10 +82,18 @@ impl PackageManager for Apt {
             let output = self.runner.run("sudo", &["apt-get", "update"])?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                let err_msg = if stderr.contains("Permission denied") || stderr.contains("Are you root") {
-                    format!("Permission denied when updating apt cache. Are you running as root? stderr: {}", stderr)
+                let err_msg = if stderr.contains("Permission denied")
+                    || stderr.contains("Are you root")
+                {
+                    format!(
+                        "Permission denied when updating apt cache. Are you running as root? stderr: {}",
+                        stderr
+                    )
                 } else {
-                    format!("Failed to update apt cache: {}. stderr: {}", output.status, stderr)
+                    format!(
+                        "Failed to update apt cache: {}. stderr: {}",
+                        output.status, stderr
+                    )
                 };
                 error!("{}", err_msg);
                 return Err(err_msg.into());
@@ -94,10 +112,15 @@ impl PackageManager for Apt {
         // Use simulated dist-upgrade to find which packages would be upgraded.
         // This requires sudo because apt needs to lock the cache even for simulated upgrades
         // if run as a non-root user.
-        let output = self.runner.run("sudo", &["apt-get", "-s", "dist-upgrade"])?;
+        let output = self
+            .runner
+            .run("sudo", &["apt-get", "-s", "dist-upgrade"])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let err_msg = format!("Failed to determine available updates: {}. stderr: {}", output.status, stderr);
+            let err_msg = format!(
+                "Failed to determine available updates: {}. stderr: {}",
+                output.status, stderr
+            );
             error!("{}", err_msg);
             return Err(err_msg.into());
         }
@@ -119,12 +142,16 @@ impl PackageManager for Apt {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    async fn dry_run_upgrade(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn dry_run_upgrade(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         self.get_updates().await
     }
 
     #[cfg(all(not(target_os = "linux"), not(test)))]
-    async fn dry_run_upgrade(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn dry_run_upgrade(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(vec![])
     }
 
@@ -136,6 +163,7 @@ impl PackageManager for Apt {
             Ok(output) => {
                 if output.status.success() {
                     info!("full upgrade completed successfully");
+                    self.run_cleanup();
                     Ok(())
                 } else {
                     let err_msg = format!(
@@ -154,14 +182,63 @@ impl PackageManager for Apt {
             }
         }
     }
+
+    fn auto_clean(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!("running apt autoclean");
+        let output = self.runner.run("sudo", &["apt-get", "autoclean"])?;
+        if output.status.success() {
+            info!("apt autoclean completed successfully");
+            Ok(())
+        } else {
+            let err_msg = format!(
+                "apt autoclean failed with status: {}. stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            error!("{}", err_msg);
+            Err(err_msg.into())
+        }
+    }
+
+    fn auto_remove(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!("running apt autoremove");
+        let output = self.runner.run("sudo", &["apt-get", "autoremove", "-y"])?;
+        if output.status.success() {
+            info!("apt autoremove completed successfully");
+            Ok(())
+        } else {
+            let err_msg = format!(
+                "apt autoremove failed with status: {}. stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            error!("{}", err_msg);
+            Err(err_msg.into())
+        }
+    }
+}
+
+impl Apt {
+    fn run_cleanup(&self) {
+        if self.auto_clean {
+            if let Err(e) = self.auto_clean() {
+                warn!("auto-clean failed, continuing: {e}");
+            }
+        }
+        if self.auto_remove {
+            if let Err(e) = self.auto_remove() {
+                warn!("auto-remove failed, continuing: {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitStatus, Output};
-    use std::io;
 
     struct MockRunner {
         success: bool,
@@ -194,6 +271,8 @@ mod tests {
         };
         let apt = Apt {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -209,6 +288,8 @@ mod tests {
         };
         let apt = Apt {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -224,6 +305,8 @@ mod tests {
         };
         let apt = Apt {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -240,6 +323,8 @@ mod tests {
         };
         let apt = Apt {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -255,6 +340,8 @@ mod tests {
         };
         let apt = Apt {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -273,6 +360,8 @@ mod tests {
         };
         let apt = Apt {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -290,16 +379,25 @@ mod tests {
         let runner = MockRunner {
             success: false,
             stdout: "".to_string(),
-            stderr: "E: Could not open lock file /var/lib/apt/lists/lock - open (13: Permission denied)".to_string(),
+            stderr:
+                "E: Could not open lock file /var/lib/apt/lists/lock - open (13: Permission denied)"
+                    .to_string(),
         };
         let apt = Apt {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
         let result = apt.get_updates().await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Permission denied"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Permission denied")
+        );
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -312,12 +410,19 @@ mod tests {
         };
         let apt = Apt {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
         let result = apt.get_updates().await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Failed to update apt cache"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to update apt cache")
+        );
     }
 
     #[tokio::test]
@@ -340,9 +445,13 @@ mod tests {
         }
 
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let runner = TrackingRunner { calls: calls.clone() };
+        let runner = TrackingRunner {
+            calls: calls.clone(),
+        };
         let apt = Apt {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(60), // 1 minute
         };
@@ -366,9 +475,13 @@ mod tests {
         }
 
         // Force update with TTL 0
-        let runner2 = TrackingRunner { calls: calls.clone() };
+        let runner2 = TrackingRunner {
+            calls: calls.clone(),
+        };
         let apt2 = Apt {
             runner: Box::new(runner2),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(0),
         };
@@ -396,5 +509,129 @@ mod tests {
 
         let apt_default = Apt::default();
         assert_eq!(apt_default.cache_ttl, Duration::from_secs(360 * 60));
+    }
+
+    #[tokio::test]
+    async fn test_apt_full_upgrade_runs_cleanup_when_enabled() {
+        use std::sync::Arc;
+
+        struct TrackingRunner {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl CommandRunner for TrackingRunner {
+            fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(format!("{} {}", program, args.join(" ")));
+                Ok(Output {
+                    status: ExitStatus::from_raw(0),
+                    stdout: b"".to_vec(),
+                    stderr: b"".to_vec(),
+                })
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = TrackingRunner {
+            calls: calls.clone(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+            auto_clean: true,
+            auto_remove: true,
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
+        };
+
+        assert!(apt.full_upgrade().await.is_ok());
+
+        let c = calls.lock().unwrap();
+        assert!(c.iter().any(|s| s.contains("apt full-upgrade")));
+        assert!(c.iter().any(|s| s.contains("apt-get autoclean")));
+        assert!(c.iter().any(|s| s.contains("apt-get autoremove")));
+    }
+
+    #[tokio::test]
+    async fn test_apt_full_upgrade_skips_cleanup_when_disabled() {
+        use std::sync::Arc;
+
+        struct TrackingRunner {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl CommandRunner for TrackingRunner {
+            fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(format!("{} {}", program, args.join(" ")));
+                Ok(Output {
+                    status: ExitStatus::from_raw(0),
+                    stdout: b"".to_vec(),
+                    stderr: b"".to_vec(),
+                })
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = TrackingRunner {
+            calls: calls.clone(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
+        };
+
+        assert!(apt.full_upgrade().await.is_ok());
+
+        let c = calls.lock().unwrap();
+        assert!(c.iter().any(|s| s.contains("apt full-upgrade")));
+        assert!(!c.iter().any(|s| s.contains("apt-get autoclean")));
+        assert!(!c.iter().any(|s| s.contains("apt-get autoremove")));
+    }
+
+    #[tokio::test]
+    async fn test_apt_full_upgrade_cleanup_failure_does_not_fail_upgrade() {
+        use std::sync::Arc;
+
+        struct FailingCleanupRunner {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl CommandRunner for FailingCleanupRunner {
+            fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(format!("{} {}", program, args.join(" ")));
+                if program == "sudo" && args.contains(&"autoclean") {
+                    Ok(Output {
+                        status: ExitStatus::from_raw(1 << 8),
+                        stdout: b"".to_vec(),
+                        stderr: b"autoclean failed".to_vec(),
+                    })
+                } else {
+                    Ok(Output {
+                        status: ExitStatus::from_raw(0),
+                        stdout: b"".to_vec(),
+                        stderr: b"".to_vec(),
+                    })
+                }
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = FailingCleanupRunner {
+            calls: calls.clone(),
+        };
+        let apt = Apt {
+            runner: Box::new(runner),
+            auto_clean: true,
+            auto_remove: false,
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
+        };
+
+        assert!(apt.full_upgrade().await.is_ok());
+
+        let c = calls.lock().unwrap();
+        assert!(c.iter().any(|s| s.contains("apt full-upgrade")));
+        assert!(c.iter().any(|s| s.contains("apt-get autoclean")));
     }
 }

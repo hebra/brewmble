@@ -25,6 +25,8 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
 - **Multi-backend Support**: Automatically detects and uses the available package manager (APT or Homebrew).
 - **System Status**: Reports whether the system is up-to-date and lists available updates.
 - **Package Management**: Can trigger a full system upgrade via the detected package manager.
+- **Automatic Cleanup**: Optional `apt-get autoclean` / `brew cleanup` and `apt-get autoremove -y` / `brew autoremove` after successful upgrades.
+- **Controlled Reboots**: Optional API-triggered system reboot, gated by a daemon configuration flag.
 - **Authentication**: Secure access via API keys.
 - **Port Hunting**: Automatically finds an available port starting from 8080 if not specified.
 
@@ -168,8 +170,10 @@ The `brewmbled` daemon runs as the `brewmble` user but needs to perform package 
 
 2. **Add the following content**:
    ```text
-   brewmble ALL=(root) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get
+   brewmble ALL=(root) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get, /usr/bin/systemctl reboot, /usr/sbin/reboot
    ```
+
+   Adjust the paths to match your distribution (`/bin/systemctl`, `/sbin/reboot`, etc.).
 
 3. **Set correct permissions**:
    The file must have strict permissions:
@@ -185,6 +189,9 @@ Environment variables can be used for configuration:
 - `BREWMBLE_DAEMON_HOSTNAME`: Hostname to use for mDNS registration.
 - `BREWMBLE_DAEMON_IP`: Explicit IP address to use for mDNS registration.
 - `BREWMBLE_DAEMON_API_KEY`: API key for authentication. If not provided, one will be generated on startup and printed to the logs.
+- `BREWMBLE_DAEMON_ALLOW_REBOOT`: Allow the daemon to reboot the host when requested via the API. Defaults to `false`.
+- `BREWMBLE_DAEMON_AUTO_CLEAN`: Automatically clean downloaded packages after a successful upgrade (`apt-get autoclean` / `brew cleanup`). Defaults to `false`.
+- `BREWMBLE_DAEMON_AUTO_REMOVE`: Automatically remove unused packages after a successful upgrade (`apt-get autoremove -y` / `brew autoremove`). Defaults to `false`.
 - `BREWMBLE_APT_UPDATE_INTERVAL`: Interval in minutes between `apt-get update` calls (Linux only). Defaults to 360 (6 hours). Set to 0 to force an update on every status check.
 - `BREWMBLE_BREW_UPDATE_INTERVAL`: Interval in minutes between `brew update` calls (macOS only). Defaults to 360 (6 hours). Set to 0 to force an update on every status check.
 - `RUST_LOG`: Logging level (e.g., `info`, `debug`).
@@ -210,7 +217,10 @@ Returns the current system status.
 {
   "message": "System has 2 outdated packages",
   "updates": ["libc6", "vim"],
-  "is_upgrading": false
+  "is_upgrading": false,
+  "allow_reboot": false,
+  "auto_clean": true,
+  "auto_remove": false
 }
 ```
 
@@ -222,6 +232,24 @@ Triggers a full system upgrade (e.g., `apt full-upgrade -y` or `brew upgrade`). 
 ```json
 {
   "message": "full upgrade triggered"
+}
+```
+
+### `POST /node/reboot`
+
+Reboots the host. Only allowed if `BREWMBLE_DAEMON_ALLOW_REBOOT` is enabled. Reboots are rejected while a full upgrade is running.
+
+**Response when allowed:**
+```json
+{
+  "message": "reboot triggered"
+}
+```
+
+**Response when disabled:**
+```json
+{
+  "message": "reboot is not enabled on this daemon"
 }
 ```
 

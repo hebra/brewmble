@@ -64,3 +64,7 @@ This file provides guidance to agents when working with code in this repository.
 - Container architecture requires both HTTP and mDNS networking
 - Daemon uses middleware pattern for authentication (auth_middleware)
 - Status handler returns 412 PRECONDITION_FAILED on systems without a supported package manager
+
+## Project Planning Rules (Non-Obvious Only)
+
+- Save all implementation plans to the `plans/` folder at the repository root. Do not use hidden or vendor-specific plan directories.

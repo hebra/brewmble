@@ -8,6 +8,7 @@ pub const SERVICE_FULL_TYPE: &str = "_brewmble._tcp.local.";
 pub const PATH_STATUS: &str = "/status";
 pub const PATH_HEALTH: &str = "/health";
 pub const PATH_UPGRADE: &str = "/packages/full-upgrade";
+pub const PATH_REBOOT: &str = "/node/reboot";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StatusResponse {
@@ -16,6 +17,22 @@ pub struct StatusResponse {
     pub is_upgrading: bool,
     #[serde(default)]
     pub daemon_version: Option<String>,
+    #[serde(default)]
+    pub allow_reboot: bool,
+    #[serde(default)]
+    pub auto_clean: bool,
+    #[serde(default)]
+    pub auto_remove: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct RebootRequest {
+    pub delay_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RebootResponse {
+    pub message: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -49,18 +66,27 @@ mod tests {
             updates: vec!["pkg1".to_string(), "pkg2".to_string()],
             is_upgrading: false,
             daemon_version: Some("0.1.0".to_string()),
+            allow_reboot: true,
+            auto_clean: true,
+            auto_remove: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"message\":\"All good\""));
         assert!(json.contains("\"updates\":[\"pkg1\",\"pkg2\"]"));
         assert!(json.contains("\"is_upgrading\":false"));
         assert!(json.contains("\"daemon_version\":\"0.1.0\""));
+        assert!(json.contains("\"allow_reboot\":true"));
+        assert!(json.contains("\"auto_clean\":true"));
+        assert!(json.contains("\"auto_remove\":false"));
 
         let decoded: StatusResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.message, resp.message);
         assert_eq!(decoded.updates, resp.updates);
         assert_eq!(decoded.is_upgrading, resp.is_upgrading);
         assert_eq!(decoded.daemon_version, resp.daemon_version);
+        assert_eq!(decoded.allow_reboot, resp.allow_reboot);
+        assert_eq!(decoded.auto_clean, resp.auto_clean);
+        assert_eq!(decoded.auto_remove, resp.auto_remove);
     }
 
     #[test]
@@ -69,6 +95,9 @@ mod tests {
         let decoded: StatusResponse = serde_json::from_str(json).unwrap();
         assert_eq!(decoded.message, "Old daemon");
         assert_eq!(decoded.daemon_version, None);
+        assert!(!decoded.allow_reboot);
+        assert!(!decoded.auto_clean);
+        assert!(!decoded.auto_remove);
     }
 
     #[test]
@@ -88,7 +117,10 @@ mod tests {
         let decoded: HealthResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.status, resp.status);
         assert_eq!(decoded.package_manager, resp.package_manager);
-        assert_eq!(decoded.package_manager_version, resp.package_manager_version);
+        assert_eq!(
+            decoded.package_manager_version,
+            resp.package_manager_version
+        );
         assert_eq!(decoded.is_upgrading, resp.is_upgrading);
     }
 
@@ -115,5 +147,39 @@ mod tests {
 
         let decoded: UpgradeRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.dry_run, req.dry_run);
+    }
+
+    #[test]
+    fn test_reboot_response_serialization() {
+        let resp = RebootResponse {
+            message: "Reboot scheduled".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"message\":\"Reboot scheduled\""));
+
+        let decoded: RebootResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.message, resp.message);
+    }
+
+    #[test]
+    fn test_reboot_request_serialization() {
+        let req = RebootRequest {
+            delay_secs: Some(60),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"delay_secs\":60"));
+
+        let decoded: RebootRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.delay_secs, req.delay_secs);
+    }
+
+    #[test]
+    fn test_reboot_request_default_serialization() {
+        let req = RebootRequest::default();
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"delay_secs\":null"));
+
+        let decoded: RebootRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.delay_secs, None);
     }
 }

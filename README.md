@@ -105,7 +105,10 @@ cd daemon && cargo build --release
    ./cli/target/release/brewmble status --all
 
    # Trigger upgrade
-   ./cli/target/release/brewmble packages --full-upgrade <target>
+   ./cli/target/release/brewmble node --full-upgrade <target>
+
+   # Reboot a node (only if the daemon has reboot enabled)
+   ./cli/target/release/brewmble node --reboot <target>
    ```
 
 ## Security
@@ -149,6 +152,9 @@ Brewmble can be configured using environment variables.
 | `BREWMBLE_DAEMON_HOSTNAME` | Daemon | Hostname to use for mDNS registration. | System hostname |
 | `BREWMBLE_DAEMON_IP` | Daemon | Explicit IP address to use for mDNS registration. | Automatically detected |
 | `BREWMBLE_DAEMON_API_KEY` | Daemon | API key for authentication. If not provided, a random UUID v4 will be generated and logged. | Generated |
+| `BREWMBLE_DAEMON_ALLOW_REBOOT` | Daemon | Allow the daemon to reboot the host when requested via the API. | `false` |
+| `BREWMBLE_DAEMON_AUTO_CLEAN` | Daemon | Automatically clean downloaded packages after a successful upgrade (`apt-get autoclean` / `brew cleanup`). | `false` |
+| `BREWMBLE_DAEMON_AUTO_REMOVE` | Daemon | Automatically remove unused packages after a successful upgrade (`apt-get autoremove -y` / `brew autoremove`). | `false` |
 | `BREWMBLE_APT_UPDATE_INTERVAL` | Daemon | Interval in minutes between `apt-get update` calls. Set to `0` to always update. | `360` (6 hours) |
 | `BREWMBLE_BREW_UPDATE_INTERVAL` | Daemon | Interval in minutes between `brew update` calls. Set to `0` to always update. | `360` (6 hours) |
 | `BREWMBLE_TIMEOUT` | CLI | Timeout for discovery and HTTP requests. Supports seconds or [humantime](https://docs.rs/humantime) (e.g., `1m`, `30s`). | `5s` (discovery), `60s` (HTTP) |

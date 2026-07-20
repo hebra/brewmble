@@ -1,29 +1,30 @@
-use brewmble_rest::{
-    HealthResponse, StatusResponse, UpgradeRequest, UpgradeResponse, API_KEY_HEADER, PATH_HEALTH,
-    PATH_STATUS, PATH_UPGRADE, SERVICE_FULL_TYPE,
-};
-use tower_http::trace::TraceLayer;
 use axum::{
+    Json, Router,
     extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
+};
+use brewmble_rest::{
+    API_KEY_HEADER, HealthResponse, PATH_HEALTH, PATH_REBOOT, PATH_STATUS, PATH_UPGRADE,
+    RebootRequest, RebootResponse, SERVICE_FULL_TYPE, StatusResponse, UpgradeRequest,
+    UpgradeResponse,
 };
 use clap::Parser;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use tokio::net::TcpListener;
+use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod package_manager;
-use package_manager::{get_package_manager, PackageManager};
+use package_manager::{PackageManager, get_package_manager};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
@@ -47,6 +48,18 @@ struct Cli {
     #[arg(long, env = "BREWMBLE_DAEMON_API_KEY")]
     api_key: Option<String>,
 
+    /// Allow the daemon to reboot the host when requested via the API.
+    #[arg(long, env = "BREWMBLE_DAEMON_ALLOW_REBOOT")]
+    allow_reboot: bool,
+
+    /// Automatically clean downloaded packages after a successful upgrade.
+    #[arg(long, env = "BREWMBLE_DAEMON_AUTO_CLEAN")]
+    auto_clean: bool,
+
+    /// Automatically remove unused packages after a successful upgrade.
+    #[arg(long, env = "BREWMBLE_DAEMON_AUTO_REMOVE")]
+    auto_remove: bool,
+
     /// Print version information
     #[arg(short = 'v', long)]
     version: bool,
@@ -56,9 +69,11 @@ struct Cli {
 struct AppState {
     is_upgrading: Arc<AtomicBool>,
     api_key: String,
+    allow_reboot: bool,
+    auto_clean: bool,
+    auto_remove: bool,
     package_manager: Arc<Box<dyn PackageManager>>,
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -102,9 +117,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let hostname = cli.hostname.unwrap_or_else(|| {
-        gethostname::gethostname().to_string_lossy().into_owned()
-    }).trim_end_matches('.').to_string();
+    let hostname = cli
+        .hostname
+        .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned())
+        .trim_end_matches('.')
+        .to_string();
 
     let mdns_daemon = register_mdns(http_port, &hostname, cli.ip);
 
@@ -116,15 +133,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key
     };
 
-    let pm = get_package_manager();
+    let pm = get_package_manager(cli.auto_clean, cli.auto_remove);
     info!("using {} package manager backend", pm.name());
     if !pm.is_available() {
-        warn!("The current package manager ({}) is not available on this system.", pm.name());
+        warn!(
+            "The current package manager ({}) is not available on this system.",
+            pm.name()
+        );
     }
 
     let state = AppState {
         is_upgrading: Arc::new(AtomicBool::new(false)),
         api_key,
+        allow_reboot: cli.allow_reboot,
+        auto_clean: cli.auto_clean,
+        auto_remove: cli.auto_remove,
         package_manager: Arc::new(pm),
     };
 
@@ -132,14 +155,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(PATH_HEALTH, get(health_handler))
         .route(PATH_STATUS, get(status_handler))
         .route(PATH_UPGRADE, post(full_upgrade_handler))
+        .route(PATH_REBOOT, post(reboot_handler))
         .layer(TraceLayer::new_for_http())
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state);
 
-    info!(
-        "brewmble daemon listening on {}",
-        listener.local_addr()?
-    );
+    info!("brewmble daemon listening on {}", listener.local_addr()?);
 
     let server_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -190,14 +214,22 @@ async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
 
 async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let is_upgrading = state.is_upgrading.load(Ordering::SeqCst);
+    let config_flags = (state.allow_reboot, state.auto_clean, state.auto_remove);
+
     if !state.package_manager.is_available() {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(StatusResponse {
-                message: format!("the system is not a {} system", state.package_manager.name()),
+                message: format!(
+                    "the system is not a {} system",
+                    state.package_manager.name()
+                ),
                 updates: Vec::new(),
                 is_upgrading,
                 daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                allow_reboot: config_flags.0,
+                auto_clean: config_flags.1,
+                auto_remove: config_flags.2,
             }),
         );
     }
@@ -217,6 +249,9 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
                     updates,
                     is_upgrading,
                     daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    allow_reboot: config_flags.0,
+                    auto_clean: config_flags.1,
+                    auto_remove: config_flags.2,
                 }),
             )
         }
@@ -227,6 +262,9 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
                 updates: Vec::new(),
                 is_upgrading,
                 daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                allow_reboot: config_flags.0,
+                auto_clean: config_flags.1,
+                auto_remove: config_flags.2,
             }),
         ),
     }
@@ -240,7 +278,10 @@ async fn full_upgrade_handler(
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(UpgradeResponse {
-                message: format!("the system is not a {} system", state.package_manager.name()),
+                message: format!(
+                    "the system is not a {} system",
+                    state.package_manager.name()
+                ),
                 updates: None,
             }),
         );
@@ -302,6 +343,64 @@ async fn full_upgrade_handler(
     )
 }
 
+async fn reboot_handler(
+    State(state): State<AppState>,
+    Json(_payload): Json<RebootRequest>,
+) -> impl IntoResponse {
+    if !state.package_manager.is_available() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(RebootResponse {
+                message: format!(
+                    "the system is not a {} system",
+                    state.package_manager.name()
+                ),
+            }),
+        );
+    }
+
+    if state.is_upgrading.load(Ordering::SeqCst) {
+        return (
+            StatusCode::LOCKED,
+            Json(RebootResponse {
+                message: "a full upgrade is currently running".to_string(),
+            }),
+        );
+    }
+
+    if !state.allow_reboot {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(RebootResponse {
+                message: "reboot is not enabled on this daemon".to_string(),
+            }),
+        );
+    }
+
+    tokio::spawn(async move {
+        info!("scheduling system reboot");
+        // Try systemd first, then fall back to the traditional reboot command.
+        let result = tokio::process::Command::new("sudo")
+            .args(["systemctl", "reboot"])
+            .status()
+            .await
+            .or_else(|_| std::process::Command::new("sudo").args(["reboot"]).status());
+
+        match result {
+            Ok(status) if status.success() => info!("system reboot initiated"),
+            Ok(status) => error!("failed to initiate reboot: exit status {}", status),
+            Err(e) => error!("failed to execute reboot command: {e}"),
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(RebootResponse {
+            message: "reboot triggered".to_string(),
+        }),
+    )
+}
+
 fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<ServiceDaemon> {
     let daemon = match ServiceDaemon::new() {
         Ok(daemon) => {
@@ -327,7 +426,7 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
     let info = if let Some(ip) = ip_addr {
         info!("Using explicit IP: {}", ip);
         match ServiceInfo::new(
-        SERVICE_FULL_TYPE,
+            SERVICE_FULL_TYPE,
             &instance,
             &host_name,
             ip,
@@ -342,7 +441,7 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
         }
     } else {
         match ServiceInfo::new(
-        SERVICE_FULL_TYPE,
+            SERVICE_FULL_TYPE,
             &instance,
             &host_name,
             "",
@@ -402,8 +501,8 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
     use brewmble_rest::StatusResponse;
+    use tower::ServiceExt;
 
     struct MockPackageManager {
         name: String,
@@ -421,13 +520,23 @@ mod tests {
         fn is_available(&self) -> bool {
             self.available
         }
-        async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        async fn get_updates(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(vec!["pkg1".to_string()])
         }
-        async fn dry_run_upgrade(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        async fn dry_run_upgrade(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(vec!["pkg1".to_string()])
         }
         async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn auto_clean(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn auto_remove(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }
@@ -438,6 +547,9 @@ mod tests {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: api_key.clone(),
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
             package_manager: Arc::new(Box::new(MockPackageManager {
                 name: "mock".to_string(),
                 available: true,
@@ -445,24 +557,34 @@ mod tests {
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
-            .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
             .with_state(state);
 
         // No API key
-        let response = app.clone()
-            .oneshot(Request::builder().uri(PATH_STATUS).body(axum::body::Body::empty()).unwrap())
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(PATH_STATUS)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         // Wrong API key
-        let response = app.clone()
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(PATH_STATUS)
                     .header(API_KEY_HEADER, "wrong-key")
                     .body(axum::body::Body::empty())
-                    .unwrap()
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -475,7 +597,7 @@ mod tests {
                     .uri(PATH_STATUS)
                     .header(API_KEY_HEADER, api_key)
                     .body(axum::body::Body::empty())
-                    .unwrap()
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -489,6 +611,9 @@ mod tests {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
             package_manager: Arc::new(Box::new(MockPackageManager {
                 name: "mock".to_string(),
                 available: true,
@@ -499,7 +624,12 @@ mod tests {
             .with_state(state);
 
         let response = app
-            .oneshot(Request::builder().uri(PATH_STATUS).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(PATH_STATUS)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -515,6 +645,9 @@ mod tests {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
             package_manager: Arc::new(Box::new(MockPackageManager {
                 name: "mock".to_string(),
                 available: false,
@@ -525,7 +658,12 @@ mod tests {
             .with_state(state);
 
         let response = app
-            .oneshot(Request::builder().uri(PATH_STATUS).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(PATH_STATUS)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -540,6 +678,9 @@ mod tests {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
             package_manager: Arc::new(Box::new(MockPackageManager {
                 name: "mock".to_string(),
                 available: true,
@@ -550,7 +691,12 @@ mod tests {
             .with_state(state);
 
         let response = app
-            .oneshot(Request::builder().uri(PATH_HEALTH).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(PATH_HEALTH)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -566,6 +712,9 @@ mod tests {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             api_key: "test".to_string(),
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
             package_manager: Arc::new(Box::new(MockPackageManager {
                 name: "mock".to_string(),
                 available: true,
@@ -581,8 +730,10 @@ mod tests {
                     .method("POST")
                     .uri(PATH_UPGRADE)
                     .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap()))
-                    .unwrap()
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap(),
+                    ))
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -597,7 +748,10 @@ mod tests {
             let state = AppState {
                 is_upgrading: Arc::new(AtomicBool::new(false)),
                 api_key: "test".to_string(),
-                package_manager: Arc::new(get_package_manager()),
+                allow_reboot: false,
+                auto_clean: false,
+                auto_remove: false,
+                package_manager: Arc::new(get_package_manager(false, false)),
             };
             let app = Router::new()
                 .route("/status", get(status_handler))
@@ -605,14 +759,17 @@ mod tests {
                 .with_state(state.clone());
 
             // 1. Start upgrade
-            let response = app.clone()
+            let response = app
+                .clone()
                 .oneshot(
                     Request::builder()
                         .method("POST")
                         .uri("/packages/full-upgrade")
                         .header("Content-Type", "application/json")
-                        .body(axum::body::Body::from(serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap()))
-                        .unwrap()
+                        .body(axum::body::Body::from(
+                            serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap(),
+                        ))
+                        .unwrap(),
                 )
                 .await
                 .unwrap();
@@ -620,14 +777,17 @@ mod tests {
             assert!(state.is_upgrading.load(Ordering::SeqCst));
 
             // 2. Try starting upgrade again while one is running
-            let response = app.clone()
+            let response = app
+                .clone()
                 .oneshot(
                     Request::builder()
                         .method("POST")
                         .uri("/packages/full-upgrade")
                         .header("Content-Type", "application/json")
-                        .body(axum::body::Body::from(serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap()))
-                        .unwrap()
+                        .body(axum::body::Body::from(
+                            serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap(),
+                        ))
+                        .unwrap(),
                 )
                 .await
                 .unwrap();
@@ -637,14 +797,157 @@ mod tests {
             assert_eq!(error_json["message"], "a full upgrade is currently running");
 
             // 3. Check /status reflects is_upgrading: true
-            let response = app.clone()
-                .oneshot(Request::builder().uri("/status").body(axum::body::Body::empty()).unwrap())
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/status")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             let body = to_bytes(response.into_body(), 1024).await.unwrap();
             let status: StatusResponse = serde_json::from_slice(&body).unwrap();
             assert!(status.is_upgrading);
         }
+    }
+
+    #[tokio::test]
+    async fn test_reboot_handler_allowed() {
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            api_key: "test".to_string(),
+            allow_reboot: true,
+            auto_clean: false,
+            auto_remove: false,
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
+        };
+        let app = Router::new()
+            .route(PATH_REBOOT, post(reboot_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(PATH_REBOOT)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&RebootRequest::default()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_reboot_handler_disabled() {
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            api_key: "test".to_string(),
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
+        };
+        let app = Router::new()
+            .route(PATH_REBOOT, post(reboot_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(PATH_REBOOT)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&RebootRequest::default()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_reboot_handler_blocked_while_upgrading() {
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(true)),
+            api_key: "test".to_string(),
+            allow_reboot: true,
+            auto_clean: false,
+            auto_remove: false,
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
+        };
+        let app = Router::new()
+            .route(PATH_REBOOT, post(reboot_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(PATH_REBOOT)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&RebootRequest::default()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::LOCKED);
+    }
+
+    #[tokio::test]
+    async fn test_status_handler_exposes_config_flags() {
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            api_key: "test".to_string(),
+            allow_reboot: true,
+            auto_clean: true,
+            auto_remove: false,
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
+        };
+        let app = Router::new()
+            .route(PATH_STATUS, get(status_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(PATH_STATUS)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert!(status.allow_reboot);
+        assert!(status.auto_clean);
+        assert!(!status.auto_remove);
     }
 
     #[tokio::test]
@@ -683,7 +986,9 @@ mod tests {
         let bound_port = listener.local_addr().unwrap().port();
 
         // Set environment variable
-        unsafe { std::env::set_var("BREWMBLE_DAEMON_PORT", bound_port.to_string()); }
+        unsafe {
+            std::env::set_var("BREWMBLE_DAEMON_PORT", bound_port.to_string());
+        }
 
         let port_env = std::env::var("BREWMBLE_DAEMON_PORT").ok();
         assert!(port_env.is_some());
@@ -695,25 +1000,51 @@ mod tests {
 
         assert!(result.is_err());
 
-        unsafe { std::env::remove_var("BREWMBLE_DAEMON_PORT"); }
+        unsafe {
+            std::env::remove_var("BREWMBLE_DAEMON_PORT");
+        }
         drop(listener);
     }
 
     #[test]
     fn test_cli_parsing() {
-        let cli = Cli::parse_from(["brewmbled", "--port", "9090", "--hostname", "test-host", "--ip", "1.2.3.4", "--api-key", "secret-key"]);
+        let cli = Cli::parse_from([
+            "brewmbled",
+            "--port",
+            "9090",
+            "--hostname",
+            "test-host",
+            "--ip",
+            "1.2.3.4",
+            "--api-key",
+            "secret-key",
+            "--allow-reboot",
+            "--auto-clean",
+            "--auto-remove",
+        ]);
         assert_eq!(cli.port, Some(9090));
         assert_eq!(cli.hostname, Some("test-host".to_string()));
         assert_eq!(cli.ip, Some("1.2.3.4".parse().unwrap()));
         assert_eq!(cli.api_key, Some("secret-key".to_string()));
+        assert!(cli.allow_reboot);
+        assert!(cli.auto_clean);
+        assert!(cli.auto_remove);
+    }
+
+    #[test]
+    fn test_cli_default_config_flags() {
+        let cli = Cli::parse_from(["brewmbled"]);
+        assert!(!cli.allow_reboot);
+        assert!(!cli.auto_clean);
+        assert!(!cli.auto_remove);
     }
 
     #[test]
     fn test_cli_env_vars() {
         let cli = Cli::try_parse_from(["brewmbled"]);
         if let Ok(c) = cli {
-             // If env var was already set by environment, we just check it parses
-             assert!(c.port.is_some() || c.port.is_none());
+            // If env var was already set by environment, we just check it parses
+            assert!(c.port.is_some() || c.port.is_none());
         }
 
         // Test with explicit env override in a controlled way if possible,

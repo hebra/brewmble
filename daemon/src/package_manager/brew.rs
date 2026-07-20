@@ -4,18 +4,22 @@ use std::io;
 use std::process::Output;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct Brew {
     pub runner: Box<dyn CommandRunner>,
+    pub auto_clean: bool,
+    pub auto_remove: bool,
     pub last_update: Mutex<Option<Instant>>,
     pub cache_ttl: Duration,
 }
 
-impl Default for Brew {
-    fn default() -> Self {
+impl Brew {
+    pub fn new(auto_clean: bool, auto_remove: bool) -> Self {
         Self {
             runner: Box::new(RealCommandRunner),
+            auto_clean,
+            auto_remove,
             last_update: Mutex::new(None),
             cache_ttl: {
                 let ttl_mins = std::env::var("BREWMBLE_BREW_UPDATE_INTERVAL")
@@ -25,6 +29,12 @@ impl Default for Brew {
                 Duration::from_secs(ttl_mins * 60)
             },
         }
+    }
+}
+
+impl Default for Brew {
+    fn default() -> Self {
+        Self::new(false, false)
     }
 }
 
@@ -80,7 +90,10 @@ impl PackageManager for Brew {
             let output = self.run_brew(&["update"])?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                let err_msg = format!("brew update failed with status: {}. stderr: {}", output.status, stderr);
+                let err_msg = format!(
+                    "brew update failed with status: {}. stderr: {}",
+                    output.status, stderr
+                );
                 error!("{}", err_msg);
                 return Err(err_msg.into());
             }
@@ -117,7 +130,9 @@ impl PackageManager for Brew {
         Ok(updates)
     }
 
-    async fn dry_run_upgrade(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn dry_run_upgrade(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         self.get_updates().await
     }
 
@@ -129,6 +144,7 @@ impl PackageManager for Brew {
             Ok(output) => {
                 if output.status.success() {
                     info!("brew upgrade completed successfully");
+                    self.run_cleanup();
                     Ok(())
                 } else {
                     let err_msg = format!(
@@ -147,14 +163,63 @@ impl PackageManager for Brew {
             }
         }
     }
+
+    fn auto_clean(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!("running brew cleanup");
+        let output = self.run_brew(&["cleanup"])?;
+        if output.status.success() {
+            info!("brew cleanup completed successfully");
+            Ok(())
+        } else {
+            let err_msg = format!(
+                "brew cleanup failed with status: {}. stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            error!("{}", err_msg);
+            Err(err_msg.into())
+        }
+    }
+
+    fn auto_remove(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!("running brew autoremove");
+        let output = self.run_brew(&["autoremove"])?;
+        if output.status.success() {
+            info!("brew autoremove completed successfully");
+            Ok(())
+        } else {
+            let err_msg = format!(
+                "brew autoremove failed with status: {}. stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            error!("{}", err_msg);
+            Err(err_msg.into())
+        }
+    }
+}
+
+impl Brew {
+    fn run_cleanup(&self) {
+        if self.auto_clean {
+            if let Err(e) = self.auto_clean() {
+                warn!("auto-clean failed, continuing: {e}");
+            }
+        }
+        if self.auto_remove {
+            if let Err(e) = self.auto_remove() {
+                warn!("auto-remove failed, continuing: {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitStatus, Output};
-    use std::io;
 
     struct MockRunner {
         success: bool,
@@ -203,6 +268,8 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -218,6 +285,8 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -234,6 +303,8 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -251,6 +322,8 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -267,6 +340,8 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
         };
@@ -298,6 +373,8 @@ mod tests {
         };
         let brew = Brew {
             runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(60), // 1 minute
         };
@@ -327,6 +404,8 @@ mod tests {
         };
         let brew2 = Brew {
             runner: Box::new(runner2),
+            auto_clean: false,
+            auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(0),
         };
@@ -335,5 +414,129 @@ mod tests {
             let c = calls2.lock().unwrap();
             assert!(c.iter().any(|s| s.contains("brew update")));
         }
+    }
+
+    #[tokio::test]
+    async fn test_brew_full_upgrade_runs_cleanup_when_enabled() {
+        use std::sync::Arc;
+
+        struct TrackingRunner {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl CommandRunner for TrackingRunner {
+            fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(format!("{} {}", program, args.join(" ")));
+                Ok(Output {
+                    status: ExitStatus::from_raw(0),
+                    stdout: b"".to_vec(),
+                    stderr: b"".to_vec(),
+                })
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = TrackingRunner {
+            calls: calls.clone(),
+        };
+        let brew = Brew {
+            runner: Box::new(runner),
+            auto_clean: true,
+            auto_remove: true,
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
+        };
+
+        assert!(brew.full_upgrade().await.is_ok());
+
+        let c = calls.lock().unwrap();
+        assert!(c.iter().any(|s| s.contains("brew upgrade")));
+        assert!(c.iter().any(|s| s.contains("brew cleanup")));
+        assert!(c.iter().any(|s| s.contains("brew autoremove")));
+    }
+
+    #[tokio::test]
+    async fn test_brew_full_upgrade_skips_cleanup_when_disabled() {
+        use std::sync::Arc;
+
+        struct TrackingRunner {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl CommandRunner for TrackingRunner {
+            fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(format!("{} {}", program, args.join(" ")));
+                Ok(Output {
+                    status: ExitStatus::from_raw(0),
+                    stdout: b"".to_vec(),
+                    stderr: b"".to_vec(),
+                })
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = TrackingRunner {
+            calls: calls.clone(),
+        };
+        let brew = Brew {
+            runner: Box::new(runner),
+            auto_clean: false,
+            auto_remove: false,
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
+        };
+
+        assert!(brew.full_upgrade().await.is_ok());
+
+        let c = calls.lock().unwrap();
+        assert!(c.iter().any(|s| s.contains("brew upgrade")));
+        assert!(!c.iter().any(|s| s.contains("brew cleanup")));
+        assert!(!c.iter().any(|s| s.contains("brew autoremove")));
+    }
+
+    #[tokio::test]
+    async fn test_brew_full_upgrade_cleanup_failure_does_not_fail_upgrade() {
+        use std::sync::Arc;
+
+        struct FailingCleanupRunner {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl CommandRunner for FailingCleanupRunner {
+            fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(format!("{} {}", program, args.join(" ")));
+                if program == "brew" && args.contains(&"cleanup") {
+                    Ok(Output {
+                        status: ExitStatus::from_raw(1 << 8),
+                        stdout: b"".to_vec(),
+                        stderr: b"cleanup failed".to_vec(),
+                    })
+                } else {
+                    Ok(Output {
+                        status: ExitStatus::from_raw(0),
+                        stdout: b"".to_vec(),
+                        stderr: b"".to_vec(),
+                    })
+                }
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = FailingCleanupRunner {
+            calls: calls.clone(),
+        };
+        let brew = Brew {
+            runner: Box::new(runner),
+            auto_clean: true,
+            auto_remove: false,
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
+        };
+
+        assert!(brew.full_upgrade().await.is_ok());
+
+        let c = calls.lock().unwrap();
+        assert!(c.iter().any(|s| s.contains("brew upgrade")));
+        assert!(c.iter().any(|s| s.contains("brew cleanup")));
     }
 }
