@@ -104,7 +104,7 @@ Also update the CLI:
 - `cd daemon && cargo test`
 - `cd cli && cargo test`
 - `cd rest && cargo test`
-- Manual CLI parse check: `cargo run -- node --reboot localhost:8080` and `cargo run -- packages --full-upgrade localhost:8080` (alias).
+- Manual CLI parse check: `cargo run -- node --reboot localhost:4712` and `cargo run -- packages --full-upgrade localhost:4712` (alias).
 
 ## Risks & Open Questions
 - **Sudoers:** Reboot requires passwordless sudo for the reboot command; document exact paths per distribution.

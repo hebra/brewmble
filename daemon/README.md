@@ -28,7 +28,7 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
 - **Automatic Cleanup**: Optional `apt-get autoclean` / `brew cleanup` and `apt-get autoremove -y` / `brew autoremove` after successful upgrades.
 - **Controlled Reboots**: Optional API-triggered system reboot, gated by a daemon configuration flag.
 - **Authentication**: Secure access via API keys.
-- **Port Hunting**: Automatically finds an available port starting from 8080 if not specified.
+- **Port Hunting**: Automatically finds an available port starting from 4712 if not specified.
 
 ## Installation
 
@@ -201,7 +201,7 @@ Environment variables can be used for configuration:
 All API endpoints require authentication via an `X-API-Key` header.
 
 ```bash
-curl -H "X-API-Key: your-secret-api-key" http://localhost:8080/status
+curl -H "X-API-Key: your-secret-api-key" http://localhost:4712/status
 ```
 
 For more advanced security options like HTTPS or SSH tunneling, see the [main Security section](../README.md#security).

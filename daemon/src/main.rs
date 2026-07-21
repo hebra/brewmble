@@ -26,13 +26,13 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod package_manager;
 use package_manager::{PackageManager, get_package_manager};
 
-const DEFAULT_HTTP_PORT: u16 = 8080;
+const DEFAULT_HTTP_PORT: u16 = 4712;
 
 #[derive(Parser)]
 #[command(name = "brewmbled", version, disable_version_flag = true)]
 #[command(about = "Brewmble daemon", long_about = None)]
 struct Cli {
-    /// Port to listen on. If not specified, the daemon will search for a free port starting from 8080.
+    /// Port to listen on. If not specified, the daemon will search for a free port starting from 4712.
     #[arg(short, long, env = "BREWMBLE_DAEMON_PORT")]
     port: Option<u16>,
 

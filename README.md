@@ -131,8 +131,8 @@ For encrypted traffic over the network, you can use HTTPS:
 ### 3. SSH Tunneling
 
 A simple way to secure communication without additional infrastructure:
-- **Setup**: Create a tunnel: `ssh -L 8080:localhost:8080 user@remote-node`
-- **CLI**: Connect to `localhost:8080`.
+- **Setup**: Create a tunnel: `ssh -L 4712:localhost:4712 user@remote-node`
+- **CLI**: Connect to `localhost:4712`.
 
 ### 4. Private Overlay Networks
 
@@ -148,7 +148,7 @@ Brewmble can be configured using environment variables.
 
 | Variable | Component | Description | Default |
 |:---|:---|:---|:---|
-| `BREWMBLE_DAEMON_PORT` | Daemon | Port for the daemon to listen on. If not specified, the daemon will search for a free port starting from 8080. | `8080` (auto-hunt) |
+| `BREWMBLE_DAEMON_PORT` | Daemon | Port for the daemon to listen on. If not specified, the daemon will search for a free port starting from 4712. | `4712` (auto-hunt) |
 | `BREWMBLE_DAEMON_HOSTNAME` | Daemon | Hostname to use for mDNS registration. | System hostname |
 | `BREWMBLE_DAEMON_IP` | Daemon | Explicit IP address to use for mDNS registration. | Automatically detected |
 | `BREWMBLE_DAEMON_API_KEY` | Daemon | API key for authentication. If not provided, a random UUID v4 will be generated and logged. | Generated |

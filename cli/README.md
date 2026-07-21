@@ -106,10 +106,10 @@ profiles:
   default:
     nodes:
       - name: production-1
-        address: 192.168.1.10:8080
+        address: 192.168.1.10:4712
         api_key: your-secret-api-key
       - name: raspberry-pi
-        address: 192.168.1.50:8080
+        address: 192.168.1.50:4712
         use_keyring: true # API key is stored in system keyring
 ```
 

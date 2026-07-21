@@ -13,8 +13,8 @@ User=brewmble
 # Configuration via environment variables.
 # Uncomment and set these as needed for your environment.
 
-# Port to listen on (default: 8080).
-# Environment=BREWMBLE_DAEMON_PORT=8080
+# Port to listen on (default: 4712).
+# Environment=BREWMBLE_DAEMON_PORT=4712
 
 # Hostname for mDNS registration (default: system hostname).
 # Environment=BREWMBLE_DAEMON_HOSTNAME=my-node
