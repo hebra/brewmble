@@ -52,7 +52,7 @@ This file provides guidance to agents when working with code in this repository.
 - CLI discovers daemons via mDNS, daemon serves status via HTTP API
 - Daemon runs on Linux (Debian-based systems with apt) and macOS (with Homebrew)
 - Environment variables configure daemon networking and identity
-- REST and web components are planned but not yet implemented (empty directories)
+- The web dashboard is planned but not yet implemented (the `web/` directory contains only a README and Makefile)
 - Container builds require both HTTP (4712) and mDNS (5353) ports
 
 ## Project Architecture Rules (Non-Obvious Only)

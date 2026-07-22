@@ -167,7 +167,7 @@ Brewmble can be configured using environment variables.
 See the individual component directories for specific development instructions:
 - [Project Brief](./PROJECT_BRIEF.md)
 - [Architecture](./ARCHITECTURE.md)
-- [Roadmap](./ROADMAP.md)
+- [Roadmap](./plans/roadmap.md)
 - [CLI Development](./cli/README.md)
 - [Daemon Development](./daemon/README.md)
 

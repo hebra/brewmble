@@ -24,10 +24,10 @@ The CLI is the primary interface for users to interact with the managed fleet.
 - **Technology Stack**: Rust, `reqwest` (HTTP Client), `clap` (CLI Parser), `mdns-sd`.
 
 ### 3. Brewmble REST (Crate)
-*Note: Currently integrated within components, but planned to be extracted into a shared crate.*
+Shared Rust library located in `rest/` and used by both the CLI and the daemon.
 - **Responsibilities**:
     - Shared data models for API requests and responses.
-    - Common error types and constants.
+    - Common error types, endpoint paths, and service-discovery constants.
 
 ---
 
@@ -94,5 +94,5 @@ Security is handled via a simple API Key mechanism.
 ## Platform Specifics
 
 - **Linux**: Uses CLI commands like `apt-get`. Requires a Debian-based system.
-- **macOS**: Planned support for Homebrew (`brew`).
+- **macOS**: Uses Homebrew (`brew`) via the implementation in `daemon/src/package_manager/brew.rs`.
 - **Conditional Compilation**: Extensive use of `#[cfg(target_os = "linux")]` and `#[cfg(target_os = "macos")]` to handle package manager differences.
