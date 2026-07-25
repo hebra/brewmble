@@ -65,7 +65,7 @@ mod tests {
             message: "All good".to_string(),
             updates: vec!["pkg1".to_string(), "pkg2".to_string()],
             is_upgrading: false,
-            daemon_version: Some("0.1.0".to_string()),
+            daemon_version: Some("0.2.0".to_string()),
             allow_reboot: true,
             auto_clean: true,
             auto_remove: false,
@@ -74,7 +74,7 @@ mod tests {
         assert!(json.contains("\"message\":\"All good\""));
         assert!(json.contains("\"updates\":[\"pkg1\",\"pkg2\"]"));
         assert!(json.contains("\"is_upgrading\":false"));
-        assert!(json.contains("\"daemon_version\":\"0.1.0\""));
+        assert!(json.contains("\"daemon_version\":\"0.2.0\""));
         assert!(json.contains("\"allow_reboot\":true"));
         assert!(json.contains("\"auto_clean\":true"));
         assert!(json.contains("\"auto_remove\":false"));
