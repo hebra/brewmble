@@ -17,6 +17,7 @@ This file provides guidance to agents when working with code in this repository.
 - Uses mDNS service discovery with "_brewmble._tcp.local." service type for automatic daemon discovery
 - Environment variables control daemon configuration: BREWMBLE_DAEMON_PORT (default 4712), BREWMBLE_DAEMON_HOSTNAME, BREWMBLE_DAEMON_IP, BREWMBLE_DAEMON_API_KEY, BREWMBLE_APT_UPDATE_INTERVAL (default 360), BREWMBLE_BREW_UPDATE_INTERVAL (default 360)
 - BREWMBLE_TIMEOUT env var accepts both seconds (integer) or humantime format (e.g., "1m", "30s")
+- BREWMBLE_NATIVE_PROGRESS env var controls native terminal progress bars (unset or 1 to enable, 0 to disable); enabled by default
 - Daemon caches 'apt-get update' and 'brew update' results based on their respective update intervals (default 360 mins) - see get_updates()
 - CLI uses blocking HTTP client (reqwest with blocking feature) while daemon uses async Axum framework
 - Different Rust editions: CLI uses 2021, daemon uses 2024
@@ -36,6 +37,7 @@ This file provides guidance to agents when working with code in this repository.
 - mDNS instance name format: "brewmbled-{hostname}" where hostname is first part before dot
 - Daemon uses AtomicBool for is_upgrading state to prevent concurrent upgrades
 - Full upgrade spawns tokio task and returns immediately (fire-and-forget pattern)
+- CLI `status` command emits ConEmu OSC 9;4 native progress sequences by default and hides the text progress bar; set BREWMBLE_NATIVE_PROGRESS=0 to disable
 - Aim for at least 90% test coverage for all new code and major refactors
 
 ## Project Debug Rules (Non-Obvious Only)

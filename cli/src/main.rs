@@ -4,7 +4,7 @@ use brewmble_rest::{
 };
 use clap::{Parser, Subcommand};
 use flume::RecvTimeoutError;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use keyring::Entry;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use serde::{Deserialize, Serialize};
@@ -14,9 +14,13 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tabwriter::TabWriter;
+
+mod progress;
+use progress::NativeProgress;
 
 const TOKEN_PLACEHOLDER: &str = "REPLACE_WITH_ACTUAL_TOKEN";
 
@@ -955,6 +959,8 @@ fn run_status(
     config: &Config,
 ) -> Result<(), Box<dyn Error>> {
     let multi = MultiProgress::new();
+    let native = Arc::new(NativeProgress::new());
+    let native_supported = native.is_supported();
     let spinner_style = ProgressStyle::default_spinner()
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈")
         .template("{spinner:.green} {msg}")?;
@@ -995,7 +1001,14 @@ fn run_status(
 
     // 2. Start discovery in background if requested
     if discover_all {
-        let pb = multi.add(ProgressBar::new_spinner());
+        native.set_indeterminate();
+        let pb = if native_supported {
+            let pb = ProgressBar::new_spinner();
+            pb.set_draw_target(ProgressDrawTarget::hidden());
+            pb
+        } else {
+            multi.add(ProgressBar::new_spinner())
+        };
         pb.set_style(spinner_style.clone());
         pb.set_message("Discovering nodes...");
         let tx = target_tx.clone();
@@ -1020,7 +1033,13 @@ fn run_status(
     let node_reports = Arc::new(Mutex::new(Vec::<(String, bool, bool)>::new()));
     let active_profile_arc = Arc::new(active_profile.cloned());
 
-    let pb = multi.add(ProgressBar::new(0));
+    let pb = if native_supported {
+        let pb = ProgressBar::new(0);
+        pb.set_draw_target(ProgressDrawTarget::hidden());
+        pb
+    } else {
+        multi.add(ProgressBar::new(0))
+    };
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
@@ -1030,6 +1049,8 @@ fn run_status(
     );
     pb.set_message("Querying status...");
 
+    let any_failed = Arc::new(AtomicBool::new(false));
+
     rayon::scope(|s| {
         while let Ok((target_addr, target_name)) = target_rx.recv() {
             let client = client.clone();
@@ -1037,18 +1058,27 @@ fn run_status(
             let node_reports = Arc::clone(&node_reports);
             let profile = Arc::clone(&active_profile_arc);
             let pb = pb.clone();
+            let multi = multi.clone();
+            let native = Arc::clone(&native);
+            let any_failed = Arc::clone(&any_failed);
 
             pb.inc_length(1);
+            native.set_progress(pb.position(), pb.length());
 
             s.spawn(move |_| {
                 if !seen_targets.lock().unwrap().insert(target_addr.clone()) {
                     pb.inc_length(0); // Adjust length if skipped
                     pb.inc(1);
+                    native.set_progress(pb.position(), pb.length());
                     return;
                 }
 
                 let (status, message, details, failed, outdated) =
                     query_status(&client, &target_addr, profile.as_ref().as_ref());
+
+                if failed {
+                    any_failed.store(true, Ordering::Relaxed);
+                }
 
                 let mut output = String::new();
                 let name = target_name.as_deref().unwrap_or(&target_addr);
@@ -1063,13 +1093,14 @@ fn run_status(
                     let _ = writeln!(output, "    {}", details.trim().replace('\n', "\n    "));
                 }
                 let _ = writeln!(output);
-                pb.println(output);
+                let _ = multi.println(output);
 
                 node_reports
                     .lock()
                     .unwrap()
                     .push((name.to_string(), failed, outdated));
                 pb.inc(1);
+                native.set_progress(pb.position(), pb.length());
             });
         }
     });
@@ -1108,6 +1139,16 @@ fn run_status(
                 failed_nodes.join(", ")
             );
         }
+    }
+
+    if native_supported {
+        if any_failed.load(Ordering::Relaxed) {
+            native.finish_error();
+        } else {
+            native.finish_success();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        native.clear();
     }
 
     Ok(())
