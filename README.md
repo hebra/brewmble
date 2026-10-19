@@ -14,10 +14,9 @@ where it simplifies the maintenance of multiple devices.
   - [Installation](#installation)
 - [Usage](#usage)
 - [Security](#security)
-  - [1. API Key Authentication (Built-in)](#1-api-key-authentication-built-in)
-  - [2. HTTPS via Reverse Proxy](#2-https-via-reverse-proxy)
-  - [3. SSH Tunneling](#3-ssh-tunneling)
-  - [4. Private Overlay Networks](#4-private-overlay-networks)
+  - [1. Mutual TLS (Built-in)](#1-mutual-tls-built-in)
+  - [2. SSH Tunneling](#2-ssh-tunneling)
+  - [3. Private Overlay Networks](#3-private-overlay-networks)
 - [Configuration](#configuration)
 - [Development](#development)
 - [License](#license)
@@ -37,8 +36,8 @@ Brewmble consists of several key components:
 
 - **[Brewmble Daemon](./daemon)**: A background service (`brewmbled`) that runs on each managed node. It interacts with the local package manager (APT or Homebrew) and exposes a REST API.
 - **[Brewmble CLI](./cli)**: A command-line tool (`brewmble`) for humans to interact with one or more daemons.
-- **Brewmble REST**: The REST API specification used for communication between components.
-- **Brewmble Web**: (In development) A web-based dashboard for cluster overview.
+- **[Brewmble REST](./rest)**: A shared Rust crate defining the API data models, endpoint paths, and service-discovery constants used by both the CLI and the daemon.
+- **[Brewmble Web](./web)**: (Planned, not yet implemented) A web-based dashboard for cluster overview.
 
 ## Getting Started
 
@@ -50,8 +49,11 @@ Brewmble consists of several key components:
 
 ### Installation
 
-#### Using cargo
-
+#### Install Rust and Cargo
+```shell
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.bashrc
+```
 
 #### Create a local daemon user (Linux)
 ```shell
@@ -61,13 +63,7 @@ sudo su brewmble
 
 *Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` commands. See the [Sudo Configuration section in the Daemon README](./daemon/README.md#sudo-configuration) for details.*
 
-#### Install Rust and Cargo
-```shell
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.bashrc
-```
-
-
+#### Using cargo
 
 ```shell
 # CLI tools
@@ -104,12 +100,19 @@ cd daemon && cargo build --release
    # Check status
    ./cli/target/release/brewmble status --all
 
-   # Trigger upgrade
-   ./cli/target/release/brewmble node --full-upgrade <target>
+    # Trigger upgrade
+    ./cli/target/release/brewmble node --full-upgrade <target>
+    # ("packages" is an alias for "node")
 
-   # Reboot a node (only if the daemon has reboot enabled)
-   ./cli/target/release/brewmble node --reboot <target>
-   ```
+    # Preview an upgrade without executing it
+    ./cli/target/release/brewmble node --full-upgrade --dry-run <target>
+
+    # Reboot a node (only if the daemon has reboot enabled)
+    ./cli/target/release/brewmble node --reboot <target>
+
+    # Show CLI and daemon versions
+    ./cli/target/release/brewmble version
+    ```
 
 ## Security
 
@@ -162,9 +165,9 @@ The CLI uses profile-based configuration stored in `~/.brewmble.yaml` or `.brewm
 | Variable | Component | Description | Default |
 |:---|:---|:---|:---|
 | `BREWMBLE_CONFIG` | CLI | Path to the CLI configuration file. | `~/.brewmble.yaml` / `.brewmble.yaml` |
-| `BREWMBLE_TIMEOUT` | CLI | Timeout for discovery and HTTP requests. Supports seconds or [humantime](https://docs.rs/humantime) (e.g., `1m`, `30s`). | `5s` (discovery), `60s` (HTTP) |
-| `BREWMBLE_NATIVE_PROGRESS` | CLI | Native terminal progress bars (1 to enable, 0 to disable). | `1` |
-| `RUST_LOG` | Daemon / CLI | Logging filter (e.g., `info`, `debug`). | `brewmbled=info` |
+| `BREWMBLE_TIMEOUT` | CLI | Timeout for HTTP requests (seconds or [humantime](https://docs.rs/humantime), e.g., `1m`, `30s`) and default `discover` scan duration (seconds). | `5s` (discovery), `60s` (HTTP) |
+| `BREWMBLE_NATIVE_PROGRESS` | CLI | Native terminal progress bars (unset or 1 to enable, 0 to disable). | enabled |
+| `RUST_LOG` | Daemon | Logging filter (e.g., `info`, `debug`). | `brewmbled=info,tower_http=debug,axum::rejection=trace` |
 | `CONTAINER_TOOL` | Makefile | Tool used for container operations. | `podman` |
 
 ## Development

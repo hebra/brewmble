@@ -10,7 +10,8 @@ ExecStart=/opt/brewmble/.cargo/bin/brewmbled --config /etc/brewmble/brewmbled.ya
 Restart=on-failure
 User=brewmble
 
-# Logging filter for the daemon (e.g., info, debug). Default is brewmbled=info.
+# Logging filter for the daemon (e.g., info, debug).
+# Default is brewmbled=info,tower_http=debug,axum::rejection=trace.
 # Environment=RUST_LOG=brewmbled=info
 
 [Install]

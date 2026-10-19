@@ -7,6 +7,7 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
 - [Features](#features)
 - [Installation](#installation)
   - [From Source](#from-source)
+  - [TLS Setup](#tls-setup)
   - [Using Docker/Podman](#using-dockerpodman)
   - [Running as a systemd service (Linux)](#running-as-a-systemd-service-linux)
   - [Running as a Launch Agent (macOS)](#running-as-a-launch-agent-macos)
@@ -14,14 +15,16 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
 - [Configuration](#configuration)
 - [Security and Authentication](#security-and-authentication)
 - [API Endpoints](#api-endpoints)
+  - [`GET /health`](#get-health)
   - [`GET /status`](#get-status)
   - [`POST /packages/full-upgrade`](#post-packagesfull-upgrade)
+  - [`POST /node/reboot`](#post-nodereboot)
 - [Development](#development)
   - [Running Tests](#running-tests)
 
 ## Features
 
-- **mDNS Registration**: Automatically announces itself on the local network as `_brewmble._tcp`.
+- **mDNS Registration**: Automatically announces itself on the local network as `_brewmble._tcp.local.` with the instance name `brewmbled-<hostname>` and TXT properties `id=<hostname>` and `tls=mtls`.
 - **Multi-backend Support**: Automatically detects and uses the available package manager (APT or Homebrew).
 - **System Status**: Reports whether the system is up-to-date and lists available updates.
 - **Package Management**: Can trigger a full system upgrade via the detected package manager.
@@ -81,9 +84,9 @@ For Linux systems, a sample systemd service file is provided in the `docs` folde
    ```
 
 2. **Configure the service**:
-   Open the file in an editor to adjust the `ExecStart` path and the `BREWMBLE_DAEMON_TLS_*` environment variables:
+   Open the file in an editor to adjust the `ExecStart` path. All daemon settings (including TLS certificate paths) come from the YAML configuration file passed via `--config`:
    ```bash
-   sudo nano /etc/systemd/system/brewmble.service
+   sudo nano /etc/systemd/system/brewmbled.service
    ```
 
 3. **Reload systemd**:
@@ -301,6 +304,27 @@ For more details, see the [main Security section](../README.md#security).
 
 ## API Endpoints
 
+All endpoints are served over HTTPS and require a client certificate signed by the cluster CA.
+
+### `GET /health`
+
+Returns liveness information about the daemon and its detected package manager.
+
+```bash
+curl --cert client.pem --key client-key.pem --cacert ca.pem \
+  https://localhost:4712/health
+```
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "package_manager": "apt",
+  "package_manager_version": "2.6.1",
+  "is_upgrading": false
+}
+```
+
 ### `GET /status`
 
 Returns the current system status.
@@ -316,26 +340,56 @@ curl --cert client.pem --key client-key.pem --cacert ca.pem \
   "message": "System has 2 outdated packages",
   "updates": ["libc6", "vim"],
   "is_upgrading": false,
+  "daemon_version": "0.3.0",
   "allow_reboot": false,
   "auto_clean": true,
   "auto_remove": false
 }
 ```
 
+**Status codes:**
+
+- `200 OK`: Status returned.
+- `412 PRECONDITION_FAILED`: The detected package manager is not available on this system (e.g., no `apt` or `brew` found).
+- `500 INTERNAL_SERVER_ERROR`: Checking for updates failed.
+
 ### `POST /packages/full-upgrade`
 
-Triggers a full system upgrade (e.g., `apt full-upgrade -y` or `brew upgrade`). This operation is asynchronous.
+Triggers a full system upgrade (e.g., `apt full-upgrade -y` or `brew upgrade`). This operation is asynchronous; the endpoint returns immediately while the upgrade runs in the background.
 
-**Response:**
+**Request body:**
+```json
+{
+  "dry_run": false
+}
+```
+
+With `dry_run: true`, the daemon simulates the upgrade and returns the list of packages that would be changed instead:
+
+```json
+{
+  "message": "dry-run completed",
+  "updates": ["libc6", "vim"]
+}
+```
+
+**Response (non-dry-run):**
 ```json
 {
   "message": "full upgrade triggered"
 }
 ```
 
+Only one upgrade can run at a time; the `is_upgrading` flag in `GET /status` reports whether an upgrade is in progress.
+
+**Status codes:**
+
+- `200 OK`: Upgrade triggered (or dry-run completed).
+- `412 PRECONDITION_FAILED`: The package manager is not available, or a full upgrade is already running.
+
 ### `POST /node/reboot`
 
-Reboots the host. Only allowed if `features.allow_reboot` is enabled in configuration. Reboots are rejected while a full upgrade is running.
+Reboots the host (via `sudo systemctl reboot`, falling back to `sudo reboot`). Only allowed if `features.allow_reboot` is enabled in the configuration, and rejected while a full upgrade is running. The request body is optional and currently ignored.
 
 **Response when allowed:**
 ```json
@@ -350,6 +404,13 @@ Reboots the host. Only allowed if `features.allow_reboot` is enabled in configur
   "message": "reboot is not enabled on this daemon"
 }
 ```
+
+**Status codes:**
+
+- `200 OK`: Reboot triggered.
+- `403 FORBIDDEN`: Reboot is not enabled (`features.allow_reboot` is `false`).
+- `412 PRECONDITION_FAILED`: The package manager is not available.
+- `423 LOCKED`: A full upgrade is currently running.
 
 ## Development
 

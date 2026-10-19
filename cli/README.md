@@ -8,8 +8,10 @@ The Brewmble CLI (`brewmble`) is a command-line interface for managing Brewmble 
 - [Usage](#usage)
   - [Discovery](#discovery)
   - [Status](#status)
-  - [Package Management](#package-management)
+  - [Node Management](#node-management)
+  - [Certificate Management](#certificate-management)
   - [Profile Management](#profile-management)
+  - [Version Information](#version-information)
 - [Security](#security)
 - [Configuration](#configuration)
   - [Configuration File](#configuration-file)
@@ -36,7 +38,7 @@ Discover all Brewmble daemons on the local network:
 brewmble discover [--timeout <seconds>] [--update-config]
 ```
 
-Use `--update-config` (or `-u`) to save discovered daemons to your configuration file.
+The scan waits up to `--timeout` (or `-t`) seconds for responses (default: `5`). Use `--update-config` (or `-u`) to save discovered daemons to your configuration file.
 
 ### Status
 
@@ -49,20 +51,30 @@ brewmble status
 # Check all discovered daemons
 brewmble status --all
 
-# Check specific daemons
-brewmble status <host:port> [<host:port> ...]
+# Check specific daemons (host:port, or a name from the active profile)
+brewmble status <target> [<target> ...]
 ```
 
-### Package Management
+Targets are resolved against the active profile by name or address, and the output ends with a summary of outdated and unreachable nodes.
 
-Trigger a full system upgrade on target nodes:
+### Node Management
+
+Trigger a full system upgrade or reboot on target nodes. The `node` command is also available under the alias `packages`:
 
 ```bash
-# Upgrade all nodes from the configuration file
-brewmble packages --full-upgrade
+# Upgrade all nodes from the active profile
+brewmble node --full-upgrade
+# or: brewmble packages -u
+
+# Preview what would be upgraded without executing
+brewmble node --full-upgrade --dry-run <target>
 
 # Upgrade specific target nodes
-brewmble packages --full-upgrade <target> [<target> ...]
+brewmble node --full-upgrade <target> [<target> ...]
+
+# Reboot a node (only if the daemon has allow_reboot enabled)
+brewmble node --reboot <target>
+# or: brewmble node -r <target>
 ```
 
 ### Certificate Management
@@ -70,7 +82,7 @@ brewmble packages --full-upgrade <target> [<target> ...]
 Initialize the cluster CA and issue certificates for daemons and this CLI:
 
 ```bash
-# Create the cluster CA in the system keyring
+# Create the cluster CA in the system keyring (use --force to overwrite an existing CA)
 brewmble ca init
 
 # Show the CA certificate and fingerprint
@@ -81,6 +93,8 @@ brewmble cert issue --kind daemon --cn <hostname> --out-dir <dir>
 
 # Issue this CLI's client certificate and store it in the keyring
 brewmble cert issue --kind client
+# Re-issue an existing client certificate
+brewmble cert issue --kind client --force
 ```
 
 ### Profile Management
@@ -96,6 +110,20 @@ brewmble profile create <name>
 
 # Switch to a profile
 brewmble profile use <name>
+
+# Delete a profile (cannot delete the default or active profile)
+brewmble profile delete <name>
+
+# Open the configuration file in $EDITOR
+brewmble profile edit
+```
+
+### Version Information
+
+Show the CLI version together with the daemon versions of the nodes in the active profile:
+
+```bash
+brewmble version
 ```
 
 ## Security
@@ -111,7 +139,8 @@ The CLI can be configured via a YAML configuration file (`.brewmble.yaml`) and e
 The CLI searches for a configuration file in the following order:
 1.  Path specified via the `--config` (or `-c`) flag.
 2.  Path specified via the `BREWMBLE_CONFIG` environment variable.
-3.  The current working directory (`./.brewmble.yaml`).
+3.  The home directory (`~/.brewmble.yaml`).
+4.  The current working directory (`./.brewmble.yaml`).
 
 #### Structure
 
@@ -126,12 +155,14 @@ profiles:
         address: 192.168.1.50:4712
 ```
 
-The `api_key` and `use_keyring` fields from older versions are ignored; authentication is now performed with mTLS client certificates managed via `brewmble cert`.
+A legacy top-level `nodes:` list from older versions is automatically migrated into the `default` profile when the file is loaded. Per-node `api_key` fields from older versions are silently ignored; authentication is now performed with mTLS client certificates managed via `brewmble cert`.
 
 ### Environment Variables
 
-- `BREWMBLE_TIMEOUT`: Default timeout for network operations (e.g., `30s`, `1m`). Default is `60s`.
+- `BREWMBLE_TIMEOUT`: Timeout for HTTP requests (full seconds or [humantime](https://docs.rs/humantime) values such as `1m` or `30s`; default `60s`) and the default discovery scan duration (whole seconds; default `5s`).
 - `BREWMBLE_CONFIG`: Path to the configuration file.
+- `BREWMBLE_NATIVE_PROGRESS`: Emit native terminal progress sequences (`OSC 9;4`) during `status`. Unset or `1` enables them (the default); set to `0` to disable and fall back to in-terminal progress bars.
+- `EDITOR`: Editor used by `brewmble profile edit` (default: `vi`).
 
 ## Development
 
