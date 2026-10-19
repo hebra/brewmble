@@ -608,7 +608,9 @@ mod tests {
 
     #[test]
     fn test_cli_parse_discover_default() {
-        std::env::remove_var("BREWMBLE_TIMEOUT");
+        unsafe {
+            std::env::remove_var("BREWMBLE_TIMEOUT");
+        }
         let cli = Cli::parse_from(&["brewmble", "discover"]);
         if let Some(Commands::Discover {
             timeout,
@@ -834,16 +836,24 @@ mod tests {
 
     #[test]
     fn test_get_default_timeout() {
-        std::env::remove_var("BREWMBLE_TIMEOUT");
+        unsafe {
+            std::env::remove_var("BREWMBLE_TIMEOUT");
+        }
         assert_eq!(get_default_timeout(), Duration::from_secs(60));
 
-        std::env::set_var("BREWMBLE_TIMEOUT", "15");
+        unsafe {
+            std::env::set_var("BREWMBLE_TIMEOUT", "15");
+        }
         assert_eq!(get_default_timeout(), Duration::from_secs(15));
 
-        std::env::set_var("BREWMBLE_TIMEOUT", "1m");
+        unsafe {
+            std::env::set_var("BREWMBLE_TIMEOUT", "1m");
+        }
         assert_eq!(get_default_timeout(), Duration::from_secs(60));
 
-        std::env::remove_var("BREWMBLE_TIMEOUT");
+        unsafe {
+            std::env::remove_var("BREWMBLE_TIMEOUT");
+        }
     }
 
     #[test]

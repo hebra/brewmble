@@ -20,7 +20,7 @@ This file provides guidance to agents when working with code in this repository.
 - BREWMBLE_NATIVE_PROGRESS env var controls native terminal progress bars (unset or 1 to enable, 0 to disable); enabled by default
 - Daemon caches 'apt-get update' and 'brew update' results based on their respective update intervals (default 360 mins configured via package_manager.update_interval_mins) - see get_updates()
 - CLI uses blocking HTTPS client (reqwest with blocking feature and rustls) while daemon uses async Axum framework over HTTPS
-- Different Rust editions: CLI uses 2021, daemon uses 2024
+- Rust edition: uses 2024 across all crates
 - Container builds use podman with ports 4712 (HTTPS) and 5353 (mDNS)
 - Daemon auto-hunts for free port starting from 4712 if server.port is not configured
 - API authentication is performed via mutual TLS (mTLS); the X-API-Key header has been removed

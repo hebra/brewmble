@@ -109,11 +109,13 @@ mod tests {
     fn detect_respects_disable_override() {
         let _guard = ENV_LOCK.lock().unwrap();
         let previous = std::env::var(ENV_OVERRIDE).ok();
-        std::env::set_var(ENV_OVERRIDE, "0");
+        unsafe {
+            std::env::set_var(ENV_OVERRIDE, "0");
+        }
         assert!(!detect_native_progress());
         match previous {
-            Some(v) => std::env::set_var(ENV_OVERRIDE, v),
-            None => std::env::remove_var(ENV_OVERRIDE),
+            Some(v) => unsafe { std::env::set_var(ENV_OVERRIDE, v) },
+            None => unsafe { std::env::remove_var(ENV_OVERRIDE) },
         }
     }
 
@@ -121,11 +123,13 @@ mod tests {
     fn detect_defaults_to_enabled() {
         let _guard = ENV_LOCK.lock().unwrap();
         let previous = std::env::var(ENV_OVERRIDE).ok();
-        std::env::remove_var(ENV_OVERRIDE);
+        unsafe {
+            std::env::remove_var(ENV_OVERRIDE);
+        }
         assert!(detect_native_progress());
         match previous {
-            Some(v) => std::env::set_var(ENV_OVERRIDE, v),
-            None => std::env::remove_var(ENV_OVERRIDE),
+            Some(v) => unsafe { std::env::set_var(ENV_OVERRIDE, v) },
+            None => unsafe { std::env::remove_var(ENV_OVERRIDE) },
         }
     }
 
