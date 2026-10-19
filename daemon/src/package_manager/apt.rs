@@ -17,7 +17,7 @@ pub struct Apt {
 }
 
 impl Apt {
-    pub fn new(auto_clean: bool, auto_remove: bool) -> Self {
+    pub fn new(auto_clean: bool, auto_remove: bool, update_interval_mins: u64) -> Self {
         Self {
             runner: Box::new(RealCommandRunner),
             auto_clean,
@@ -25,20 +25,14 @@ impl Apt {
             #[cfg(any(target_os = "linux", test))]
             last_update: Mutex::new(None),
             #[cfg(any(target_os = "linux", test))]
-            cache_ttl: {
-                let ttl_mins = std::env::var("BREWMBLE_APT_UPDATE_INTERVAL")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(360); // Default to 6 hours
-                Duration::from_secs(ttl_mins * 60)
-            },
+            cache_ttl: Duration::from_secs(update_interval_mins * 60),
         }
     }
 }
 
 impl Default for Apt {
     fn default() -> Self {
-        Self::new(false, false)
+        Self::new(false, false, 360)
     }
 }
 
@@ -495,20 +489,15 @@ mod tests {
 
     #[test]
     fn test_apt_default_config() {
-        // We use a mutex to ensure we don't interfere with other tests that might read env
-        // but since we are just testing the default implementation it should be fine
-        // if we run this test specifically or with --test-threads=1
-        unsafe {
-            std::env::set_var("BREWMBLE_APT_UPDATE_INTERVAL", "123");
-        }
-        let apt = Apt::default();
-        assert_eq!(apt.cache_ttl, Duration::from_secs(123 * 60));
-        unsafe {
-            std::env::remove_var("BREWMBLE_APT_UPDATE_INTERVAL");
-        }
+        let apt = Apt::new(true, true, 120);
+        assert_eq!(apt.cache_ttl, Duration::from_secs(120 * 60));
+        assert!(apt.auto_clean);
+        assert!(apt.auto_remove);
 
         let apt_default = Apt::default();
         assert_eq!(apt_default.cache_ttl, Duration::from_secs(360 * 60));
+        assert!(!apt_default.auto_clean);
+        assert!(!apt_default.auto_remove);
     }
 
     #[tokio::test]

@@ -1,8 +1,10 @@
 .env
 /.idea
 /.kilo
+/.junie
 bin/
 target/
 *.log
 .*.txt
 .brewmble.yaml
+**/*.pem

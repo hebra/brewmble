@@ -31,18 +31,22 @@ impl CommandRunner for RealCommandRunner {
 pub mod apt;
 pub mod brew;
 
-pub fn get_package_manager(auto_clean: bool, auto_remove: bool) -> Box<dyn PackageManager> {
+pub fn get_package_manager(
+    auto_clean: bool,
+    auto_remove: bool,
+    update_interval_mins: u64,
+) -> Box<dyn PackageManager> {
     #[cfg(target_os = "macos")]
     {
-        Box::new(brew::Brew::new(auto_clean, auto_remove))
+        Box::new(brew::Brew::new(auto_clean, auto_remove, update_interval_mins))
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let brew = brew::Brew::new(auto_clean, auto_remove);
+        let brew = brew::Brew::new(auto_clean, auto_remove, update_interval_mins);
         if brew.is_available() {
             return Box::new(brew);
         }
-        Box::new(apt::Apt::new(auto_clean, auto_remove))
+        Box::new(apt::Apt::new(auto_clean, auto_remove, update_interval_mins))
     }
 }

@@ -56,7 +56,7 @@ The daemon requires three PEM files from the cluster CA:
    ```bash
    scp ./daemon-certs/* root@<hostname>:/etc/brewmble/tls/
    ```
-4. Start the daemon with the `--tls-*` flags or set the `BREWMBLE_DAEMON_TLS_*` environment variables.
+4. Initialize and configure the daemon configuration file with `brewmbled config init` and `brewmbled config edit`, specifying the certificate paths under the `tls:` section.
 
 ### Using Docker/Podman
 
@@ -201,20 +201,85 @@ The `brewmbled` daemon runs as the `brewmble` user but needs to perform package 
 
 ## Configuration
 
-Environment variables can be used for configuration:
+`brewmbled` is configured via a YAML configuration file.
 
-- `BREWMBLE_DAEMON_PORT`: Port to listen on.
-- `BREWMBLE_DAEMON_HOSTNAME`: Hostname to use for mDNS registration.
-- `BREWMBLE_DAEMON_IP`: Explicit IP address to use for mDNS registration.
-- `BREWMBLE_DAEMON_TLS_CA_CERT`: Path to the cluster CA certificate PEM file (required).
-- `BREWMBLE_DAEMON_TLS_CERT`: Path to the daemon certificate PEM file (required).
-- `BREWMBLE_DAEMON_TLS_KEY`: Path to the daemon private key PEM file (required).
-- `BREWMBLE_DAEMON_ALLOW_REBOOT`: Allow the daemon to reboot the host when requested via the API. Defaults to `false`.
-- `BREWMBLE_DAEMON_AUTO_CLEAN`: Automatically clean downloaded packages after a successful upgrade (`apt-get autoclean` / `brew cleanup`). Defaults to `false`.
-- `BREWMBLE_DAEMON_AUTO_REMOVE`: Automatically remove unused packages after a successful upgrade (`apt-get autoremove -y` / `brew autoremove`). Defaults to `false`.
-- `BREWMBLE_APT_UPDATE_INTERVAL`: Interval in minutes between `apt-get update` calls (Linux only). Defaults to 360 (6 hours). Set to 0 to force an update on every status check.
-- `BREWMBLE_BREW_UPDATE_INTERVAL`: Interval in minutes between `brew update` calls (macOS only). Defaults to 360 (6 hours). Set to 0 to force an update on every status check.
-- `RUST_LOG`: Logging level (e.g., `info`, `debug`).
+### Configuration Discovery
+
+The daemon searches for configuration files in the following hierarchical order:
+
+1. **Explicit Path**: Specified via `--config <path>` or `-c <path>`.
+2. **User Config**: `~/.config/brewmble/brewmbled.yaml`
+3. **System Config**: `/etc/brewmble/brewmbled.yaml`
+4. **Current Directory**: `./brewmbled.yaml`
+
+If no configuration file is found and no explicit path is passed, daemon startup fails with a diagnostic error directing you to run `brewmbled config init`.
+
+### Configuration Management Commands
+
+`brewmbled config` provides dedicated subcommands for managing daemon configuration:
+
+- **Initialize template configuration**:
+  ```bash
+  brewmbled config init
+  # Overwrite existing file:
+  brewmbled config init --force
+  # Custom path:
+  brewmbled -c /path/to/brewmbled.yaml config init
+  ```
+- **Inspect active configuration**:
+  ```bash
+  brewmbled config show
+  ```
+- **Edit configuration in `$EDITOR`**:
+  ```bash
+  brewmbled config edit
+  ```
+- **Pre-flight validation** (verifies YAML syntax and TLS certificate/key presence):
+  ```bash
+  brewmbled config validate
+  ```
+
+### Configuration Schema
+
+```yaml
+# Server networking and mDNS settings
+server:
+  # Port to listen on. If omitted, the daemon hunts for a free port starting at 4712.
+  port: 4712
+
+  # Hostname for mDNS registration (default: system hostname).
+  hostname: "node-1"
+
+  # Explicit IP address for mDNS registration (default: auto-detected).
+  ip: "192.168.1.10"
+
+# TLS / mutual TLS certificates (required)
+tls:
+  # Path to the cluster CA certificate PEM file
+  ca_cert: "/etc/brewmble/tls/ca.pem"
+
+  # Path to the daemon certificate PEM file
+  cert: "/etc/brewmble/tls/daemon.pem"
+
+  # Path to the daemon private key PEM file
+  key: "/etc/brewmble/tls/daemon-key.pem"
+
+# Daemon behavior flags
+features:
+  # Allow the daemon to reboot the host when requested via the API (default: false)
+  allow_reboot: false
+
+  # Automatically clean downloaded packages after upgrade (default: false)
+  auto_clean: false
+
+  # Automatically remove unused packages after upgrade (default: false)
+  auto_remove: false
+
+# Package manager backend caching
+package_manager:
+  # Cache update interval in minutes (default: 360, set to 0 to update on every status check)
+  update_interval_mins: 360
+```
 
 ## Security and Authentication
 
@@ -226,11 +291,10 @@ Provision the daemon with three PEM files:
 - `daemon.pem` — daemon leaf certificate (CN = hostname, no SANs)
 - `daemon-key.pem` — daemon private key (PKCS#8)
 
+Configure their paths in your `brewmbled.yaml` under the `tls:` section, and verify permissions with:
+
 ```bash
-brewmbled \
-  --tls-ca-cert /etc/brewmble/tls/ca.pem \
-  --tls-cert /etc/brewmble/tls/daemon.pem \
-  --tls-key /etc/brewmble/tls/daemon-key.pem
+brewmbled config validate
 ```
 
 For more details, see the [main Security section](../README.md#security).
@@ -271,7 +335,7 @@ Triggers a full system upgrade (e.g., `apt full-upgrade -y` or `brew upgrade`). 
 
 ### `POST /node/reboot`
 
-Reboots the host. Only allowed if `BREWMBLE_DAEMON_ALLOW_REBOOT` is enabled. Reboots are rejected while a full upgrade is running.
+Reboots the host. Only allowed if `features.allow_reboot` is enabled in configuration. Reboots are rejected while a full upgrade is running.
 
 **Response when allowed:**
 ```json

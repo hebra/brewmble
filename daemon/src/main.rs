@@ -10,11 +10,11 @@ use brewmble_rest::{
     RebootResponse, SERVICE_FULL_TYPE, StatusResponse, TXT_TLS, TXT_TLS_VALUE, UpgradeRequest,
     UpgradeResponse,
 };
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rustls::pki_types::CertificateDer;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -24,54 +24,125 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+pub mod config;
 mod package_manager;
 use package_manager::{PackageManager, get_package_manager};
 
 const DEFAULT_PORT: u16 = 4712;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "brewmbled", version, disable_version_flag = true)]
 #[command(about = "Brewmble daemon", long_about = None)]
 struct Cli {
-    /// Port to listen on. If not specified, the daemon will search for a free port starting from 4712.
-    #[arg(short, long, env = "BREWMBLE_DAEMON_PORT")]
-    port: Option<u16>,
-
-    /// Hostname to use for mDNS registration. Defaults to the system hostname.
-    #[arg(long, env = "BREWMBLE_DAEMON_HOSTNAME")]
-    hostname: Option<String>,
-
-    /// Explicit IP address to use for mDNS registration.
-    #[arg(long, env = "BREWMBLE_DAEMON_IP")]
-    ip: Option<IpAddr>,
-
-    /// Path to the cluster CA certificate PEM file.
-    #[arg(long, env = "BREWMBLE_DAEMON_TLS_CA_CERT")]
-    tls_ca_cert: PathBuf,
-
-    /// Path to the daemon certificate PEM file.
-    #[arg(long, env = "BREWMBLE_DAEMON_TLS_CERT")]
-    tls_cert: PathBuf,
-
-    /// Path to the daemon private key PEM file.
-    #[arg(long, env = "BREWMBLE_DAEMON_TLS_KEY")]
-    tls_key: PathBuf,
-
-    /// Allow the daemon to reboot the host when requested via the API.
-    #[arg(long, env = "BREWMBLE_DAEMON_ALLOW_REBOOT")]
-    allow_reboot: bool,
-
-    /// Automatically clean downloaded packages after a successful upgrade.
-    #[arg(long, env = "BREWMBLE_DAEMON_AUTO_CLEAN")]
-    auto_clean: bool,
-
-    /// Automatically remove unused packages after a successful upgrade.
-    #[arg(long, env = "BREWMBLE_DAEMON_AUTO_REMOVE")]
-    auto_remove: bool,
+    /// Path to configuration file
+    #[arg(short = 'c', long, global = true)]
+    config: Option<PathBuf>,
 
     /// Print version information
     #[arg(short = 'v', long)]
     version: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+enum Commands {
+    /// Manage daemon configuration
+    Config {
+        #[command(subcommand)]
+        subcommand: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+enum ConfigCommands {
+    /// Generate a default configuration file template
+    Init {
+        /// Overwrite existing configuration file if it exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Display the resolved active configuration
+    Show,
+    /// Open the configuration file in $EDITOR
+    Edit,
+    /// Validate configuration syntax and check TLS certificates
+    Validate,
+}
+
+fn run_config_init(path: Option<&Path>, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let target_path = path
+        .map(PathBuf::from)
+        .unwrap_or_else(config::default_config_path);
+    config::init_config_file(&target_path, force)?;
+    println!("Configuration template written to {}", target_path.display());
+    Ok(())
+}
+
+fn run_config_show(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = config::resolve_config_path(path)?;
+    let cfg = config::load_config(&config_path)?;
+    let yaml = serde_yaml::to_string(&cfg)?;
+    print!("{yaml}");
+    Ok(())
+}
+
+fn run_config_edit(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let target_path = match path {
+        Some(p) => p.to_path_buf(),
+        None => match config::resolve_config_path(None) {
+            Ok(p) => p,
+            Err(_) => config::default_config_path(),
+        },
+    };
+
+    if !target_path.exists() {
+        config::init_config_file(&target_path, false)?;
+    }
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = std::process::Command::new(&editor)
+        .arg(&target_path)
+        .status()
+        .map_err(|e| format!("Failed to launch editor '{editor}': {e}"))?;
+
+    if !status.success() {
+        return Err(format!("Editor '{editor}' exited with status: {status}").into());
+    }
+    Ok(())
+}
+
+fn run_config_validate(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = config::resolve_config_path(path)?;
+    let cfg = config::load_config(&config_path)?;
+    let report = config::validate_config(&cfg);
+
+    for warning in &report.warnings {
+        eprintln!("Warning: {warning}");
+    }
+
+    if !report.is_valid() {
+        for err in &report.errors {
+            eprintln!("Error: {err}");
+        }
+        return Err("Configuration validation failed".into());
+    }
+
+    println!("Configuration at '{}' is valid.", config_path.display());
+    Ok(())
+}
+
+fn run_config(
+    subcommand: ConfigCommands,
+    explicit_config: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match subcommand {
+        ConfigCommands::Init { force } => run_config_init(explicit_config, force),
+        ConfigCommands::Show => run_config_show(explicit_config),
+        ConfigCommands::Edit => run_config_edit(explicit_config),
+        ConfigCommands::Validate => run_config_validate(explicit_config),
+    }
 }
 
 #[derive(Clone)]
@@ -100,9 +171,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("brewmbled {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+
+    if let Some(Commands::Config { subcommand }) = cli.command {
+        return run_config(subcommand, cli.config.as_deref());
+    }
     info!("Starting brewmbled version {}", env!("CARGO_PKG_VERSION"));
 
-    let http_port = if let Some(port) = cli.port {
+    let config_path = match config::resolve_config_path(cli.config.as_deref()) {
+        Ok(path) => path,
+        Err(err) => {
+            error!("{err}");
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let daemon_config = match config::load_config(&config_path) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            error!("failed to load configuration from '{}': {err}", config_path.display());
+            eprintln!("error: failed to load configuration from '{}': {err}", config_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(err) = config::ensure_valid_config(&daemon_config) {
+        error!("configuration validation failed: {err}");
+        eprintln!("error: {err}");
+        std::process::exit(1);
+    }
+
+    info!("Loaded configuration from {}", config_path.display());
+
+    let http_port = if let Some(port) = daemon_config.server.port {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let listener = TcpListener::bind(addr).await.map_err(|e| {
             error!("failed to bind to port {port}: {e}");
@@ -131,16 +232,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let hostname = cli
+    let hostname = daemon_config
+        .server
         .hostname
         .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned())
         .trim_end_matches('.')
         .to_string();
 
-    let tls_config = load_tls_config(&cli.tls_ca_cert, &cli.tls_cert, &cli.tls_key)?;
-    let mdns_daemon = register_mdns(http_port, &hostname, cli.ip);
+    let tls_config = load_tls_config(
+        &daemon_config.tls.ca_cert,
+        &daemon_config.tls.cert,
+        &daemon_config.tls.key,
+    )?;
+    let mdns_daemon = register_mdns(http_port, &hostname, daemon_config.server.ip);
 
-    let pm = get_package_manager(cli.auto_clean, cli.auto_remove);
+    let pm = get_package_manager(
+        daemon_config.features.auto_clean,
+        daemon_config.features.auto_remove,
+        daemon_config.package_manager.update_interval_mins,
+    );
     info!("using {} package manager backend", pm.name());
     if !pm.is_available() {
         warn!(
@@ -151,9 +261,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState {
         is_upgrading: Arc::new(AtomicBool::new(false)),
-        allow_reboot: cli.allow_reboot,
-        auto_clean: cli.auto_clean,
-        auto_remove: cli.auto_remove,
+        allow_reboot: daemon_config.features.allow_reboot,
+        auto_clean: daemon_config.features.auto_clean,
+        auto_remove: daemon_config.features.auto_remove,
         package_manager: Arc::new(pm),
     };
 
@@ -467,9 +577,9 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
 }
 
 fn load_tls_config(
-    ca_path: &PathBuf,
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
+    ca_path: &Path,
+    cert_path: &Path,
+    key_path: &Path,
 ) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error>> {
     let ca_pem = std::fs::read_to_string(ca_path)
         .map_err(|e| format!("failed to read CA cert file '{}': {e}", ca_path.display()))?;
@@ -954,98 +1064,97 @@ mod tests {
         drop(listener);
     }
 
-    #[tokio::test]
-    async fn test_port_fail_if_env_set() {
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bound_port = listener.local_addr().unwrap().port();
-
-        // Set environment variable
-        unsafe {
-            std::env::set_var("BREWMBLE_DAEMON_PORT", bound_port.to_string());
-        }
-
-        let port_env = std::env::var("BREWMBLE_DAEMON_PORT").ok();
-        assert!(port_env.is_some());
-
-        let port_str = port_env.unwrap();
-        let port = port_str.parse::<u16>().unwrap();
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let result = TcpListener::bind(addr).await;
-
-        assert!(result.is_err());
-
-        unsafe {
-            std::env::remove_var("BREWMBLE_DAEMON_PORT");
-        }
-        drop(listener);
-    }
-
     #[test]
     fn test_cli_parsing() {
-        let cli = Cli::parse_from([
-            "brewmbled",
-            "--port",
-            "9090",
-            "--hostname",
-            "test-host",
-            "--ip",
-            "1.2.3.4",
-            "--tls-ca-cert",
-            "/etc/brewmble/tls/ca.pem",
-            "--tls-cert",
-            "/etc/brewmble/tls/daemon.pem",
-            "--tls-key",
-            "/etc/brewmble/tls/daemon-key.pem",
-            "--allow-reboot",
-            "--auto-clean",
-            "--auto-remove",
-        ]);
-        assert_eq!(cli.port, Some(9090));
-        assert_eq!(cli.hostname, Some("test-host".to_string()));
-        assert_eq!(cli.ip, Some("1.2.3.4".parse().unwrap()));
-        assert_eq!(cli.tls_ca_cert, PathBuf::from("/etc/brewmble/tls/ca.pem"));
-        assert_eq!(cli.tls_cert, PathBuf::from("/etc/brewmble/tls/daemon.pem"));
+        let cli = Cli::parse_from(["brewmbled", "-c", "/etc/brewmble/brewmbled.yaml"]);
         assert_eq!(
-            cli.tls_key,
-            PathBuf::from("/etc/brewmble/tls/daemon-key.pem")
+            cli.config,
+            Some(PathBuf::from("/etc/brewmble/brewmbled.yaml"))
         );
-        assert!(cli.allow_reboot);
-        assert!(cli.auto_clean);
-        assert!(cli.auto_remove);
+        assert!(!cli.version);
+        assert!(cli.command.is_none());
+
+        let cli = Cli::parse_from(["brewmbled", "-v"]);
+        assert!(cli.version);
+
+        let cli = Cli::parse_from(["brewmbled"]);
+        assert_eq!(cli.config, None);
+        assert!(!cli.version);
+        assert!(cli.command.is_none());
     }
 
     #[test]
-    fn test_cli_default_config_flags() {
-        let cli = Cli::parse_from([
-            "brewmbled",
-            "--tls-ca-cert",
-            "/etc/brewmble/tls/ca.pem",
-            "--tls-cert",
-            "/etc/brewmble/tls/daemon.pem",
-            "--tls-key",
-            "/etc/brewmble/tls/daemon-key.pem",
-        ]);
-        assert!(!cli.allow_reboot);
-        assert!(!cli.auto_clean);
-        assert!(!cli.auto_remove);
-    }
+    fn test_daemon_startup_from_config_file() {
+        let dir = std::env::temp_dir().join(format!("brewmble-startup-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
 
-    #[test]
-    fn test_cli_env_vars() {
-        let cli = Cli::try_parse_from([
-            "brewmbled",
-            "--tls-ca-cert",
-            "/etc/brewmble/tls/ca.pem",
-            "--tls-cert",
-            "/etc/brewmble/tls/daemon.pem",
-            "--tls-key",
-            "/etc/brewmble/tls/daemon-key.pem",
-        ]);
-        assert!(cli.is_ok());
-        let c = cli.unwrap();
-        assert!(c.port.is_some() || c.port.is_none());
+        let (ca_cert, ca_key) = generate_test_ca("test-ca");
+        let (daemon_cert, daemon_key) = generate_test_leaf(
+            "test-daemon",
+            &ca_cert,
+            &ca_key,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        );
+
+        let ca_path = dir.join("ca.pem");
+        let cert_path = dir.join("daemon.pem");
+        let key_path = dir.join("daemon-key.pem");
+        std::fs::write(&ca_path, &ca_cert).unwrap();
+        std::fs::write(&cert_path, &daemon_cert).unwrap();
+        std::fs::write(&key_path, &daemon_key).unwrap();
+
+        let config_file = dir.join("brewmbled.yaml");
+        let cfg = config::DaemonConfig {
+            server: config::ServerConfig {
+                port: Some(9090),
+                hostname: Some("node-startup".to_string()),
+                ip: None,
+            },
+            tls: config::TlsConfig {
+                ca_cert: ca_path,
+                cert: cert_path,
+                key: key_path,
+            },
+            features: config::FeaturesConfig {
+                allow_reboot: true,
+                auto_clean: true,
+                auto_remove: true,
+            },
+            package_manager: config::PackageManagerConfig {
+                update_interval_mins: 180,
+            },
+        };
+        config::save_config(&config_file, &cfg).unwrap();
+
+        // Test loading and state init
+        let loaded = config::load_config(&config_file).unwrap();
+        assert!(config::ensure_valid_config(&loaded).is_ok());
+
+        let tls_config = load_tls_config(
+            &loaded.tls.ca_cert,
+            &loaded.tls.cert,
+            &loaded.tls.key,
+        );
+        assert!(tls_config.is_ok());
+
+        let pm = get_package_manager(
+            loaded.features.auto_clean,
+            loaded.features.auto_remove,
+            loaded.package_manager.update_interval_mins,
+        );
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            allow_reboot: loaded.features.allow_reboot,
+            auto_clean: loaded.features.auto_clean,
+            auto_remove: loaded.features.auto_remove,
+            package_manager: Arc::new(pm),
+        };
+
+        assert!(state.allow_reboot);
+        assert!(state.auto_clean);
+        assert!(state.auto_remove);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1250,6 +1359,117 @@ mod tests {
         assert!(result.is_err());
 
         handle.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cli_config_commands_parsing() {
+        let cli = Cli::try_parse_from(["brewmbled", "config", "init"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Config {
+                subcommand: ConfigCommands::Init { force: false }
+            })
+        );
+
+        let cli = Cli::try_parse_from(["brewmbled", "config", "init", "--force"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Config {
+                subcommand: ConfigCommands::Init { force: true }
+            })
+        );
+
+        let cli = Cli::try_parse_from(["brewmbled", "-c", "/custom/config.yaml", "config", "show"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/custom/config.yaml")));
+        assert_eq!(
+            cli.command,
+            Some(Commands::Config {
+                subcommand: ConfigCommands::Show
+            })
+        );
+
+        let cli = Cli::try_parse_from(["brewmbled", "config", "edit"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Config {
+                subcommand: ConfigCommands::Edit
+            })
+        );
+
+        let cli = Cli::try_parse_from(["brewmbled", "config", "validate"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Config {
+                subcommand: ConfigCommands::Validate
+            })
+        );
+    }
+
+    #[test]
+    fn test_run_config_init_and_show_and_validate() {
+        let dir = std::env::temp_dir().join(format!("brewmble-cfg-cmd-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let config_file = dir.join("brewmbled.yaml");
+
+        // 1. Init
+        let res = run_config_init(Some(&config_file), false);
+        assert!(res.is_ok());
+        assert!(config_file.exists());
+
+        // Init again without force fails
+        let res = run_config_init(Some(&config_file), false);
+        assert!(res.is_err());
+
+        // Init again with force succeeds
+        let res = run_config_init(Some(&config_file), true);
+        assert!(res.is_ok());
+
+        // 2. Show
+        let res = run_config_show(Some(&config_file));
+        assert!(res.is_ok());
+
+        // 3. Validate template (fails because TLS files don't exist yet)
+        let res = run_config_validate(Some(&config_file));
+        assert!(res.is_err());
+
+        // Create valid certificates
+        let (ca_cert, ca_key) = generate_test_ca("test-ca");
+        let (daemon_cert, daemon_key) = generate_test_leaf(
+            "test-daemon",
+            &ca_cert,
+            &ca_key,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        );
+
+        let ca_path = dir.join("ca.pem");
+        let cert_path = dir.join("daemon.pem");
+        let key_path = dir.join("daemon-key.pem");
+        std::fs::write(&ca_path, &ca_cert).unwrap();
+        std::fs::write(&cert_path, &daemon_cert).unwrap();
+        std::fs::write(&key_path, &daemon_key).unwrap();
+
+        let valid_config = config::DaemonConfig {
+            server: config::ServerConfig {
+                port: Some(4712),
+                hostname: Some("node-1".to_string()),
+                ip: None,
+            },
+            tls: config::TlsConfig {
+                ca_cert: ca_path,
+                cert: cert_path,
+                key: key_path,
+            },
+            features: config::FeaturesConfig::default(),
+            package_manager: config::PackageManagerConfig::default(),
+        };
+
+        config::save_config(&config_file, &valid_config).unwrap();
+
+        // 4. Validate now succeeds
+        let res = run_config_validate(Some(&config_file));
+        assert!(res.is_ok());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

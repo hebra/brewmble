@@ -15,26 +15,20 @@ pub struct Brew {
 }
 
 impl Brew {
-    pub fn new(auto_clean: bool, auto_remove: bool) -> Self {
+    pub fn new(auto_clean: bool, auto_remove: bool, update_interval_mins: u64) -> Self {
         Self {
             runner: Box::new(RealCommandRunner),
             auto_clean,
             auto_remove,
             last_update: Mutex::new(None),
-            cache_ttl: {
-                let ttl_mins = std::env::var("BREWMBLE_BREW_UPDATE_INTERVAL")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(360); // Default to 6 hours
-                Duration::from_secs(ttl_mins * 60)
-            },
+            cache_ttl: Duration::from_secs(update_interval_mins * 60),
         }
     }
 }
 
 impl Default for Brew {
     fn default() -> Self {
-        Self::new(false, false)
+        Self::new(false, false, 360)
     }
 }
 

@@ -136,26 +136,35 @@ For clusters, using a private network layer is recommended:
 
 ## Configuration
 
-Brewmble can be configured using environment variables.
+Brewmble components are configured via declarative YAML files and CLI subcommands:
+
+### Daemon Configuration (`brewmbled.yaml`)
+
+The daemon loads configuration from `~/.config/brewmble/brewmbled.yaml`, `/etc/brewmble/brewmbled.yaml`, or `./brewmbled.yaml` (or via `--config <path>` / `-c <path>`).
+
+Manage daemon configuration with:
+
+```bash
+brewmbled config init       # Generate initial template
+brewmbled config show       # Display active configuration
+brewmbled config edit       # Open configuration in $EDITOR
+brewmbled config validate   # Pre-flight check certificates and settings
+```
+
+See the [Daemon README](./daemon/README.md#configuration) for the complete YAML schema.
+
+### CLI Configuration (`.brewmble.yaml`)
+
+The CLI uses profile-based configuration stored in `~/.brewmble.yaml` or `.brewmble.yaml`. Manage profiles with `brewmble profile (list|use|create|delete|edit)`.
 
 ### Environment Variables
 
 | Variable | Component | Description | Default |
 |:---|:---|:---|:---|
-| `BREWMBLE_DAEMON_PORT` | Daemon | Port for the daemon to listen on. If not specified, the daemon will search for a free port starting from 4712. | `4712` (auto-hunt) |
-| `BREWMBLE_DAEMON_HOSTNAME` | Daemon | Hostname to use for mDNS registration. | System hostname |
-| `BREWMBLE_DAEMON_IP` | Daemon | Explicit IP address to use for mDNS registration. | Automatically detected |
-| `BREWMBLE_DAEMON_TLS_CA_CERT` | Daemon | Path to the cluster CA certificate PEM file. | Required |
-| `BREWMBLE_DAEMON_TLS_CERT` | Daemon | Path to the daemon certificate PEM file. | Required |
-| `BREWMBLE_DAEMON_TLS_KEY` | Daemon | Path to the daemon private key PEM file. | Required |
-| `BREWMBLE_DAEMON_ALLOW_REBOOT` | Daemon | Allow the daemon to reboot the host when requested via the API. | `false` |
-| `BREWMBLE_DAEMON_AUTO_CLEAN` | Daemon | Automatically clean downloaded packages after a successful upgrade (`apt-get autoclean` / `brew cleanup`). | `false` |
-| `BREWMBLE_DAEMON_AUTO_REMOVE` | Daemon | Automatically remove unused packages after a successful upgrade (`apt-get autoremove -y` / `brew autoremove`). | `false` |
-| `BREWMBLE_APT_UPDATE_INTERVAL` | Daemon | Interval in minutes between `apt-get update` calls. Set to `0` to always update. | `360` (6 hours) |
-| `BREWMBLE_BREW_UPDATE_INTERVAL` | Daemon | Interval in minutes between `brew update` calls. Set to `0` to always update. | `360` (6 hours) |
+| `BREWMBLE_CONFIG` | CLI | Path to the CLI configuration file. | `~/.brewmble.yaml` / `.brewmble.yaml` |
 | `BREWMBLE_TIMEOUT` | CLI | Timeout for discovery and HTTP requests. Supports seconds or [humantime](https://docs.rs/humantime) (e.g., `1m`, `30s`). | `5s` (discovery), `60s` (HTTP) |
-| `BREWMBLE_CONFIG` | CLI | Path to the CLI configuration file. | `.brewmble.yaml` |
-| `RUST_LOG` | Daemon | Logging filter for the daemon (e.g., `info`, `debug`). | `brewmbled=info` |
+| `BREWMBLE_NATIVE_PROGRESS` | CLI | Native terminal progress bars (1 to enable, 0 to disable). | `1` |
+| `RUST_LOG` | Daemon / CLI | Logging filter (e.g., `info`, `debug`). | `brewmbled=info` |
 | `CONTAINER_TOOL` | Makefile | Tool used for container operations. | `podman` |
 
 ## Development
