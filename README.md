@@ -101,14 +101,14 @@ cd daemon && cargo build --release
    ./cli/target/release/brewmble status --all
 
     # Trigger upgrade
-    ./cli/target/release/brewmble node --full-upgrade <target>
+    ./cli/target/release/brewmble node --full-upgrade <node>
     # ("packages" is an alias for "node")
 
     # Preview an upgrade without executing it
-    ./cli/target/release/brewmble node --full-upgrade --dry-run <target>
+    ./cli/target/release/brewmble node --full-upgrade --dry-run <node>
 
     # Reboot a node (only if the daemon has reboot enabled)
-    ./cli/target/release/brewmble node --reboot <target>
+    ./cli/target/release/brewmble node --reboot <node>
 
     # Show CLI and daemon versions
     ./cli/target/release/brewmble version

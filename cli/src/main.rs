@@ -234,9 +234,9 @@ enum Commands {
         #[arg(long, conflicts_with = "reboot", requires = "full_upgrade")]
         dry_run: bool,
 
-        /// Targets (host:port)
+        /// Node name(s) configured in the active profile
         #[arg(num_args = 0..)]
-        targets: Vec<String>,
+        nodes: Vec<String>,
     },
     /// Manage configuration profiles
     Profile {
@@ -338,12 +338,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             full_upgrade,
             reboot,
             dry_run,
-            targets,
+            nodes,
         }) => {
-            if targets.is_empty() && !config_exists {
+            if nodes.is_empty() && !config_exists {
                 println!("No config file was found or set.");
             }
-            run_node(full_upgrade, reboot, dry_run, targets, &config)
+            run_node(full_upgrade, reboot, dry_run, nodes, &config)
         }
         Some(Commands::Profile { subcommand }) => {
             run_profile(subcommand, &mut config, &config_path)
@@ -646,7 +646,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run: _,
-            targets: _,
+            nodes: _,
         }) = cli.command
         {
             assert!(full_upgrade);
@@ -663,13 +663,13 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
-            targets,
+            nodes,
         }) = cli.command
         {
             assert!(full_upgrade);
             assert!(!reboot);
             assert!(dry_run);
-            assert!(targets.is_empty());
+            assert!(nodes.is_empty());
         } else {
             panic!("Expected Node command");
         }
@@ -677,18 +677,18 @@ mod tests {
 
     #[test]
     fn test_cli_parse_node_no_dry_run() {
-        let cli = Cli::parse_from(&["brewmble", "node", "--full-upgrade", "host:8080"]);
+        let cli = Cli::parse_from(&["brewmble", "node", "--full-upgrade", "node1"]);
         if let Some(Commands::Node {
             full_upgrade,
             reboot,
             dry_run,
-            targets,
+            nodes,
         }) = cli.command
         {
             assert!(full_upgrade);
             assert!(!reboot);
             assert!(!dry_run);
-            assert_eq!(targets, vec!["host:8080"]);
+            assert_eq!(nodes, vec!["node1"]);
         } else {
             panic!("Expected Node command");
         }
@@ -696,18 +696,18 @@ mod tests {
 
     #[test]
     fn test_cli_parse_node_reboot() {
-        let cli = Cli::parse_from(&["brewmble", "node", "-r", "host:8080"]);
+        let cli = Cli::parse_from(&["brewmble", "node", "-r", "node1"]);
         if let Some(Commands::Node {
             full_upgrade,
             reboot,
             dry_run,
-            targets,
+            nodes,
         }) = cli.command
         {
             assert!(!full_upgrade);
             assert!(reboot);
             assert!(!dry_run);
-            assert_eq!(targets, vec!["host:8080"]);
+            assert_eq!(nodes, vec!["node1"]);
         } else {
             panic!("Expected Node command");
         }
@@ -715,18 +715,18 @@ mod tests {
 
     #[test]
     fn test_cli_parse_packages_alias() {
-        let cli = Cli::parse_from(&["brewmble", "packages", "--full-upgrade", "host:8080"]);
+        let cli = Cli::parse_from(&["brewmble", "packages", "--full-upgrade", "node1"]);
         if let Some(Commands::Node {
             full_upgrade,
             reboot,
             dry_run,
-            targets,
+            nodes,
         }) = cli.command
         {
             assert!(full_upgrade);
             assert!(!reboot);
             assert!(!dry_run);
-            assert_eq!(targets, vec!["host:8080"]);
+            assert_eq!(nodes, vec!["node1"]);
         } else {
             panic!("Expected Node command via packages alias");
         }
@@ -740,9 +740,81 @@ mod tests {
 
     #[test]
     fn test_cli_parse_node_requires_action() {
-        let result = Cli::try_parse_from(&["brewmble", "node", "host:8080"]);
+        let result = Cli::try_parse_from(&["brewmble", "node", "node1"]);
         // Clap does not know the mutual requirement, so parsing succeeds and run_node errors.
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_profile_nodes_all() {
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![
+            NodeConfig {
+                name: Some("node-1".to_string()),
+                address: "192.168.1.10:4712".to_string(),
+            },
+            NodeConfig {
+                name: Some("node-2".to_string()),
+                address: "192.168.1.11:4712".to_string(),
+            },
+        ];
+
+        let resolved = resolve_profile_nodes(&[], &config).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name.as_deref(), Some("node-1"));
+        assert_eq!(resolved[1].name.as_deref(), Some("node-2"));
+    }
+
+    #[test]
+    fn test_resolve_profile_nodes_specific() {
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![
+            NodeConfig {
+                name: Some("node-1".to_string()),
+                address: "192.168.1.10:4712".to_string(),
+            },
+            NodeConfig {
+                name: Some("node-2".to_string()),
+                address: "192.168.1.11:4712".to_string(),
+            },
+        ];
+
+        let resolved = resolve_profile_nodes(&["node-2".to_string()], &config).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name.as_deref(), Some("node-2"));
+        assert_eq!(resolved[0].address, "192.168.1.11:4712");
+    }
+
+    #[test]
+    fn test_resolve_profile_nodes_not_found() {
+        let config = Config::default();
+        let err = resolve_profile_nodes(&["unknown-node".to_string()], &config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Node 'unknown-node' not found in profile 'default'"
+        );
+    }
+
+    #[test]
+    fn test_resolve_profile_nodes_fallback_address() {
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
+            name: None,
+            address: "192.168.1.50:4712".to_string(),
+        }];
+
+        let resolved =
+            resolve_profile_nodes(&["192.168.1.50:4712".to_string()], &config).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].address, "192.168.1.50:4712");
+    }
+
+    #[test]
+    fn test_resolve_profile_nodes_missing_profile() {
+        let mut config = Config::default();
+        config.active_profile = "nonexistent".to_string();
+        let err = resolve_profile_nodes(&[], &config).unwrap_err();
+        assert_eq!(err.to_string(), "Profile 'nonexistent' not found");
     }
 
     #[test]
@@ -1429,11 +1501,42 @@ fn resolve_url(target: &str) -> String {
     }
 }
 
+fn resolve_profile_nodes<'a>(
+    nodes: &[String],
+    config: &'a Config,
+) -> Result<Vec<&'a NodeConfig>, Box<dyn Error>> {
+    let profile = config
+        .profiles
+        .get(&config.active_profile)
+        .ok_or_else(|| format!("Profile '{}' not found", config.active_profile))?;
+
+    if nodes.is_empty() {
+        Ok(profile.nodes.iter().collect())
+    } else {
+        let mut matched = Vec::new();
+        for node_name in nodes {
+            if let Some(node) = profile.nodes.iter().find(|n| {
+                n.name.as_deref() == Some(node_name.as_str())
+                    || (n.name.is_none() && &n.address == node_name)
+            }) {
+                matched.push(node);
+            } else {
+                return Err(format!(
+                    "Node '{}' not found in profile '{}'",
+                    node_name, config.active_profile
+                )
+                .into());
+            }
+        }
+        Ok(matched)
+    }
+}
+
 fn run_node(
     full_upgrade: bool,
     reboot: bool,
     dry_run: bool,
-    mut targets: Vec<String>,
+    nodes: Vec<String>,
     config: &Config,
 ) -> Result<(), Box<dyn Error>> {
     if !full_upgrade && !reboot {
@@ -1444,28 +1547,21 @@ fn run_node(
         return Err("--dry-run can only be used with --full-upgrade".into());
     }
 
-    let active_profile = config.profiles.get(&config.active_profile);
+    let target_nodes = resolve_profile_nodes(&nodes, config)?;
 
-    if targets.is_empty() {
-        if let Some(profile) = active_profile {
-            for node in &profile.nodes {
-                targets.push(node.address.clone());
-            }
-        }
-    }
-
-    if targets.is_empty() {
-        println!("No targets found.");
+    if target_nodes.is_empty() {
+        println!("No nodes found.");
         return Ok(());
     }
 
     let client = ca::build_client()?;
 
     let mut tw = TabWriter::new(io::stdout());
-    writeln!(tw, "TARGET\tSTATUS")?;
+    writeln!(tw, "NODE\tSTATUS")?;
 
-    for target in targets {
-        let url = resolve_url(&target);
+    for node in target_nodes {
+        let name = node.name.as_deref().unwrap_or(&node.address);
+        let url = resolve_url(&node.address);
 
         let (status, body, updates) = if reboot {
             let reboot_url = format!("{}{}", url, PATH_REBOOT);
@@ -1502,7 +1598,7 @@ fn run_node(
             }
         };
 
-        writeln!(tw, "{}\t{}", target, status)?;
+        writeln!(tw, "{}\t{}", name, status)?;
         if !body.is_empty() {
             writeln!(tw, "\t{}", body.replace('\n', "\n\t"))?;
         }

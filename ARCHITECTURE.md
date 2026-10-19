@@ -75,7 +75,7 @@ Security is handled exclusively via mutual TLS (mTLS); there are no API keys.
 6. CLI aggregates and displays the results in a formatted table.
 
 ### Upgrade Flow
-1. User executes `brewmble node --full-upgrade <target>`.
+1. User executes `brewmble node --full-upgrade <node>`.
 2. CLI sends a `POST /packages/full-upgrade` request to the target daemon with a JSON body: `{"dry_run": false}`.
 3. The TLS handshake authenticates the CLI's client certificate against the cluster CA (no request-level authentication takes place).
 4. If `dry_run` is `true`, the daemon simulates the upgrade and returns the list of packages that would be changed.
