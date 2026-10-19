@@ -27,7 +27,7 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
 - **Package Management**: Can trigger a full system upgrade via the detected package manager.
 - **Automatic Cleanup**: Optional `apt-get autoclean` / `brew cleanup` and `apt-get autoremove -y` / `brew autoremove` after successful upgrades.
 - **Controlled Reboots**: Optional API-triggered system reboot, gated by a daemon configuration flag.
-- **Authentication**: Secure access via API keys.
+- **Authentication**: Secure access via mutual TLS (mTLS). The daemon requires a valid client certificate signed by the cluster CA.
 - **Port Hunting**: Automatically finds an available port starting from 4712 if not specified.
 
 ## Installation
@@ -39,6 +39,24 @@ cargo build --release
 ```
 
 The binary will be located at `target/release/brewmbled`.
+
+### TLS Setup
+
+The daemon requires three PEM files from the cluster CA:
+
+1. On a machine with the `brewmble` CLI installed, initialize the cluster CA:
+   ```bash
+   brewmble ca init
+   ```
+2. Issue a daemon certificate for the target host:
+   ```bash
+   brewmble cert issue --kind daemon --cn <hostname> --out-dir ./daemon-certs
+   ```
+3. Copy the three PEM files to the daemon host:
+   ```bash
+   scp ./daemon-certs/* root@<hostname>:/etc/brewmble/tls/
+   ```
+4. Start the daemon with the `--tls-*` flags or set the `BREWMBLE_DAEMON_TLS_*` environment variables.
 
 ### Using Docker/Podman
 
@@ -63,9 +81,9 @@ For Linux systems, a sample systemd service file is provided in the `docs` folde
    ```
 
 2. **Configure the service**:
-   Open the file in an editor to adjust the `ExecStart` path and any environment variables (like `BREWMBLE_DAEMON_API_KEY`):
+   Open the file in an editor to adjust the `ExecStart` path and the `BREWMBLE_DAEMON_TLS_*` environment variables:
    ```bash
-   sudo nano /etc/systemd/system/brewmbled.service
+   sudo nano /etc/systemd/system/brewmble.service
    ```
 
 3. **Reload systemd**:
@@ -188,7 +206,9 @@ Environment variables can be used for configuration:
 - `BREWMBLE_DAEMON_PORT`: Port to listen on.
 - `BREWMBLE_DAEMON_HOSTNAME`: Hostname to use for mDNS registration.
 - `BREWMBLE_DAEMON_IP`: Explicit IP address to use for mDNS registration.
-- `BREWMBLE_DAEMON_API_KEY`: API key for authentication. If not provided, one will be generated on startup and printed to the logs.
+- `BREWMBLE_DAEMON_TLS_CA_CERT`: Path to the cluster CA certificate PEM file (required).
+- `BREWMBLE_DAEMON_TLS_CERT`: Path to the daemon certificate PEM file (required).
+- `BREWMBLE_DAEMON_TLS_KEY`: Path to the daemon private key PEM file (required).
 - `BREWMBLE_DAEMON_ALLOW_REBOOT`: Allow the daemon to reboot the host when requested via the API. Defaults to `false`.
 - `BREWMBLE_DAEMON_AUTO_CLEAN`: Automatically clean downloaded packages after a successful upgrade (`apt-get autoclean` / `brew cleanup`). Defaults to `false`.
 - `BREWMBLE_DAEMON_AUTO_REMOVE`: Automatically remove unused packages after a successful upgrade (`apt-get autoremove -y` / `brew autoremove`). Defaults to `false`.
@@ -198,19 +218,33 @@ Environment variables can be used for configuration:
 
 ## Security and Authentication
 
-All API endpoints require authentication via an `X-API-Key` header.
+All API endpoints require a valid client certificate signed by the cluster CA. The daemon does not use API keys; TLS client-certificate verification is the sole authentication mechanism.
+
+Provision the daemon with three PEM files:
+
+- `ca.pem` — cluster CA certificate
+- `daemon.pem` — daemon leaf certificate (CN = hostname, no SANs)
+- `daemon-key.pem` — daemon private key (PKCS#8)
 
 ```bash
-curl -H "X-API-Key: your-secret-api-key" http://localhost:4712/status
+brewmbled \
+  --tls-ca-cert /etc/brewmble/tls/ca.pem \
+  --tls-cert /etc/brewmble/tls/daemon.pem \
+  --tls-key /etc/brewmble/tls/daemon-key.pem
 ```
 
-For more advanced security options like HTTPS or SSH tunneling, see the [main Security section](../README.md#security).
+For more details, see the [main Security section](../README.md#security).
 
 ## API Endpoints
 
 ### `GET /status`
 
 Returns the current system status.
+
+```bash
+curl --cert client.pem --key client-key.pem --cacert ca.pem \
+  https://localhost:4712/status
+```
 
 **Response:**
 ```json

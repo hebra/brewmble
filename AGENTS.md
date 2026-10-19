@@ -15,16 +15,17 @@ This file provides guidance to agents when working with code in this repository.
 
 - Daemon APT functionality requires Linux systems (Debian-based with apt)
 - Uses mDNS service discovery with "_brewmble._tcp.local." service type for automatic daemon discovery
-- Environment variables control daemon configuration: BREWMBLE_DAEMON_PORT (default 4712), BREWMBLE_DAEMON_HOSTNAME, BREWMBLE_DAEMON_IP, BREWMBLE_DAEMON_API_KEY, BREWMBLE_APT_UPDATE_INTERVAL (default 360), BREWMBLE_BREW_UPDATE_INTERVAL (default 360)
+- Environment variables control daemon configuration: BREWMBLE_DAEMON_PORT (default 4712), BREWMBLE_DAEMON_HOSTNAME, BREWMBLE_DAEMON_IP, BREWMBLE_DAEMON_TLS_CA_CERT, BREWMBLE_DAEMON_TLS_CERT, BREWMBLE_DAEMON_TLS_KEY, BREWMBLE_APT_UPDATE_INTERVAL (default 360), BREWMBLE_BREW_UPDATE_INTERVAL (default 360)
 - BREWMBLE_TIMEOUT env var accepts both seconds (integer) or humantime format (e.g., "1m", "30s")
 - BREWMBLE_NATIVE_PROGRESS env var controls native terminal progress bars (unset or 1 to enable, 0 to disable); enabled by default
 - Daemon caches 'apt-get update' and 'brew update' results based on their respective update intervals (default 360 mins) - see get_updates()
-- CLI uses blocking HTTP client (reqwest with blocking feature) while daemon uses async Axum framework
+- CLI uses blocking HTTPS client (reqwest with blocking feature and rustls) while daemon uses async Axum framework over HTTPS
 - Different Rust editions: CLI uses 2021, daemon uses 2024
-- Container builds use podman with ports 4712 (HTTP) and 5353 (mDNS)
+- Container builds use podman with ports 4712 (HTTPS) and 5353 (mDNS)
 - Daemon auto-hunts for free port starting from 4712 if BREWMBLE_DAEMON_PORT not set
-- API authentication uses X-API-Key header (not Authorization header)
-- If no API key provided, daemon generates UUID v4 and logs it
+- API authentication is performed via mutual TLS (mTLS); the X-API-Key header has been removed
+- Cluster CA and client certificates are managed by the CLI (`brewmble ca` and `brewmble cert` subcommands) and stored in the OS keyring
+- Daemon requires paths to the cluster CA cert, daemon cert, and daemon key via `--tls-*` flags or `BREWMBLE_DAEMON_TLS_*` env vars
 
 ## Project Coding Rules (Non-Obvious Only)
 
@@ -44,7 +45,7 @@ This file provides guidance to agents when working with code in this repository.
 
 - mDNS service registration failures logged with detailed error messages in daemon
 - Linux-specific apt functionality debugging requires Debian-based system
-- Container networking requires ports 4712 (HTTP) and 5353 (mDNS) to be exposed
+- Container networking requires ports 4712 (HTTPS) and 5353 (mDNS) to be exposed
 - Daemon status endpoint provides JSON response with update details
 - Tests use #[cfg(target_os = "macos")] to handle platform-specific behavior
 - CLI discover command uses HashSet to deduplicate services by fullname
@@ -64,7 +65,7 @@ This file provides guidance to agents when working with code in this repository.
 - Environment-based configuration replaces traditional config files
 - mDNS service discovery enables automatic cluster discovery
 - Container architecture requires both HTTP and mDNS networking
-- Daemon uses middleware pattern for authentication (auth_middleware)
+- Daemon uses mutual TLS (mTLS) for authentication; the auth_middleware and X-API-Key mechanism have been removed
 - Status handler returns 412 PRECONDITION_FAILED on systems without a supported package manager
 
 ## Project Planning Rules (Non-Obvious Only)

@@ -65,9 +65,27 @@ brewmble packages --full-upgrade
 brewmble packages --full-upgrade <target> [<target> ...]
 ```
 
+### Certificate Management
+
+Initialize the cluster CA and issue certificates for daemons and this CLI:
+
+```bash
+# Create the cluster CA in the system keyring
+brewmble ca init
+
+# Show the CA certificate and fingerprint
+brewmble ca show
+
+# Issue a daemon certificate (run on a workstation, then provision the PEMs)
+brewmble cert issue --kind daemon --cn <hostname> --out-dir <dir>
+
+# Issue this CLI's client certificate and store it in the keyring
+brewmble cert issue --kind client
+```
+
 ### Profile Management
 
-Manage configuration profiles and secure API keys:
+Manage configuration profiles:
 
 ```bash
 # List all profiles
@@ -78,14 +96,11 @@ brewmble profile create <name>
 
 # Switch to a profile
 brewmble profile use <name>
-
-# Securely store an API key for a node in the system keyring
-brewmble profile set-key <node-address-or-name> <api-key>
 ```
 
 ## Security
 
-Brewmble CLI supports several secure communication methods, including API keys, HTTPS, and SSH tunneling. See the [main Security section](../README.md#security) for details.
+Brewmble CLI communicates with daemons exclusively over HTTPS using mutual TLS (mTLS). The CLI stores the cluster CA and its own client certificate in the OS keyring. Daemon hostnames are not verified; only the cluster CA chain is checked. See the [main Security section](../README.md#security) for details.
 
 ## Configuration
 
@@ -107,11 +122,11 @@ profiles:
     nodes:
       - name: production-1
         address: 192.168.1.10:4712
-        api_key: your-secret-api-key
       - name: raspberry-pi
         address: 192.168.1.50:4712
-        use_keyring: true # API key is stored in system keyring
 ```
+
+The `api_key` and `use_keyring` fields from older versions are ignored; authentication is now performed with mTLS client certificates managed via `brewmble cert`.
 
 ### Environment Variables
 

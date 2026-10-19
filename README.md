@@ -113,28 +113,22 @@ cd daemon && cargo build --release
 
 ## Security
 
-Brewmble provides several options to secure communication between the CLI and daemons:
+Brewmble uses mutual TLS (mTLS) for all CLI-to-daemon communication. A single cluster CA, managed by the CLI, signs both daemon and client certificates.
 
-### 1. API Key Authentication (Built-in)
+### 1. Mutual TLS (Built-in)
 
-The primary security layer is API Key authentication.
-- **Daemon**: Set `BREWMBLE_DAEMON_API_KEY`. If not provided, a random UUID v4 is generated and logged at startup.
-- **CLI**: Store keys in `.brewmble.yaml` for each node, or use the system keyring for better security.
-- **Protocol**: All requests must include the `X-API-Key` header.
+- **CA management**: `brewmble ca init` creates a self-signed ECDSA P-256 cluster CA in the OS keyring.
+- **Daemon certificates**: `brewmble cert issue --kind daemon --cn <hostname> --out-dir <dir>` produces `ca.pem`, `daemon.pem`, and `daemon-key.pem`.
+- **Client certificate**: `brewmble cert issue --kind client` stores the CLI client certificate in the keyring.
+- **Verification**: The daemon accepts any client certificate signed by the cluster CA. Hostname verification is disabled so DHCP/IP churn does not break connectivity.
 
-### 2. HTTPS via Reverse Proxy
-
-For encrypted traffic over the network, you can use HTTPS:
-- **Setup**: Place a reverse proxy (e.g., Caddy, Nginx, or Traefik) in front of the daemon to handle TLS termination.
-- **CLI**: Use `https://` in the node address (e.g., `https://node1.example.com`).
-
-### 3. SSH Tunneling
+### 2. SSH Tunneling
 
 A simple way to secure communication without additional infrastructure:
 - **Setup**: Create a tunnel: `ssh -L 4712:localhost:4712 user@remote-node`
 - **CLI**: Connect to `localhost:4712`.
 
-### 4. Private Overlay Networks
+### 3. Private Overlay Networks
 
 For clusters, using a private network layer is recommended:
 - **Tools**: Use Tailscale or ZeroTier to create an encrypted mesh network.
@@ -151,7 +145,9 @@ Brewmble can be configured using environment variables.
 | `BREWMBLE_DAEMON_PORT` | Daemon | Port for the daemon to listen on. If not specified, the daemon will search for a free port starting from 4712. | `4712` (auto-hunt) |
 | `BREWMBLE_DAEMON_HOSTNAME` | Daemon | Hostname to use for mDNS registration. | System hostname |
 | `BREWMBLE_DAEMON_IP` | Daemon | Explicit IP address to use for mDNS registration. | Automatically detected |
-| `BREWMBLE_DAEMON_API_KEY` | Daemon | API key for authentication. If not provided, a random UUID v4 will be generated and logged. | Generated |
+| `BREWMBLE_DAEMON_TLS_CA_CERT` | Daemon | Path to the cluster CA certificate PEM file. | Required |
+| `BREWMBLE_DAEMON_TLS_CERT` | Daemon | Path to the daemon certificate PEM file. | Required |
+| `BREWMBLE_DAEMON_TLS_KEY` | Daemon | Path to the daemon private key PEM file. | Required |
 | `BREWMBLE_DAEMON_ALLOW_REBOOT` | Daemon | Allow the daemon to reboot the host when requested via the API. | `false` |
 | `BREWMBLE_DAEMON_AUTO_CLEAN` | Daemon | Automatically clean downloaded packages after a successful upgrade (`apt-get autoclean` / `brew cleanup`). | `false` |
 | `BREWMBLE_DAEMON_AUTO_REMOVE` | Daemon | Automatically remove unused packages after a successful upgrade (`apt-get autoremove -y` / `brew autoremove`). | `false` |

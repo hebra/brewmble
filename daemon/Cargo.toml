@@ -7,10 +7,12 @@ edition = "2024"
 brewmble-rest = { path = "../rest" }
 clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
 gethostname = "1.1"
 mdns-sd = "0.20.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process"] }
-uuid = { version = "1.23", features = ["v4"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tower = { version = "0.5", features = ["util"] }
@@ -18,3 +20,8 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower-http = { version = "0.6", features = ["trace"] }
+
+[dev-dependencies]
+rcgen = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+time = "0.3"

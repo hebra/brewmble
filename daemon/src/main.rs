@@ -1,19 +1,20 @@
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::State,
     http::StatusCode,
-    middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
 };
 use brewmble_rest::{
-    API_KEY_HEADER, HealthResponse, PATH_HEALTH, PATH_REBOOT, PATH_STATUS, PATH_UPGRADE,
-    RebootRequest, RebootResponse, SERVICE_FULL_TYPE, StatusResponse, UpgradeRequest,
+    HealthResponse, PATH_HEALTH, PATH_REBOOT, PATH_STATUS, PATH_UPGRADE, RebootRequest,
+    RebootResponse, SERVICE_FULL_TYPE, StatusResponse, TXT_TLS, TXT_TLS_VALUE, UpgradeRequest,
     UpgradeResponse,
 };
 use clap::Parser;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use rustls::pki_types::CertificateDer;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -26,7 +27,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod package_manager;
 use package_manager::{PackageManager, get_package_manager};
 
-const DEFAULT_HTTP_PORT: u16 = 4712;
+const DEFAULT_PORT: u16 = 4712;
 
 #[derive(Parser)]
 #[command(name = "brewmbled", version, disable_version_flag = true)]
@@ -44,9 +45,17 @@ struct Cli {
     #[arg(long, env = "BREWMBLE_DAEMON_IP")]
     ip: Option<IpAddr>,
 
-    /// API key for authentication. If not provided, one will be generated.
-    #[arg(long, env = "BREWMBLE_DAEMON_API_KEY")]
-    api_key: Option<String>,
+    /// Path to the cluster CA certificate PEM file.
+    #[arg(long, env = "BREWMBLE_DAEMON_TLS_CA_CERT")]
+    tls_ca_cert: PathBuf,
+
+    /// Path to the daemon certificate PEM file.
+    #[arg(long, env = "BREWMBLE_DAEMON_TLS_CERT")]
+    tls_cert: PathBuf,
+
+    /// Path to the daemon private key PEM file.
+    #[arg(long, env = "BREWMBLE_DAEMON_TLS_KEY")]
+    tls_key: PathBuf,
 
     /// Allow the daemon to reboot the host when requested via the API.
     #[arg(long, env = "BREWMBLE_DAEMON_ALLOW_REBOOT")]
@@ -68,7 +77,6 @@ struct Cli {
 #[derive(Clone)]
 struct AppState {
     is_upgrading: Arc<AtomicBool>,
-    api_key: String,
     allow_reboot: bool,
     auto_clean: bool,
     auto_remove: bool,
@@ -85,6 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer().with_ansi(true))
         .init();
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     if cli.version {
         println!("brewmbled {}", env!("CARGO_PKG_VERSION"));
@@ -92,19 +102,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("Starting brewmbled version {}", env!("CARGO_PKG_VERSION"));
 
-    let (listener, http_port) = if let Some(port) = cli.port {
+    let http_port = if let Some(port) = cli.port {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let listener = TcpListener::bind(addr).await.map_err(|e| {
             error!("failed to bind to port {port}: {e}");
             e
         })?;
-        (listener, port)
+        drop(listener);
+        port
     } else {
-        let mut port = DEFAULT_HTTP_PORT;
+        let mut port = DEFAULT_PORT;
         loop {
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             match TcpListener::bind(addr).await {
-                Ok(listener) => break (listener, port),
+                Ok(listener) => {
+                    drop(listener);
+                    break port;
+                }
                 Err(e) => {
                     if port == u16::MAX {
                         error!("no free ports found");
@@ -123,15 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .trim_end_matches('.')
         .to_string();
 
+    let tls_config = load_tls_config(&cli.tls_ca_cert, &cli.tls_cert, &cli.tls_key)?;
     let mdns_daemon = register_mdns(http_port, &hostname, cli.ip);
-
-    let api_key = if let Some(key) = cli.api_key {
-        key
-    } else {
-        let key = uuid::Uuid::new_v4().to_string();
-        info!("no API key provided, generated: {}", key);
-        key
-    };
 
     let pm = get_package_manager(cli.auto_clean, cli.auto_remove);
     info!("using {} package manager backend", pm.name());
@@ -144,7 +151,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState {
         is_upgrading: Arc::new(AtomicBool::new(false)),
-        api_key,
         allow_reboot: cli.allow_reboot,
         auto_clean: cli.auto_clean,
         auto_remove: cli.auto_remove,
@@ -157,20 +163,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(PATH_UPGRADE, post(full_upgrade_handler))
         .route(PATH_REBOOT, post(reboot_handler))
         .layer(TraceLayer::new_for_http())
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
         .with_state(state);
 
-    info!("brewmble daemon listening on {}", listener.local_addr()?);
+    let addr = SocketAddr::from(([0, 0, 0, 0], http_port));
+    info!("brewmble daemon listening on {}", addr);
 
-    let server_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
+    let server = axum_server::bind_rustls(addr, rustls_config)
+        .handle(handle.clone())
+        .serve(app.into_make_service());
+
+    let shutdown = async move {
+        shutdown_signal().await;
+        handle.graceful_shutdown(None);
+    };
+
+    let server_result = tokio::select! {
+        result = server => result,
+        _ = shutdown => Ok(()),
+    };
 
     if let Err(err) = server_result {
-        error!("http server error: {err}");
+        error!("https server error: {err}");
     }
 
     if let Some(mdns) = mdns_daemon {
@@ -180,27 +195,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-async fn auth_middleware(
-    State(state): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Result<impl IntoResponse, StatusCode> {
-    // Allow public access to /health
-    if req.uri().path() == PATH_HEALTH {
-        return Ok(next.run(req).await);
-    }
-
-    let auth_header = req
-        .headers()
-        .get(API_KEY_HEADER)
-        .and_then(|header| header.to_str().ok());
-
-    match auth_header {
-        Some(key) if key == state.api_key => Ok(next.run(req).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
-    }
 }
 
 async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -401,6 +395,10 @@ async fn reboot_handler(
     )
 }
 
+fn mdns_properties(hostname: &str) -> Vec<(&str, &str)> {
+    vec![("id", hostname), (TXT_TLS, TXT_TLS_VALUE)]
+}
+
 fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<ServiceDaemon> {
     let daemon = match ServiceDaemon::new() {
         Ok(daemon) => {
@@ -416,7 +414,7 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
     let instance_hostname = hostname.split('.').next().unwrap_or(hostname);
     let instance = format!("brewmbled-{instance_hostname}");
     let host_name = format!("{instance_hostname}.local.");
-    let properties = [("id", hostname)];
+    let properties = mdns_properties(hostname);
 
     info!("Registering mDNS service:");
     info!("  Instance: {}", instance);
@@ -468,6 +466,53 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
     Some(daemon)
 }
 
+fn load_tls_config(
+    ca_path: &PathBuf,
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error>> {
+    let ca_pem = std::fs::read_to_string(ca_path)
+        .map_err(|e| format!("failed to read CA cert file '{}': {e}", ca_path.display()))?;
+    let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
+        format!(
+            "failed to read daemon cert file '{}': {e}",
+            cert_path.display()
+        )
+    })?;
+    let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
+        format!(
+            "failed to read daemon key file '{}': {e}",
+            key_path.display()
+        )
+    })?;
+
+    let ca_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to parse CA cert: {e}"))?;
+    let ca_cert = ca_certs.into_iter().next().ok_or("CA cert file is empty")?;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca_cert)?;
+
+    let daemon_certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("failed to parse daemon cert: {e}"))?;
+    if daemon_certs.is_empty() {
+        return Err("daemon cert file is empty".into());
+    }
+
+    let daemon_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
+        .ok_or("daemon key file is empty or unparseable")?;
+
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
+    let mut config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(daemon_certs, daemon_key)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
@@ -502,6 +547,11 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
     use brewmble_rest::StatusResponse;
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, PKCS_ECDSA_P256_SHA256,
+    };
+    use time::OffsetDateTime;
     use tower::ServiceExt;
 
     struct MockPackageManager {
@@ -542,75 +592,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auth_middleware() {
-        let api_key = "test-key".to_string();
-        let state = AppState {
-            is_upgrading: Arc::new(AtomicBool::new(false)),
-            api_key: api_key.clone(),
-            allow_reboot: false,
-            auto_clean: false,
-            auto_remove: false,
-            package_manager: Arc::new(Box::new(MockPackageManager {
-                name: "mock".to_string(),
-                available: true,
-            })),
-        };
-        let app = Router::new()
-            .route(PATH_STATUS, get(status_handler))
-            .route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                auth_middleware,
-            ))
-            .with_state(state);
-
-        // No API key
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(PATH_STATUS)
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        // Wrong API key
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(PATH_STATUS)
-                    .header(API_KEY_HEADER, "wrong-key")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        // Correct API key
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(PATH_STATUS)
-                    .header(API_KEY_HEADER, api_key)
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // It should pass middleware.
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
     async fn test_status_handler_non_linux() {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
-            api_key: "test".to_string(),
             allow_reboot: false,
             auto_clean: false,
             auto_remove: false,
@@ -644,7 +628,6 @@ mod tests {
     async fn test_status_handler_unavailable() {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
-            api_key: "test".to_string(),
             allow_reboot: false,
             auto_clean: false,
             auto_remove: false,
@@ -677,7 +660,6 @@ mod tests {
     async fn test_health_handler() {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
-            api_key: "test".to_string(),
             allow_reboot: false,
             auto_clean: false,
             auto_remove: false,
@@ -711,7 +693,6 @@ mod tests {
     async fn test_full_upgrade_handler_mock() {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
-            api_key: "test".to_string(),
             allow_reboot: false,
             auto_clean: false,
             auto_remove: false,
@@ -747,7 +728,6 @@ mod tests {
         {
             let state = AppState {
                 is_upgrading: Arc::new(AtomicBool::new(false)),
-                api_key: "test".to_string(),
                 allow_reboot: false,
                 auto_clean: false,
                 auto_remove: false,
@@ -817,7 +797,6 @@ mod tests {
     async fn test_reboot_handler_allowed() {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
-            api_key: "test".to_string(),
             allow_reboot: true,
             auto_clean: false,
             auto_remove: false,
@@ -851,7 +830,6 @@ mod tests {
     async fn test_reboot_handler_disabled() {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
-            api_key: "test".to_string(),
             allow_reboot: false,
             auto_clean: false,
             auto_remove: false,
@@ -885,7 +863,6 @@ mod tests {
     async fn test_reboot_handler_blocked_while_upgrading() {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(true)),
-            api_key: "test".to_string(),
             allow_reboot: true,
             auto_clean: false,
             auto_remove: false,
@@ -919,7 +896,6 @@ mod tests {
     async fn test_status_handler_exposes_config_flags() {
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
-            api_key: "test".to_string(),
             allow_reboot: true,
             auto_clean: true,
             auto_remove: false,
@@ -1016,8 +992,12 @@ mod tests {
             "test-host",
             "--ip",
             "1.2.3.4",
-            "--api-key",
-            "secret-key",
+            "--tls-ca-cert",
+            "/etc/brewmble/tls/ca.pem",
+            "--tls-cert",
+            "/etc/brewmble/tls/daemon.pem",
+            "--tls-key",
+            "/etc/brewmble/tls/daemon-key.pem",
             "--allow-reboot",
             "--auto-clean",
             "--auto-remove",
@@ -1025,7 +1005,12 @@ mod tests {
         assert_eq!(cli.port, Some(9090));
         assert_eq!(cli.hostname, Some("test-host".to_string()));
         assert_eq!(cli.ip, Some("1.2.3.4".parse().unwrap()));
-        assert_eq!(cli.api_key, Some("secret-key".to_string()));
+        assert_eq!(cli.tls_ca_cert, PathBuf::from("/etc/brewmble/tls/ca.pem"));
+        assert_eq!(cli.tls_cert, PathBuf::from("/etc/brewmble/tls/daemon.pem"));
+        assert_eq!(
+            cli.tls_key,
+            PathBuf::from("/etc/brewmble/tls/daemon-key.pem")
+        );
         assert!(cli.allow_reboot);
         assert!(cli.auto_clean);
         assert!(cli.auto_remove);
@@ -1033,7 +1018,15 @@ mod tests {
 
     #[test]
     fn test_cli_default_config_flags() {
-        let cli = Cli::parse_from(["brewmbled"]);
+        let cli = Cli::parse_from([
+            "brewmbled",
+            "--tls-ca-cert",
+            "/etc/brewmble/tls/ca.pem",
+            "--tls-cert",
+            "/etc/brewmble/tls/daemon.pem",
+            "--tls-key",
+            "/etc/brewmble/tls/daemon-key.pem",
+        ]);
         assert!(!cli.allow_reboot);
         assert!(!cli.auto_clean);
         assert!(!cli.auto_remove);
@@ -1041,14 +1034,222 @@ mod tests {
 
     #[test]
     fn test_cli_env_vars() {
-        let cli = Cli::try_parse_from(["brewmbled"]);
-        if let Ok(c) = cli {
-            // If env var was already set by environment, we just check it parses
-            assert!(c.port.is_some() || c.port.is_none());
-        }
+        let cli = Cli::try_parse_from([
+            "brewmbled",
+            "--tls-ca-cert",
+            "/etc/brewmble/tls/ca.pem",
+            "--tls-cert",
+            "/etc/brewmble/tls/daemon.pem",
+            "--tls-key",
+            "/etc/brewmble/tls/daemon-key.pem",
+        ]);
+        assert!(cli.is_ok());
+        let c = cli.unwrap();
+        assert!(c.port.is_some() || c.port.is_none());
+    }
 
-        // Test with explicit env override in a controlled way if possible,
-        // but Clap's env support is hard to test with set_var in multi-threaded test runner.
-        // So we just rely on test_cli_parsing for basic logic.
+    #[test]
+    fn test_mdns_properties_include_tls() {
+        let props = mdns_properties("myhost");
+        assert!(props.iter().any(|(k, v)| *k == "id" && *v == "myhost"));
+        assert!(
+            props
+                .iter()
+                .any(|(k, v)| *k == TXT_TLS && *v == TXT_TLS_VALUE)
+        );
+    }
+
+    #[test]
+    fn test_load_tls_config_missing_files() {
+        let result = load_tls_config(
+            &PathBuf::from("/nonexistent/ca.pem"),
+            &PathBuf::from("/nonexistent/cert.pem"),
+            &PathBuf::from("/nonexistent/key.pem"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_tls_config_unparseable_pem() {
+        let dir = std::env::temp_dir().join(format!("brewmble-tls-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca_path = dir.join("ca.pem");
+        let cert_path = dir.join("daemon.pem");
+        let key_path = dir.join("daemon-key.pem");
+        std::fs::write(&ca_path, "not a pem").unwrap();
+        std::fs::write(&cert_path, "not a pem").unwrap();
+        std::fs::write(&key_path, "not a pem").unwrap();
+
+        let result = load_tls_config(&ca_path, &cert_path, &key_path);
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn generate_test_ca(cn: &str) -> (String, String) {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let not_before = OffsetDateTime::now_utc() - time::Duration::days(1);
+        params.not_before = not_before;
+        params.not_after = not_before + time::Duration::days(3650);
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    fn generate_test_leaf(
+        cn: &str,
+        _ca_cert: &str,
+        ca_key: &str,
+        eku: ExtendedKeyUsagePurpose,
+    ) -> (String, String) {
+        let ca_key = KeyPair::from_pem(ca_key).unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "test-ca");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.extended_key_usages = vec![eku];
+        let not_before = OffsetDateTime::now_utc() - time::Duration::days(1);
+        params.not_before = not_before;
+        params.not_after = not_before + time::Duration::days(397);
+        let cert = params.signed_by(&leaf_key, &issuer).unwrap();
+        (cert.pem(), leaf_key.serialize_pem())
+    }
+
+    #[tokio::test]
+    async fn test_mtls_integration() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = std::env::temp_dir().join(format!("brewmble-mtls-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (ca_cert, ca_key) = generate_test_ca("test-ca");
+        let (daemon_cert, daemon_key) = generate_test_leaf(
+            "test-daemon",
+            &ca_cert,
+            &ca_key,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        );
+        let (client_cert, client_key) = generate_test_leaf(
+            "test-client",
+            &ca_cert,
+            &ca_key,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        );
+        let (other_ca, other_key) = generate_test_ca("other-ca");
+        let (other_client_cert, other_client_key) = generate_test_leaf(
+            "other-client",
+            &other_ca,
+            &other_key,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        );
+
+        let ca_path = dir.join("ca.pem");
+        let cert_path = dir.join("daemon.pem");
+        let key_path = dir.join("daemon-key.pem");
+        std::fs::write(&ca_path, &ca_cert).unwrap();
+        std::fs::write(&cert_path, &daemon_cert).unwrap();
+        std::fs::write(&key_path, &daemon_key).unwrap();
+
+        let tls_config = load_tls_config(&ca_path, &cert_path, &key_path).unwrap();
+
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
+        };
+        let app = Router::new()
+            .route(PATH_HEALTH, get(health_handler))
+            .route(PATH_STATUS, get(status_handler))
+            .with_state(state);
+
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
+        let server = axum_server::bind_rustls(addr, rustls_config)
+            .handle(handle.clone())
+            .serve(app.into_make_service());
+        tokio::spawn(server);
+        let bound = handle.listening().await.unwrap();
+        let base = format!("https://127.0.0.1:{}", bound.port());
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let ca_root = reqwest::Certificate::from_pem(ca_cert.as_bytes()).unwrap();
+
+        // No client certificate: handshake must fail.
+        let client_no_cert = reqwest::Client::builder()
+            .tls_certs_only([ca_root.clone()])
+            .tls_danger_accept_invalid_hostnames(true)
+            .https_only(true)
+            .build()
+            .unwrap();
+        let result = client_no_cert
+            .get(format!("{}{}", base, PATH_HEALTH))
+            .send()
+            .await;
+        assert!(result.is_err());
+
+        // Valid client certificate from the cluster CA.
+        let identity =
+            reqwest::Identity::from_pem(format!("{}\n{}", client_cert, client_key).as_bytes())
+                .unwrap();
+        let client_ok = reqwest::Client::builder()
+            .identity(identity)
+            .tls_certs_only([ca_root.clone()])
+            .tls_danger_accept_invalid_hostnames(true)
+            .https_only(true)
+            .build()
+            .unwrap();
+        let response = client_ok
+            .get(format!("{}{}", base, PATH_HEALTH))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let response = client_ok
+            .get(format!("{}{}", base, PATH_STATUS))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        // Client certificate signed by a different CA: handshake must fail.
+        let bad_identity = reqwest::Identity::from_pem(
+            format!("{}\n{}", other_client_cert, other_client_key).as_bytes(),
+        )
+        .unwrap();
+        let client_bad = reqwest::Client::builder()
+            .identity(bad_identity)
+            .tls_certs_only([ca_root])
+            .tls_danger_accept_invalid_hostnames(true)
+            .https_only(true)
+            .build()
+            .unwrap();
+        let result = client_bad
+            .get(format!("{}{}", base, PATH_HEALTH))
+            .send()
+            .await;
+        assert!(result.is_err());
+
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

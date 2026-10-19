@@ -18,4 +18,11 @@ RUN apt-get update \
     && apt full-upgrade -s
 
 COPY --from=builder /app/target/release/brewmbled /usr/local/bin/brewmbled
+
+# mTLS certificate directory; mount the cluster CA, daemon cert, and daemon key here.
+VOLUME ["/etc/brewmble/tls"]
+
+# Port 4712 serves HTTPS; port 5353 is used for mDNS.
+EXPOSE 4712 5353
+
 ENTRYPOINT ["/usr/local/bin/brewmbled"]

@@ -49,10 +49,11 @@ Brewmble uses **mDNS (Multicast DNS)** for zero-configuration discovery.
 Communication between the CLI and Daemon occurs over HTTP/S using a RESTful API.
 
 ### Authentication
-Security is handled via a simple API Key mechanism.
-- **Header**: `X-API-Key`
-- **Behavior**: The daemon requires this header for all non-discovery requests. If the key is missing or incorrect, it returns `401 Unauthorized`.
-- **Key Generation**: If no key is provided via `BREWMBLE_DAEMON_API_KEY`, the daemon generates a random UUID v4 and logs it at startup.
+Security is handled via mutual TLS (mTLS).
+- **Cluster CA**: The CLI manages a single cluster CA stored in the OS keyring (`brewmble ca init`).
+- **Daemon**: Started with `--tls-ca-cert`, `--tls-cert`, and `--tls-key` (or the matching environment variables). It serves HTTPS and requires a client certificate signed by the cluster CA.
+- **CLI**: Uses its own client certificate from the keyring to connect to every daemon. Hostname verification is disabled; only the CA chain is checked.
+- **Behavior**: If the client cannot present a valid certificate, the TLS handshake fails before any HTTP request is made.
 
 ### Endpoints
 - `GET /status`: Returns information about the system and available updates.

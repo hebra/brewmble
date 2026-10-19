@@ -14,8 +14,12 @@
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>BREWMBLE_DAEMON_PORT</key>
         <string>8998</string>
-        <key>BREWMBLE_DAEMON_API_KEY</key>
-        <string>REPLACE_WITH_SECRET_KEY</string>
+        <key>BREWMBLE_DAEMON_TLS_CA_CERT</key>
+        <string>/etc/brewmble/tls/ca.pem</string>
+        <key>BREWMBLE_DAEMON_TLS_CERT</key>
+        <string>/etc/brewmble/tls/daemon.pem</string>
+        <key>BREWMBLE_DAEMON_TLS_KEY</key>
+        <string>/etc/brewmble/tls/daemon-key.pem</string>
         <key>RUST_LOG</key>
         <string>info</string>
     </dict>

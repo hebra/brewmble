@@ -22,8 +22,10 @@ User=brewmble
 # Explicit IP address for mDNS registration (default: auto-detected).
 # Environment=BREWMBLE_DAEMON_IP=192.168.1.10
 
-# API key for authentication. If not set, a random UUID v4 is generated and logged on startup.
-# Environment=BREWMBLE_DAEMON_API_KEY=your-secure-api-key
+# mTLS certificate paths (required).
+# Environment=BREWMBLE_DAEMON_TLS_CA_CERT=/etc/brewmble/tls/ca.pem
+# Environment=BREWMBLE_DAEMON_TLS_CERT=/etc/brewmble/tls/daemon.pem
+# Environment=BREWMBLE_DAEMON_TLS_KEY=/etc/brewmble/tls/daemon-key.pem
 
 # Allow the daemon to reboot the host when requested via the API (default: false).
 # Environment=BREWMBLE_DAEMON_ALLOW_REBOOT=false

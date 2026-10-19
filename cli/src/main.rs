@@ -1,11 +1,10 @@
 use brewmble_rest::{
-    RebootResponse, StatusResponse, UpgradeResponse, API_KEY_HEADER, PATH_REBOOT, PATH_STATUS,
-    PATH_UPGRADE, SERVICE_DOMAIN, SERVICE_TYPE,
+    RebootResponse, StatusResponse, UpgradeResponse, PATH_REBOOT, PATH_STATUS, PATH_UPGRADE,
+    SERVICE_DOMAIN, SERVICE_TYPE, TXT_TLS,
 };
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use flume::RecvTimeoutError;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use keyring::Entry;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -19,10 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tabwriter::TabWriter;
 
+mod ca;
 mod progress;
 use progress::NativeProgress;
-
-const TOKEN_PLACEHOLDER: &str = "REPLACE_WITH_ACTUAL_TOKEN";
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config {
@@ -62,21 +60,6 @@ struct NodeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     address: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    api_key: Option<String>,
-    #[serde(default)]
-    use_keyring: bool,
-}
-
-impl NodeConfig {
-    fn get_api_key(&self) -> Option<String> {
-        if self.use_keyring {
-            let entry = Entry::new("brewmble-cli", &self.address).ok()?;
-            entry.get_password().ok()
-        } else {
-            self.api_key.clone()
-        }
-    }
 }
 
 fn resolve_config_path(explicit_path: Option<PathBuf>) -> (PathBuf, bool) {
@@ -180,8 +163,6 @@ fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
             profile.nodes.push(NodeConfig {
                 name: new_name,
                 address: addr,
-                api_key: Some(TOKEN_PLACEHOLDER.to_string()),
-                use_keyring: false,
             });
             updated = true;
         }
@@ -262,8 +243,55 @@ enum Commands {
         #[command(subcommand)]
         subcommand: ProfileCommands,
     },
+    /// Initialize and manage the cluster CA
+    Ca {
+        #[command(subcommand)]
+        subcommand: CaCommands,
+    },
+    /// Issue certificates for daemons or this CLI
+    Cert {
+        #[command(subcommand)]
+        subcommand: CertCommands,
+    },
     /// Show version information for CLI and daemons
     Version,
+}
+
+#[derive(Subcommand)]
+enum CaCommands {
+    /// Create the cluster CA in the keyring
+    Init {
+        /// Overwrite an existing CA
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the cluster CA certificate and fingerprint
+    Show,
+}
+
+#[derive(ValueEnum, Clone)]
+enum CertKind {
+    Daemon,
+    Client,
+}
+
+#[derive(Subcommand)]
+enum CertCommands {
+    /// Issue a certificate
+    Issue {
+        /// Kind of certificate to issue
+        #[arg(short, long, value_enum)]
+        kind: CertKind,
+        /// Common name for the certificate (required for daemon certs)
+        #[arg(short, long)]
+        cn: Option<String>,
+        /// Output directory for daemon certificate files
+        #[arg(short, long)]
+        out_dir: Option<PathBuf>,
+        /// Overwrite existing client certificate or output files
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -278,16 +306,6 @@ enum ProfileCommands {
     Delete { name: String },
     /// Edit the configuration file
     Edit,
-    /// Set API key for a node in the keyring
-    SetKey {
-        /// Profile name (defaults to active profile)
-        #[arg(short, long)]
-        profile: Option<String>,
-        /// Node address or name
-        node: String,
-        /// API key
-        key: String,
-    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -330,6 +348,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(Commands::Profile { subcommand }) => {
             run_profile(subcommand, &mut config, &config_path)
         }
+        Some(Commands::Ca { subcommand }) => run_ca(subcommand),
+        Some(Commands::Cert { subcommand }) => run_cert(subcommand),
         Some(Commands::Version) => run_version(&config),
         None => {
             // This case might be reached if only options are provided but no command.
@@ -410,39 +430,87 @@ fn run_profile(
                 return Err(format!("Editor exited with status: {}", status).into());
             }
         }
-        ProfileCommands::SetKey {
-            profile: profile_name,
-            node: node_id,
-            key,
-        } => {
-            let p_name = profile_name.unwrap_or_else(|| config.active_profile.clone());
-            {
-                let profile = config
-                    .profiles
-                    .get_mut(&p_name)
-                    .ok_or_else(|| format!("Profile '{}' not found", p_name))?;
+    }
+    Ok(())
+}
 
-                let node = profile
-                    .nodes
-                    .iter_mut()
-                    .find(|n| n.address == node_id || n.name.as_ref() == Some(&node_id))
-                    .ok_or_else(|| {
-                        format!("Node '{}' not found in profile '{}'", node_id, p_name)
-                    })?;
-
-                let entry = Entry::new("brewmble-cli", &node.address)?;
-                entry.set_password(&key)?;
-
-                node.use_keyring = true;
-                node.api_key = None; // Remove plain-text key if it was there
+fn run_ca(subcommand: CaCommands) -> Result<(), Box<dyn Error>> {
+    match subcommand {
+        CaCommands::Init { force } => {
+            if !force && ca::ensure_ca().is_ok_and(|(c, k)| !c.is_empty() && !k.is_empty()) {
+                return Err("cluster CA already exists; use --force to overwrite".into());
             }
-
-            save_config(config_path, config)?;
-            println!(
-                "API key for node stored securely in keyring for profile '{}'",
-                p_name
-            );
+            if force {
+                let _ = keyring::Entry::new("brewmble-cli", "cluster-ca-cert")
+                    .and_then(|e| e.delete_password());
+                let _ = keyring::Entry::new("brewmble-cli", "cluster-ca-key")
+                    .and_then(|e| e.delete_password());
+            }
+            let (cert, _key) = ca::ensure_ca()?;
+            println!("Cluster CA created.");
+            println!("Fingerprint: {}", ca::fingerprint(&cert)?);
         }
+        CaCommands::Show => {
+            let entry = keyring::Entry::new("brewmble-cli", "cluster-ca-cert")?;
+            let cert = entry.get_password()?;
+            println!("{}", cert);
+            println!("Fingerprint: {}", ca::fingerprint(&cert)?);
+        }
+    }
+    Ok(())
+}
+
+fn run_cert(subcommand: CertCommands) -> Result<(), Box<dyn Error>> {
+    match subcommand {
+        CertCommands::Issue {
+            kind,
+            cn,
+            out_dir,
+            force,
+        } => match kind {
+            CertKind::Daemon => {
+                let cn = cn.ok_or("--cn is required for daemon certificates")?;
+                let out_dir = out_dir.ok_or("--out-dir is required for daemon certificates")?;
+                std::fs::create_dir_all(&out_dir)?;
+
+                let ca_path = out_dir.join("ca.pem");
+                let cert_path = out_dir.join("daemon.pem");
+                let key_path = out_dir.join("daemon-key.pem");
+
+                if !force && (ca_path.exists() || cert_path.exists() || key_path.exists()) {
+                    return Err("output files already exist; use --force to overwrite".into());
+                }
+
+                let (ca_cert, _ca_key) = ca::ensure_ca()?;
+                let (cert, key) = ca::issue_leaf(&cn, ca::LeafKind::Daemon)?;
+
+                std::fs::write(&ca_path, ca_cert)?;
+                std::fs::write(&cert_path, cert)?;
+                std::fs::write(&key_path, key)?;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = std::fs::metadata(&key_path)?.permissions();
+                    perms.set_mode(0o600);
+                    std::fs::set_permissions(&key_path, perms)?;
+                }
+
+                println!("Daemon certificate written to {}", out_dir.display());
+            }
+            CertKind::Client => {
+                if !force
+                    && keyring::Entry::new("brewmble-cli", "client-cert")
+                        .and_then(|e| e.get_password())
+                        .is_ok()
+                {
+                    return Err("client certificate already exists; use --force to re-issue".into());
+                }
+                let hostname = gethostname::gethostname().to_string_lossy().into_owned();
+                ca::issue_leaf(&hostname, ca::LeafKind::Client)?;
+                println!("Client certificate issued and stored in the keyring.");
+            }
+        },
     }
     Ok(())
 }
@@ -480,16 +548,17 @@ fn run_discover(
                     let fullname = info.get_fullname().to_string();
                     if seen.insert(fullname) {
                         if !header_printed {
-                            writeln!(writer, "ID\tHOST\tADDRESS\tPORT\tINSTANCE")?;
+                            writeln!(writer, "ID\tHOST\tADDRESS\tPORT\tTLS\tINSTANCE")?;
                             header_printed = true;
                         }
                         writeln!(
                             writer,
-                            "{}\t{}\t{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}",
                             entry_id(&info),
                             entry_host(&info),
                             entry_addresses(&info),
                             info.port,
+                            entry_tls(&info),
                             entry_instance(&info)
                         )?;
                         writer.flush()?;
@@ -675,6 +744,84 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_ca_init() {
+        let cli = Cli::parse_from(&["brewmble", "ca", "init"]);
+        if let Some(Commands::Ca {
+            subcommand: CaCommands::Init { force },
+        }) = cli.command
+        {
+            assert!(!force);
+        } else {
+            panic!("Expected ca init command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_ca_init_force() {
+        let cli = Cli::parse_from(&["brewmble", "ca", "init", "--force"]);
+        if let Some(Commands::Ca {
+            subcommand: CaCommands::Init { force },
+        }) = cli.command
+        {
+            assert!(force);
+        } else {
+            panic!("Expected ca init --force command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_cert_issue_daemon() {
+        let cli = Cli::parse_from(&[
+            "brewmble",
+            "cert",
+            "issue",
+            "--kind",
+            "daemon",
+            "--cn",
+            "host1",
+            "--out-dir",
+            "/tmp/certs",
+        ]);
+        if let Some(Commands::Cert {
+            subcommand:
+                CertCommands::Issue {
+                    kind: CertKind::Daemon,
+                    cn,
+                    out_dir,
+                    force,
+                },
+        }) = cli.command
+        {
+            assert_eq!(cn, Some("host1".to_string()));
+            assert_eq!(out_dir, Some(PathBuf::from("/tmp/certs")));
+            assert!(!force);
+        } else {
+            panic!("Expected cert issue daemon command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_cert_issue_client() {
+        let cli = Cli::parse_from(&["brewmble", "cert", "issue", "--kind", "client"]);
+        if let Some(Commands::Cert {
+            subcommand:
+                CertCommands::Issue {
+                    kind: CertKind::Client,
+                    cn,
+                    out_dir,
+                    force,
+                },
+        }) = cli.command
+        {
+            assert!(cn.is_none());
+            assert!(out_dir.is_none());
+            assert!(!force);
+        } else {
+            panic!("Expected cert issue client command");
+        }
+    }
+
+    #[test]
     fn test_resolve_config_path() {
         let explicit = Some(PathBuf::from("custom.yaml"));
         let (path, exists) = resolve_config_path(explicit);
@@ -705,8 +852,6 @@ mod tests {
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: None,
             address: "1.1.1.1:8080".to_string(),
-            api_key: None,
-            use_keyring: false,
         }];
 
         let discovered = vec![
@@ -722,22 +867,18 @@ mod tests {
         // Existing node updated with name
         assert_eq!(nodes[0].address, "1.1.1.1:8080");
         assert_eq!(nodes[0].name, Some("node1".to_string()));
-        assert_eq!(nodes[0].api_key, None);
 
-        // New node added with name and placeholder token
+        // New node added with name
         assert_eq!(nodes[1].address, "2.2.2.2:8080");
         assert_eq!(nodes[1].name, Some("node2".to_string()));
-        assert_eq!(nodes[1].api_key, Some(TOKEN_PLACEHOLDER.to_string()));
     }
 
     #[test]
-    fn test_merge_nodes_updates_name_but_preserves_token() {
+    fn test_merge_nodes_updates_name() {
         let mut config = Config::default();
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: Some("OldName".to_string()),
             address: "1.1.1.1:8080".to_string(),
-            api_key: Some("secret".to_string()),
-            use_keyring: false,
         }];
 
         let discovered = vec![("1.1.1.1:8080".to_string(), "NewName".to_string())];
@@ -746,7 +887,6 @@ mod tests {
         assert!(updated);
         let nodes = &config.profiles.get("default").unwrap().nodes;
         assert_eq!(nodes[0].name, Some("NewName".to_string()));
-        assert_eq!(nodes[0].api_key, Some("secret".to_string()));
     }
 
     #[test]
@@ -755,8 +895,6 @@ mod tests {
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: Some("Custom".to_string()),
             address: "1.1.1.1:8080".to_string(),
-            api_key: None,
-            use_keyring: false,
         }];
 
         let discovered = vec![("1.1.1.1:8080".to_string(), "node1".to_string())];
@@ -773,8 +911,6 @@ mod tests {
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: Some("id=raspi1".to_string()),
             address: "1.1.1.1:8080".to_string(),
-            api_key: None,
-            use_keyring: false,
         }];
 
         // Discovered node has the clean name
@@ -792,8 +928,6 @@ mod tests {
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: Some("raspi1".to_string()),
             address: "1.1.1.1:8080".to_string(),
-            api_key: Some("secret".to_string()),
-            use_keyring: false,
         }];
 
         // raspi1 changed IP
@@ -805,7 +939,6 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].address, "1.1.1.2:8080");
         assert_eq!(nodes[0].name, Some("raspi1".to_string()));
-        assert_eq!(nodes[0].api_key, Some("secret".to_string()));
     }
 
     #[test]
@@ -817,19 +950,19 @@ mod tests {
 
     #[test]
     fn test_resolve_url() {
-        assert_eq!(resolve_url("1.2.3.4:8080"), "http://1.2.3.4:8080");
+        assert_eq!(resolve_url("1.2.3.4:8080"), "https://1.2.3.4:8080");
         assert_eq!(resolve_url("http://1.2.3.4:8080"), "http://1.2.3.4:8080");
         assert_eq!(resolve_url("https://example.com"), "https://example.com");
-        assert_eq!(resolve_url("example.com:80"), "http://example.com:80");
-        assert_eq!(resolve_url("::1:8080"), "http://[::1]:8080");
-        assert_eq!(resolve_url("[::1]:8080"), "http://[::1]:8080");
-        assert_eq!(resolve_url("localhost"), "http://localhost");
-        assert_eq!(resolve_url("1.2.3.4:8080/"), "http://1.2.3.4:8080");
+        assert_eq!(resolve_url("example.com:80"), "https://example.com:80");
+        assert_eq!(resolve_url("::1:8080"), "https://[::1]:8080");
+        assert_eq!(resolve_url("[::1]:8080"), "https://[::1]:8080");
+        assert_eq!(resolve_url("localhost"), "https://localhost");
+        assert_eq!(resolve_url("1.2.3.4:8080/"), "https://1.2.3.4:8080");
     }
 
     #[test]
     fn test_entry_helpers() {
-        let properties = [("id", "node1")];
+        let properties = [("id", "node1"), ("tls", "mtls")];
         let info = ServiceInfo::new(
             "_brewmble._tcp.local.",
             "brewmbled-node1",
@@ -845,6 +978,7 @@ mod tests {
         assert_eq!(entry_id(&resolved), "node1");
         assert_eq!(entry_host(&resolved), "node1.local");
         assert_eq!(entry_addresses(&resolved), "1.2.3.4");
+        assert_eq!(entry_tls(&resolved), "mtls");
         assert_eq!(entry_instance(&resolved), "brewmbled-node1");
     }
 
@@ -876,7 +1010,6 @@ nodes:
         let profile = config.profiles.get("default").unwrap();
         assert_eq!(profile.nodes.len(), 1);
         assert_eq!(profile.nodes[0].name, Some("legacy-node".to_string()));
-        assert_eq!(profile.nodes[0].api_key, Some("secret-token".to_string()));
     }
 }
 
@@ -915,6 +1048,15 @@ fn entry_instance(entry: &ResolvedService) -> String {
         .to_string()
 }
 
+fn entry_tls(entry: &ResolvedService) -> String {
+    entry
+        .txt_properties
+        .iter()
+        .find(|p| p.key() == TXT_TLS)
+        .map(|p| p.val_str().to_string())
+        .unwrap_or_default()
+}
+
 fn run_version(config: &Config) -> Result<(), Box<dyn Error>> {
     let mut tw = TabWriter::new(std::io::stdout());
     writeln!(tw, "COMPONENT\tVERSION")?;
@@ -922,18 +1064,12 @@ fn run_version(config: &Config) -> Result<(), Box<dyn Error>> {
 
     let active_profile = config.profiles.get(&config.active_profile);
     if let Some(profile) = active_profile {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(get_default_timeout())
-            .build()?;
+        let client = ca::build_client()?;
 
         for node in &profile.nodes {
             let url = resolve_url(&node.address);
             let status_url = format!("{}{}", url, PATH_STATUS);
-            let mut request = client.get(&status_url);
-
-            if let Some(api_key) = node.get_api_key() {
-                request = request.header(API_KEY_HEADER, api_key);
-            }
+            let request = client.get(&status_url);
 
             let version = match request.send() {
                 Ok(resp) if resp.status().is_success() => match resp.json::<StatusResponse>() {
@@ -1025,13 +1161,10 @@ fn run_status(
 
     drop(target_tx); // Close tx so rx finishes when discovery is done
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(get_default_timeout())
-        .build()?;
+    let client = ca::build_client()?;
 
     let seen_targets = Arc::new(Mutex::new(HashSet::new()));
     let node_reports = Arc::new(Mutex::new(Vec::<(String, bool, bool)>::new()));
-    let active_profile_arc = Arc::new(active_profile.cloned());
 
     let pb = if native_supported {
         let pb = ProgressBar::new(0);
@@ -1056,7 +1189,6 @@ fn run_status(
             let client = client.clone();
             let seen_targets = Arc::clone(&seen_targets);
             let node_reports = Arc::clone(&node_reports);
-            let profile = Arc::clone(&active_profile_arc);
             let pb = pb.clone();
             let multi = multi.clone();
             let native = Arc::clone(&native);
@@ -1074,7 +1206,7 @@ fn run_status(
                 }
 
                 let (status, message, details, failed, outdated) =
-                    query_status(&client, &target_addr, profile.as_ref().as_ref());
+                    query_status(&client, &target_addr);
 
                 if failed {
                     any_failed.store(true, Ordering::Relaxed);
@@ -1157,26 +1289,11 @@ fn run_status(
 fn query_status(
     client: &reqwest::blocking::Client,
     target: &str,
-    active_profile: Option<&ProfileConfig>,
 ) -> (String, String, String, bool, bool) {
     let url = resolve_url(target);
     let status_url = format!("{}{}", url, PATH_STATUS);
 
-    let mut request = client.get(&status_url);
-
-    if let Some(profile) = active_profile {
-        if let Some(node) = profile
-            .nodes
-            .iter()
-            .find(|n| n.address == target || n.name.as_ref() == Some(&target.to_string()))
-        {
-            if let Some(api_key) = node.get_api_key() {
-                request = request.header(API_KEY_HEADER, api_key);
-            }
-        }
-    }
-
-    match request.send() {
+    match client.get(&status_url).send() {
         Ok(resp) => {
             let status = resp.status().to_string();
             if resp.status().is_success() {
@@ -1293,12 +1410,12 @@ fn resolve_url(target: &str) -> String {
         let port = parts.last().unwrap();
 
         if host.contains(':') && !host.starts_with('[') {
-            format!("http://[{}]:{}", host, port)
+            format!("https://[{}]:{}", host, port)
         } else {
-            format!("http://{}:{}", host, port)
+            format!("https://{}:{}", host, port)
         }
     } else {
-        format!("http://{}", target.trim_end_matches('/'))
+        format!("https://{}", target.trim_end_matches('/'))
     }
 }
 
@@ -1332,9 +1449,7 @@ fn run_node(
         return Ok(());
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(get_default_timeout())
-        .build()?;
+    let client = ca::build_client()?;
 
     let mut tw = TabWriter::new(io::stdout());
     writeln!(tw, "TARGET\tSTATUS")?;
@@ -1344,21 +1459,9 @@ fn run_node(
 
         let (status, body, updates) = if reboot {
             let reboot_url = format!("{}{}", url, PATH_REBOOT);
-            let mut request = client
+            let request = client
                 .post(&reboot_url)
                 .json(&brewmble_rest::RebootRequest::default());
-
-            if let Some(profile) = active_profile {
-                if let Some(node) = profile
-                    .nodes
-                    .iter()
-                    .find(|n| n.address == target || n.name.as_ref() == Some(&target))
-                {
-                    if let Some(api_key) = node.get_api_key() {
-                        request = request.header(API_KEY_HEADER, api_key);
-                    }
-                }
-            }
 
             match request.send() {
                 Ok(resp) => {
@@ -1372,21 +1475,9 @@ fn run_node(
             }
         } else {
             let upgrade_url = format!("{}{}", url, PATH_UPGRADE);
-            let mut request = client
+            let request = client
                 .post(&upgrade_url)
                 .json(&brewmble_rest::UpgradeRequest { dry_run });
-
-            if let Some(profile) = active_profile {
-                if let Some(node) = profile
-                    .nodes
-                    .iter()
-                    .find(|n| n.address == target || n.name.as_ref() == Some(&target))
-                {
-                    if let Some(api_key) = node.get_api_key() {
-                        request = request.header(API_KEY_HEADER, api_key);
-                    }
-                }
-            }
 
             match request.send() {
                 Ok(resp) => {
