@@ -76,7 +76,10 @@ fn run_config_init(path: Option<&Path>, force: bool) -> Result<(), Box<dyn std::
         .map(PathBuf::from)
         .unwrap_or_else(config::default_config_path);
     config::init_config_file(&target_path, force)?;
-    println!("Configuration template written to {}", target_path.display());
+    println!(
+        "Configuration template written to {}",
+        target_path.display()
+    );
     Ok(())
 }
 
@@ -189,8 +192,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let daemon_config = match config::load_config(&config_path) {
         Ok(cfg) => cfg,
         Err(err) => {
-            error!("failed to load configuration from '{}': {err}", config_path.display());
-            eprintln!("error: failed to load configuration from '{}': {err}", config_path.display());
+            error!(
+                "failed to load configuration from '{}': {err}",
+                config_path.display()
+            );
+            eprintln!(
+                "error: failed to load configuration from '{}': {err}",
+                config_path.display()
+            );
             std::process::exit(1);
         }
     };
@@ -244,7 +253,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &daemon_config.tls.cert,
         &daemon_config.tls.key,
     )?;
-    let mdns_daemon = register_mdns(http_port, &hostname, daemon_config.server.ip);
+    let mdns_daemon = if daemon_config.server.mdns {
+        register_mdns(http_port, &hostname, daemon_config.server.ip)
+    } else {
+        info!("mDNS disabled by configuration");
+        None
+    };
 
     let pm = get_package_manager(
         daemon_config.features.auto_clean,
@@ -509,6 +523,11 @@ fn mdns_properties(hostname: &str) -> Vec<(&str, &str)> {
     vec![("id", hostname), (TXT_TLS, TXT_TLS_VALUE)]
 }
 
+fn mdns_host_name(hostname: &str) -> String {
+    let instance_hostname = hostname.split('.').next().unwrap_or(hostname);
+    format!("brewmbled-{instance_hostname}.local.")
+}
+
 fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<ServiceDaemon> {
     let daemon = match ServiceDaemon::new() {
         Ok(daemon) => {
@@ -523,7 +542,7 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
 
     let instance_hostname = hostname.split('.').next().unwrap_or(hostname);
     let instance = format!("brewmbled-{instance_hostname}");
-    let host_name = format!("{instance_hostname}.local.");
+    let host_name = mdns_host_name(hostname);
     let properties = mdns_properties(hostname);
 
     info!("Registering mDNS service:");
@@ -1085,7 +1104,8 @@ mod tests {
 
     #[test]
     fn test_daemon_startup_from_config_file() {
-        let dir = std::env::temp_dir().join(format!("brewmble-startup-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("brewmble-startup-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
         let (ca_cert, ca_key) = generate_test_ca("test-ca");
@@ -1109,6 +1129,7 @@ mod tests {
                 port: Some(9090),
                 hostname: Some("node-startup".to_string()),
                 ip: None,
+                mdns: true,
             },
             tls: config::TlsConfig {
                 ca_cert: ca_path,
@@ -1130,11 +1151,7 @@ mod tests {
         let loaded = config::load_config(&config_file).unwrap();
         assert!(config::ensure_valid_config(&loaded).is_ok());
 
-        let tls_config = load_tls_config(
-            &loaded.tls.ca_cert,
-            &loaded.tls.cert,
-            &loaded.tls.key,
-        );
+        let tls_config = load_tls_config(&loaded.tls.ca_cert, &loaded.tls.cert, &loaded.tls.key);
         assert!(tls_config.is_ok());
 
         let pm = get_package_manager(
@@ -1165,6 +1182,15 @@ mod tests {
             props
                 .iter()
                 .any(|(k, v)| *k == TXT_TLS && *v == TXT_TLS_VALUE)
+        );
+    }
+
+    #[test]
+    fn test_mdns_host_name() {
+        assert_eq!(mdns_host_name("node1"), "brewmbled-node1.local.");
+        assert_eq!(
+            mdns_host_name("node1.example.com"),
+            "brewmbled-node1.local."
         );
     }
 
@@ -1380,7 +1406,8 @@ mod tests {
             })
         );
 
-        let cli = Cli::try_parse_from(["brewmbled", "-c", "/custom/config.yaml", "config", "show"]).unwrap();
+        let cli = Cli::try_parse_from(["brewmbled", "-c", "/custom/config.yaml", "config", "show"])
+            .unwrap();
         assert_eq!(cli.config, Some(PathBuf::from("/custom/config.yaml")));
         assert_eq!(
             cli.command,
@@ -1408,7 +1435,8 @@ mod tests {
 
     #[test]
     fn test_run_config_init_and_show_and_validate() {
-        let dir = std::env::temp_dir().join(format!("brewmble-cfg-cmd-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("brewmble-cfg-cmd-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let config_file = dir.join("brewmbled.yaml");
 
@@ -1454,6 +1482,7 @@ mod tests {
                 port: Some(4712),
                 hostname: Some("node-1".to_string()),
                 ip: None,
+                mdns: true,
             },
             tls: config::TlsConfig {
                 ca_cert: ca_path,

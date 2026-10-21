@@ -10,6 +10,10 @@ fn default_update_interval_mins() -> u64 {
     DEFAULT_UPDATE_INTERVAL_MINS
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     #[serde(default)]
@@ -21,7 +25,7 @@ pub struct DaemonConfig {
     pub package_manager: PackageManagerConfig,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
@@ -29,6 +33,19 @@ pub struct ServerConfig {
     pub hostname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<IpAddr>,
+    #[serde(default = "default_true")]
+    pub mdns: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: None,
+            hostname: None,
+            ip: None,
+            mdns: default_true(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -204,6 +221,9 @@ server:
   # Explicit IP address to announce via mDNS. Defaults to auto-discovered IP.
   # ip: "192.168.1.10"
 
+  # Enable mDNS service discovery. Defaults to true.
+  # mdns: true
+
 tls:
   # Path to the cluster CA certificate PEM file (required)
   ca_cert: "/etc/brewmble/tls/ca.pem"
@@ -347,38 +367,36 @@ pub fn validate_config(config: &DaemonConfig) -> ValidationReport {
         ));
     } else {
         match std::fs::read_to_string(&config.tls.key) {
-            Ok(pem) => {
-                match rustls_pemfile::private_key(&mut pem.as_bytes()) {
-                    Ok(Some(_)) => {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            if let Ok(metadata) = std::fs::metadata(&config.tls.key) {
-                                let mode = metadata.permissions().mode();
-                                if mode & 0o077 != 0 {
-                                    report.warnings.push(format!(
+            Ok(pem) => match rustls_pemfile::private_key(&mut pem.as_bytes()) {
+                Ok(Some(_)) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(metadata) = std::fs::metadata(&config.tls.key) {
+                            let mode = metadata.permissions().mode();
+                            if mode & 0o077 != 0 {
+                                report.warnings.push(format!(
                                         "TLS daemon private key file '{}' has permissive permissions ({:04o}); recommended is 0600",
                                         config.tls.key.display(),
                                         mode & 0o777
                                     ));
-                                }
                             }
                         }
                     }
-                    Ok(None) => {
-                        report.errors.push(format!(
-                            "TLS daemon private key file '{}' contains no valid private key",
-                            config.tls.key.display()
-                        ));
-                    }
-                    Err(e) => {
-                        report.errors.push(format!(
-                            "TLS daemon private key file '{}' is invalid: {e}",
-                            config.tls.key.display()
-                        ));
-                    }
                 }
-            }
+                Ok(None) => {
+                    report.errors.push(format!(
+                        "TLS daemon private key file '{}' contains no valid private key",
+                        config.tls.key.display()
+                    ));
+                }
+                Err(e) => {
+                    report.errors.push(format!(
+                        "TLS daemon private key file '{}' is invalid: {e}",
+                        config.tls.key.display()
+                    ));
+                }
+            },
             Err(e) => {
                 report.errors.push(format!(
                     "TLS daemon private key file '{}' cannot be read: {e}",
@@ -423,6 +441,7 @@ tls:
         assert_eq!(config.server.port, None);
         assert_eq!(config.server.hostname, None);
         assert_eq!(config.server.ip, None);
+        assert!(config.server.mdns);
         assert!(!config.features.allow_reboot);
         assert!(!config.features.auto_clean);
         assert!(!config.features.auto_remove);
@@ -436,6 +455,7 @@ server:
   port: 8080
   hostname: test-node
   ip: 10.0.0.1
+  mdns: false
 tls:
   ca_cert: ./ca.pem
   cert: ./cert.pem
@@ -454,6 +474,7 @@ package_manager:
             config.server.ip,
             Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
         );
+        assert!(!config.server.mdns);
         assert_eq!(config.tls.ca_cert, PathBuf::from("./ca.pem"));
         assert_eq!(config.tls.cert, PathBuf::from("./cert.pem"));
         assert_eq!(config.tls.key, PathBuf::from("./key.pem"));
@@ -511,6 +532,7 @@ server:
             PathBuf::from("/etc/brewmble/tls/daemon-key.pem")
         );
         assert_eq!(config.server.port, None);
+        assert!(config.server.mdns);
         assert_eq!(config.package_manager.update_interval_mins, 360);
     }
 
@@ -605,6 +627,7 @@ server:
                 port: Some(4712),
                 hostname: Some("node-1".to_string()),
                 ip: None,
+                mdns: true,
             },
             tls: TlsConfig {
                 ca_cert: ca_path,

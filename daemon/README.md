@@ -24,7 +24,7 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
 
 ## Features
 
-- **mDNS Registration**: Automatically announces itself on the local network as `_brewmble._tcp.local.` with the instance name `brewmbled-<hostname>` and TXT properties `id=<hostname>` and `tls=mtls`.
+- **mDNS Registration**: Automatically announces itself on the local network as `_brewmble._tcp.local.` with the instance name `brewmbled-<hostname>` and TXT properties `id=<hostname>` and `tls=mtls`. Publishes A/AAAA records under a dedicated `brewmbled-<hostname>.local` host label to avoid colliding with the system mDNS responder. Can be disabled with `server.mdns: false`.
 - **Multi-backend Support**: Automatically detects and uses the available package manager (APT or Homebrew).
 - **System Status**: Reports whether the system is up-to-date and lists available updates.
 - **Package Management**: Can trigger a full system upgrade via the detected package manager.
@@ -255,6 +255,9 @@ server:
 
   # Explicit IP address for mDNS registration (default: auto-detected).
   ip: "192.168.1.10"
+
+  # Enable mDNS service discovery (default: true).
+  mdns: true
 
 # TLS / mutual TLS certificates (required)
 tls:
