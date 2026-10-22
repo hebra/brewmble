@@ -9,6 +9,7 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
   - [From Source](#from-source)
   - [TLS Setup](#tls-setup)
   - [Using Docker/Podman](#using-dockerpodman)
+  - [Creating a Dedicated User (Linux)](#creating-a-dedicated-user-linux)
   - [Running as a systemd service (Linux)](#running-as-a-systemd-service-linux)
   - [Running as a Launch Agent (macOS)](#running-as-a-launch-agent-macos)
   - [Sudo Configuration](#sudo-configuration)
@@ -71,6 +72,17 @@ podman run -d --net=host --cap-add=CAP_SYS_ADMIN brewmbled
 ```
 
 *Note: `--net=host` is required for mDNS discovery, and `CAP_SYS_ADMIN` (or equivalent) may be needed for APT operations depending on your configuration.*
+
+### Creating a Dedicated User (Linux)
+
+To run the daemon securely as a dedicated service account on Linux:
+
+```bash
+sudo useradd -md /opt/brewmble brewmble
+sudo su brewmble
+```
+
+*Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` commands. See the [Sudo Configuration](#sudo-configuration) section for details.*
 
 ### Running as a systemd service (Linux)
 

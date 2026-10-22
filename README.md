@@ -55,14 +55,6 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.bashrc
 ```
 
-#### Create a local daemon user (Linux)
-```shell
-sudo useradd -md /opt/brewmble brewmble
-sudo su brewmble
-```
-
-*Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` commands. See the [Sudo Configuration section in the Daemon README](./daemon/README.md#sudo-configuration) for details.*
-
 #### Using cargo
 
 ```shell
