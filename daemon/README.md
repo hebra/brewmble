@@ -8,13 +8,15 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
 - [Installation](#installation)
   - [Creating a Dedicated User (Linux)](#creating-a-dedicated-user-linux)
   - [Install Rust and Cargo](#install-rust-and-cargo)
-  - [Using Cargo](#using-cargo)
-  - [From Source](#from-source)
-  - [TLS Setup](#tls-setup)
-  - [Using Docker/Podman](#using-dockerpodman)
-  - [Running as a systemd service (Linux)](#running-as-a-systemd-service-linux)
-  - [Running as a Launch Agent (macOS)](#running-as-a-launch-agent-macos)
-  - [Sudo Configuration](#sudo-configuration)
+  - Install brewmbled daemon
+    - [From Remote Codeberg.org Repository](#from-remote-codebergorg-repository)
+    - [From Local Source](#from-local-source)
+  - [Initial Configuration](#initial-configuration)
+    - [Create Configuration File](#create-configuration-file) 
+    - [TLS Setup](#tls-setup)
+    - [Running as a systemd service (Linux)](#running-as-a-systemd-service-linux)
+    - [Running as a Launch Agent (macOS)](#running-as-a-launch-agent-macos)
+    - [Sudo Configuration](#sudo-configuration)
 - [Configuration](#configuration)
 - [Security and Authentication](#security-and-authentication)
 - [API Endpoints](#api-endpoints)
@@ -43,11 +45,18 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
 To run the daemon securely as a dedicated service account on Linux:
 
 ```bash
-sudo useradd -md /opt/brewmble brewmble
+sudo useradd -md /opt/brewmble -s /bin/bash brewmble
 sudo su brewmble
 ```
 
 *Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` commands. See the [Sudo Configuration](#sudo-configuration) section for details.*
+
+### Install basic build tools (Linux)
+
+```bash
+sudo apt update
+sudo apt install build-essential
+```
 
 ### Install Rust and Cargo
 
@@ -56,13 +65,15 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.bashrc
 ```
 
-### Using Cargo
+### Install brewmbled daemon
+
+#### From Remote Codeberg.org Repository
 
 ```bash
 cargo install --git https://codeberg.org/heb/brewmble.git brewmbled
 ```
 
-### From Source
+#### From Local Source
 
 ```bash
 cargo build --release
@@ -70,7 +81,24 @@ cargo build --release
 
 The binary will be located at `target/release/brewmbled`.
 
-### TLS Setup
+### Initial Configuration
+
+#### Create Configuration File
+
+The brewmbled daemon uses a YAML file for environment-specific configuration.
+To initialise the configuration with default values, run:
+
+```bash
+brewmbled config init
+```
+To edit the configuration using the default editor, run:
+
+```bash
+brewmbled config edit
+```
+
+
+#### TLS Setup
 
 The daemon requires three PEM files from the cluster CA:
 
@@ -88,22 +116,11 @@ The daemon requires three PEM files from the cluster CA:
    ```
 4. Initialize and configure the daemon configuration file with `brewmbled config init` and `brewmbled config edit`, specifying the certificate paths under the `tls:` section.
 
-### Using Docker/Podman
-
-A `Containerfile` is provided for building a container image:
-
-```bash
-podman build -t brewmbled .
-podman run -d --net=host --cap-add=CAP_SYS_ADMIN brewmbled
-```
-
-*Note: `--net=host` is required for mDNS discovery, and `CAP_SYS_ADMIN` (or equivalent) may be needed for APT operations depending on your configuration.*
-
-### Running as a systemd service (Linux)
+#### Running as a systemd service (Linux)
 
 For Linux systems, a sample systemd service file is provided in the `docs` folder.
 
-#### Setup
+##### Setup
 
 1. **Copy the service file**:
    ```bash
@@ -121,7 +138,7 @@ For Linux systems, a sample systemd service file is provided in the `docs` folde
    sudo systemctl daemon-reload
    ```
 
-#### Managing the Service
+##### Managing the Service
 
 - **Start the daemon**:
   ```bash
@@ -153,11 +170,11 @@ For Linux systems, a sample systemd service file is provided in the `docs` folde
   sudo journalctl -u brewmbled
   ```
 
-### Running as a Launch Agent (macOS)
+#### Running as a Launch Agent (macOS)
 
 For macOS, you can run `brewmbled` as a background service for the logged-in user using `launchd`. A sample plist file is provided in the `docs` folder.
 
-#### Setup
+##### Setup
 
 1. **Copy the plist file**:
    ```bash
@@ -178,7 +195,7 @@ For macOS, you can run `brewmbled` as a background service for the logged-in use
    launchctl load ~/Library/LaunchAgents/com.github.hebra.brewmble.brewmbled.plist
    ```
 
-#### Managing the Service
+##### Managing the Service
 
 - **Start the daemon**:
   ```bash
@@ -206,7 +223,7 @@ For macOS, you can run `brewmbled` as a background service for the logged-in use
   tail -f /tmp/com.github.hebra.brewmble.brewmbled.err
   ```
 
-### Sudo Configuration
+#### Sudo Configuration
 
 The `brewmbled` daemon runs as the `brewmble` user but needs to perform package management operations that require root privileges. To enable this, you must configure `sudo` to allow the `brewmble` user to run `apt` commands without a password.
 
