@@ -92,7 +92,10 @@ cd daemon && cargo build --release
    # Check status
    ./cli/target/release/brewmble status --all
 
-    # Trigger upgrade
+   # List configured nodes in active profile
+   ./cli/target/release/brewmble node --list
+
+   # Trigger upgrade
     ./cli/target/release/brewmble node --full-upgrade <node>
     # ("packages" is an alias for "node")
 

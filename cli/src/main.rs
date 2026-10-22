@@ -234,6 +234,10 @@ enum Commands {
         #[arg(long, conflicts_with = "reboot", requires = "full_upgrade")]
         dry_run: bool,
 
+        /// List node names configured in the active profile
+        #[arg(short = 'l', long, conflicts_with_all = ["full_upgrade", "reboot", "dry_run"])]
+        list: bool,
+
         /// Node name(s) configured in the active profile
         #[arg(num_args = 0..)]
         nodes: Vec<String>,
@@ -338,12 +342,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             full_upgrade,
             reboot,
             dry_run,
+            list,
             nodes,
         }) => {
             if nodes.is_empty() && !config_exists {
                 println!("No config file was found or set.");
             }
-            run_node(full_upgrade, reboot, dry_run, nodes, &config)
+            run_node(full_upgrade, reboot, dry_run, list, nodes, &config)
         }
         Some(Commands::Profile { subcommand }) => {
             run_profile(subcommand, &mut config, &config_path)
@@ -646,6 +651,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run: _,
+            list: _,
             nodes: _,
         }) = cli.command
         {
@@ -663,6 +669,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
+            list: _,
             nodes,
         }) = cli.command
         {
@@ -682,6 +689,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
+            list: _,
             nodes,
         }) = cli.command
         {
@@ -701,6 +709,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
+            list: _,
             nodes,
         }) = cli.command
         {
@@ -720,6 +729,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
+            list: _,
             nodes,
         }) = cli.command
         {
@@ -733,6 +743,87 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_node_list() {
+        let cli = Cli::parse_from(&["brewmble", "node", "--list"]);
+        if let Some(Commands::Node {
+            full_upgrade,
+            reboot,
+            dry_run,
+            list,
+            nodes,
+        }) = cli.command
+        {
+            assert!(!full_upgrade);
+            assert!(!reboot);
+            assert!(!dry_run);
+            assert!(list);
+            assert!(nodes.is_empty());
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_node_list_short() {
+        let cli = Cli::parse_from(&["brewmble", "node", "-l"]);
+        if let Some(Commands::Node {
+            full_upgrade,
+            reboot,
+            dry_run,
+            list,
+            nodes,
+        }) = cli.command
+        {
+            assert!(!full_upgrade);
+            assert!(!reboot);
+            assert!(!dry_run);
+            assert!(list);
+            assert!(nodes.is_empty());
+        } else {
+            panic!("Expected Node command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_packages_list() {
+        let cli = Cli::parse_from(&["brewmble", "packages", "--list"]);
+        if let Some(Commands::Node {
+            full_upgrade,
+            reboot,
+            dry_run,
+            list,
+            nodes,
+        }) = cli.command
+        {
+            assert!(!full_upgrade);
+            assert!(!reboot);
+            assert!(!dry_run);
+            assert!(list);
+            assert!(nodes.is_empty());
+        } else {
+            panic!("Expected Node command via packages alias");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_node_list_conflicts_with_upgrade() {
+        let result = Cli::try_parse_from(&["brewmble", "node", "--list", "--full-upgrade"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parse_node_list_conflicts_with_reboot() {
+        let result = Cli::try_parse_from(&["brewmble", "node", "-l", "-r"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parse_node_list_conflicts_with_dry_run() {
+        let result = Cli::try_parse_from(&["brewmble", "node", "--list", "--dry-run"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_cli_parse_node_reboot_conflicts_with_dry_run() {
         let result = Cli::try_parse_from(&["brewmble", "node", "--reboot", "--dry-run"]);
         assert!(result.is_err());
@@ -743,6 +834,76 @@ mod tests {
         let result = Cli::try_parse_from(&["brewmble", "node", "node1"]);
         // Clap does not know the mutual requirement, so parsing succeeds and run_node errors.
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_node_no_action_specified() {
+        let config = Config::default();
+        let err = run_node(false, false, false, false, vec![], &config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "either --full-upgrade (-u), --reboot (-r), or --list (-l) must be specified"
+        );
+    }
+
+    #[test]
+    fn test_run_node_list_empty_profile() {
+        let config = Config::default();
+        let result = run_node(false, false, false, true, vec![], &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_node_list_with_nodes() {
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![
+            NodeConfig {
+                name: Some("node-1".to_string()),
+                address: "192.168.1.10:4712".to_string(),
+            },
+            NodeConfig {
+                name: None,
+                address: "192.168.1.50:4712".to_string(),
+            },
+        ];
+
+        let result = run_node(false, false, false, true, vec![], &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_node_list_specific_node() {
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![
+            NodeConfig {
+                name: Some("node-1".to_string()),
+                address: "192.168.1.10:4712".to_string(),
+            },
+        ];
+
+        let result = run_node(
+            false,
+            false,
+            false,
+            true,
+            vec!["node-1".to_string()],
+            &config,
+        );
+        assert!(result.is_ok());
+
+        let err = run_node(
+            false,
+            false,
+            false,
+            true,
+            vec!["unknown".to_string()],
+            &config,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Node 'unknown' not found in profile 'default'"
+        );
     }
 
     #[test]
@@ -1536,11 +1697,14 @@ fn run_node(
     full_upgrade: bool,
     reboot: bool,
     dry_run: bool,
+    list: bool,
     nodes: Vec<String>,
     config: &Config,
 ) -> Result<(), Box<dyn Error>> {
-    if !full_upgrade && !reboot {
-        return Err("either --full-upgrade (-u) or --reboot (-r) must be specified".into());
+    if !full_upgrade && !reboot && !list {
+        return Err(
+            "either --full-upgrade (-u), --reboot (-r), or --list (-l) must be specified".into(),
+        );
     }
 
     if dry_run && !full_upgrade {
@@ -1551,6 +1715,14 @@ fn run_node(
 
     if target_nodes.is_empty() {
         println!("No nodes found.");
+        return Ok(());
+    }
+
+    if list {
+        for node in target_nodes {
+            let name = node.name.as_deref().unwrap_or(&node.address);
+            println!("{}", name);
+        }
         return Ok(());
     }
 

@@ -59,9 +59,13 @@ Targets are resolved against the active profile by name or address, and the outp
 
 ### Node Management
 
-Trigger a full system upgrade or reboot on target nodes configured in the active profile. The `node` command is also available under the alias `packages`:
+Trigger a full system upgrade, reboot target nodes, or list nodes configured in the active profile. The `node` command is also available under the alias `packages`:
 
 ```bash
+# List all nodes configured in the active profile
+brewmble node --list
+# or: brewmble node -l
+
 # Upgrade all nodes from the active profile
 brewmble node --full-upgrade
 # or: brewmble packages -u
