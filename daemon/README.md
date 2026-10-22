@@ -6,10 +6,12 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
 
 - [Features](#features)
 - [Installation](#installation)
+  - [Creating a Dedicated User (Linux)](#creating-a-dedicated-user-linux)
+  - [Install Rust and Cargo](#install-rust-and-cargo)
+  - [Using Cargo](#using-cargo)
   - [From Source](#from-source)
   - [TLS Setup](#tls-setup)
   - [Using Docker/Podman](#using-dockerpodman)
-  - [Creating a Dedicated User (Linux)](#creating-a-dedicated-user-linux)
   - [Running as a systemd service (Linux)](#running-as-a-systemd-service-linux)
   - [Running as a Launch Agent (macOS)](#running-as-a-launch-agent-macos)
   - [Sudo Configuration](#sudo-configuration)
@@ -35,6 +37,30 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
 - **Port Hunting**: Automatically finds an available port starting from 4712 if not specified.
 
 ## Installation
+
+### Creating a Dedicated User (Linux)
+
+To run the daemon securely as a dedicated service account on Linux:
+
+```bash
+sudo useradd -md /opt/brewmble brewmble
+sudo su brewmble
+```
+
+*Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` commands. See the [Sudo Configuration](#sudo-configuration) section for details.*
+
+### Install Rust and Cargo
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.bashrc
+```
+
+### Using Cargo
+
+```bash
+cargo install --git https://codeberg.org/heb/brewmble.git brewmbled
+```
 
 ### From Source
 
@@ -72,17 +98,6 @@ podman run -d --net=host --cap-add=CAP_SYS_ADMIN brewmbled
 ```
 
 *Note: `--net=host` is required for mDNS discovery, and `CAP_SYS_ADMIN` (or equivalent) may be needed for APT operations depending on your configuration.*
-
-### Creating a Dedicated User (Linux)
-
-To run the daemon securely as a dedicated service account on Linux:
-
-```bash
-sudo useradd -md /opt/brewmble brewmble
-sudo su brewmble
-```
-
-*Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` commands. See the [Sudo Configuration](#sudo-configuration) section for details.*
 
 ### Running as a systemd service (Linux)
 
