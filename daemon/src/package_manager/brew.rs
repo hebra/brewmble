@@ -2,12 +2,13 @@ use super::{CommandRunner, PackageManager, RealCommandRunner};
 use async_trait::async_trait;
 use std::io;
 use std::process::Output;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 pub struct Brew {
-    pub runner: Box<dyn CommandRunner>,
+    pub runner: Arc<dyn CommandRunner>,
     pub auto_clean: bool,
     pub auto_remove: bool,
     pub last_update: Mutex<Option<Instant>>,
@@ -17,7 +18,7 @@ pub struct Brew {
 impl Brew {
     pub fn new(auto_clean: bool, auto_remove: bool, update_interval_mins: u64) -> Self {
         Self {
-            runner: Box::new(RealCommandRunner),
+            runner: Arc::new(RealCommandRunner),
             auto_clean,
             auto_remove,
             last_update: Mutex::new(None),
@@ -46,6 +47,24 @@ impl Brew {
 
         Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "brew not found")))
     }
+
+    async fn run_brew_async(&self, args: &'static [&'static str]) -> io::Result<Output> {
+        let runner = self.runner.clone();
+        tokio::task::spawn_blocking(move || {
+            let paths = ["brew", "/opt/homebrew/bin/brew", "/usr/local/bin/brew"];
+            let mut last_err = None;
+            for path in paths {
+                match runner.run(path, args) {
+                    Ok(output) => return Ok(output),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(last_err
+                .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "brew not found")))
+        })
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    }
 }
 
 #[async_trait]
@@ -72,7 +91,7 @@ impl PackageManager for Brew {
 
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let should_update = {
-            let last_update = self.last_update.lock().unwrap();
+            let last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
             match *last_update {
                 Some(last) if self.cache_ttl.as_secs() > 0 => last.elapsed() >= self.cache_ttl,
                 _ => true,
@@ -81,7 +100,7 @@ impl PackageManager for Brew {
 
         if should_update {
             info!("updating brew formulae...");
-            let output = self.run_brew(&["update"])?;
+            let output = self.run_brew_async(&["update"]).await?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let err_msg = format!(
@@ -92,7 +111,7 @@ impl PackageManager for Brew {
                 return Err(err_msg.into());
             }
             // Update the last update time
-            let mut last_update = self.last_update.lock().unwrap();
+            let mut last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
             *last_update = Some(Instant::now());
         } else {
             info!(
@@ -102,7 +121,7 @@ impl PackageManager for Brew {
         }
 
         info!("determining available updates...");
-        let output = self.run_brew(&["outdated", "--quiet"])?;
+        let output = self.run_brew_async(&["outdated", "--quiet"]).await?;
 
         if !output.status.success() {
             let err_msg = format!(
@@ -132,7 +151,7 @@ impl PackageManager for Brew {
 
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("starting brew upgrade");
-        let output = self.run_brew(&["upgrade"]);
+        let output = self.run_brew_async(&["upgrade"]).await;
 
         match output {
             Ok(output) => {
@@ -261,7 +280,7 @@ mod tests {
             stderr: "".to_string(),
         };
         let brew = Brew {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -278,7 +297,7 @@ mod tests {
             stderr: "".to_string(),
         };
         let brew = Brew {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -296,7 +315,7 @@ mod tests {
             stderr: "brew error".to_string(),
         };
         let brew = Brew {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -315,7 +334,7 @@ mod tests {
             stderr: "".to_string(),
         };
         let brew = Brew {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -333,7 +352,7 @@ mod tests {
             stderr: "".to_string(),
         };
         let brew = Brew {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -366,7 +385,7 @@ mod tests {
             calls: calls.clone(),
         };
         let brew = Brew {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -397,7 +416,7 @@ mod tests {
             calls: calls2.clone(),
         };
         let brew2 = Brew {
-            runner: Box::new(runner2),
+            runner: Arc::new(runner2),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -434,7 +453,7 @@ mod tests {
             calls: calls.clone(),
         };
         let brew = Brew {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: true,
             auto_remove: true,
             last_update: Mutex::new(None),
@@ -473,7 +492,7 @@ mod tests {
             calls: calls.clone(),
         };
         let brew = Brew {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -520,7 +539,7 @@ mod tests {
             calls: calls.clone(),
         };
         let brew = Brew {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: true,
             auto_remove: false,
             last_update: Mutex::new(None),

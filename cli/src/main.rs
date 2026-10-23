@@ -1,6 +1,6 @@
 use brewmble_rest::{
-    RebootResponse, StatusResponse, UpgradeResponse, PATH_REBOOT, PATH_STATUS, PATH_UPGRADE,
-    SERVICE_DOMAIN, SERVICE_TYPE, TXT_TLS,
+    PATH_REBOOT, PATH_STATUS, PATH_UPGRADE, RebootResponse, SERVICE_DOMAIN, SERVICE_TYPE,
+    StatusResponse, TXT_TLS, UpgradeResponse,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use flume::RecvTimeoutError;
@@ -19,8 +19,12 @@ use std::time::{Duration, Instant};
 use tabwriter::TabWriter;
 
 mod ca;
+mod pin;
 mod progress;
+mod sanitize;
+use pin::{PinOutcome, check_pin};
 use progress::NativeProgress;
+use sanitize::sanitize_display;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config {
@@ -56,35 +60,52 @@ struct ProfileConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct NodeConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    address: String,
+pub(crate) struct NodeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    pub(crate) address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fingerprint: Option<String>,
 }
 
 fn resolve_config_path(explicit_path: Option<PathBuf>) -> (PathBuf, bool) {
+    resolve_config_path_inner(
+        explicit_path,
+        std::env::home_dir(),
+        PathBuf::from(".brewmble.yaml"),
+    )
+}
+
+fn resolve_config_path_inner(
+    explicit_path: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+    local_path: PathBuf,
+) -> (PathBuf, bool) {
     if let Some(path) = explicit_path {
         return (path, true);
     }
 
-    if let Some(mut home) = home::home_dir() {
+    if let Some(mut home) = home_dir.clone() {
         home.push(".brewmble.yaml");
         if home.exists() {
             return (home, true);
         }
     }
 
-    let local_path = PathBuf::from(".brewmble.yaml");
     if local_path.exists() {
-        (local_path, true)
+        eprintln!(
+            "using config from current directory: {}",
+            local_path.display()
+        );
+        return (local_path, true);
+    }
+
+    // Never auto-create a config in the current working directory.
+    if let Some(mut home) = home_dir {
+        home.push(".brewmble.yaml");
+        (home, false)
     } else {
-        // Default to home dir if it exists
-        if let Some(mut home) = home::home_dir() {
-            home.push(".brewmble.yaml");
-            (home, false)
-        } else {
-            (local_path, false)
-        }
+        (local_path, false)
     }
 }
 
@@ -93,7 +114,7 @@ fn load_config(path: &Path) -> Result<Config, Box<dyn Error>> {
         return Ok(Config::default());
     }
     let content = fs::read_to_string(path)?;
-    let mut config: Config = serde_yaml::from_str(&content)?;
+    let mut config: Config = serde_yaml_ng::from_str(&content)?;
 
     // Migration: Move old nodes to default profile
     if !config.nodes.is_empty() {
@@ -102,6 +123,15 @@ fn load_config(path: &Path) -> Result<Config, Box<dyn Error>> {
             .entry(default_profile_name())
             .or_insert_with(ProfileConfig::default);
         profile.nodes.extend(config.nodes.drain(..));
+    }
+
+    // Sanitize node names to avoid terminal escape injection from config
+    for profile in config.profiles.values_mut() {
+        for node in &mut profile.nodes {
+            if let Some(name) = node.name.take() {
+                node.name = Some(sanitize_display(&name));
+            }
+        }
     }
 
     // Ensure active profile exists
@@ -115,8 +145,54 @@ fn load_config(path: &Path) -> Result<Config, Box<dyn Error>> {
 }
 
 fn save_config(path: &Path, config: &Config) -> Result<(), Box<dyn Error>> {
-    let content = serde_yaml::to_string(config)?;
-    fs::write(path, content)?;
+    let content = serde_yaml_ng::to_string(config)?;
+    write_config_atomically(path, &content)?;
+    Ok(())
+}
+
+fn update_node_fingerprint(config: &mut Config, address: &str, fingerprint: &str) {
+    let active = config.active_profile.clone();
+    if let Some(profile) = config.profiles.get_mut(&active) {
+        if let Some(node) = profile.nodes.iter_mut().find(|n| n.address == address) {
+            node.fingerprint = Some(fingerprint.to_string());
+        }
+    }
+}
+
+fn validate_and_update_pins(
+    config: &mut Config,
+    nodes: &[NodeConfig],
+) -> Result<bool, Box<dyn Error>> {
+    let mut updated = false;
+    for node in nodes {
+        match check_pin(node, &node.address) {
+            Ok(PinOutcome::Learned(fp)) => {
+                println!("Pinned {} {}", pin::node_name(node), fp);
+                update_node_fingerprint(config, &node.address, &fp);
+                updated = true;
+            }
+            Ok(PinOutcome::Matched) => {}
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+    Ok(updated)
+}
+
+fn write_config_atomically(path: &Path, content: &str) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        io::Write::write_all(&mut file, content.as_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -149,7 +225,14 @@ fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
             let node = &mut profile.nodes[index];
             let mut node_updated = false;
             if node.address != addr {
+                let name = pin::node_name(node).to_string();
                 node.address = addr;
+                if node.fingerprint.take().is_some() {
+                    eprintln!(
+                        "warning: address changed for {}; cleared stored fingerprint — re-pinning required",
+                        name
+                    );
+                }
                 node_updated = true;
             }
             if node.name != new_name {
@@ -163,6 +246,7 @@ fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
             profile.nodes.push(NodeConfig {
                 name: new_name,
                 address: addr,
+                fingerprint: None,
             });
             updated = true;
         }
@@ -235,8 +319,12 @@ enum Commands {
         dry_run: bool,
 
         /// List node names configured in the active profile
-        #[arg(short = 'l', long, conflicts_with_all = ["full_upgrade", "reboot", "dry_run"])]
+        #[arg(short = 'l', long, conflicts_with_all = ["full_upgrade", "reboot", "dry_run", "repin"])]
         list: bool,
+
+        /// Re-pin a node after its certificate has changed
+        #[arg(long, conflicts_with_all = ["full_upgrade", "reboot", "dry_run", "list"])]
+        repin: Option<String>,
 
         /// Node name(s) configured in the active profile
         #[arg(num_args = 0..)]
@@ -336,26 +424,38 @@ fn main() -> Result<(), Box<dyn Error>> {
             if targets.is_empty() && !all && !config_exists {
                 println!("No config file was found or set.");
             }
-            run_status(all, targets, &config)
+            run_status(all, targets, &mut config, &config_path)
         }
         Some(Commands::Node {
             full_upgrade,
             reboot,
             dry_run,
             list,
+            repin,
             nodes,
         }) => {
-            if nodes.is_empty() && !config_exists {
+            if nodes.is_empty() && !config_exists && repin.is_none() {
                 println!("No config file was found or set.");
             }
-            run_node(full_upgrade, reboot, dry_run, list, nodes, &config)
+            if let Some(name) = repin {
+                return run_repin(&name, &mut config, &config_path);
+            }
+            run_node(
+                full_upgrade,
+                reboot,
+                dry_run,
+                list,
+                nodes,
+                &mut config,
+                &config_path,
+            )
         }
         Some(Commands::Profile { subcommand }) => {
             run_profile(subcommand, &mut config, &config_path)
         }
         Some(Commands::Ca { subcommand }) => run_ca(subcommand),
         Some(Commands::Cert { subcommand }) => run_cert(subcommand),
-        Some(Commands::Version) => run_version(&config),
+        Some(Commands::Version) => run_version(&mut config, &config_path),
         None => {
             // This case might be reached if only options are provided but no command.
             // However, clap handles --help and --version automatically.
@@ -428,7 +528,11 @@ fn run_profile(
                 save_config(config_path, config)?;
             }
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-            let status = std::process::Command::new(editor)
+            let mut parts = editor.split_whitespace();
+            let program = parts.next().unwrap_or("vi");
+            let extra_args: Vec<&str> = parts.collect();
+            let status = std::process::Command::new(program)
+                .args(extra_args)
                 .arg(config_path)
                 .status()?;
             if !status.success() {
@@ -447,13 +551,15 @@ fn run_ca(subcommand: CaCommands) -> Result<(), Box<dyn Error>> {
             }
             if force {
                 let _ = keyring::Entry::new("brewmble-cli", "cluster-ca-cert")
-                    .and_then(|e| e.delete_password());
+                    .and_then(|e| e.delete_credential());
                 let _ = keyring::Entry::new("brewmble-cli", "cluster-ca-key")
-                    .and_then(|e| e.delete_password());
+                    .and_then(|e| e.delete_credential());
             }
             let (cert, _key) = ca::ensure_ca()?;
             println!("Cluster CA created.");
-            println!("Fingerprint: {}", ca::fingerprint(&cert)?);
+            println!("  CN:   brewmble-cluster-ca");
+            println!("  Days: {}", ca::CA_VALIDITY_DAYS);
+            println!("  SHA256 fingerprint: {}", ca::fingerprint(&cert)?);
         }
         CaCommands::Show => {
             let entry = keyring::Entry::new("brewmble-cli", "cluster-ca-cert")?;
@@ -490,7 +596,7 @@ fn run_cert(subcommand: CertCommands) -> Result<(), Box<dyn Error>> {
                 let (cert, key) = ca::issue_leaf(&cn, ca::LeafKind::Daemon)?;
 
                 std::fs::write(&ca_path, ca_cert)?;
-                std::fs::write(&cert_path, cert)?;
+                std::fs::write(&cert_path, &cert)?;
                 std::fs::write(&key_path, key)?;
 
                 #[cfg(unix)]
@@ -502,6 +608,11 @@ fn run_cert(subcommand: CertCommands) -> Result<(), Box<dyn Error>> {
                 }
 
                 println!("Daemon certificate written to {}", out_dir.display());
+                println!("  CN:   {}", cn);
+                println!("  SAN:  DNS:{}", cn);
+                println!("  EKU:  ServerAuth");
+                println!("  Days: {}", ca::LEAF_VALIDITY_DAYS);
+                println!("  SHA256 fingerprint: {}", ca::fingerprint(&cert)?);
             }
             CertKind::Client => {
                 if !force
@@ -512,8 +623,13 @@ fn run_cert(subcommand: CertCommands) -> Result<(), Box<dyn Error>> {
                     return Err("client certificate already exists; use --force to re-issue".into());
                 }
                 let hostname = gethostname::gethostname().to_string_lossy().into_owned();
-                ca::issue_leaf(&hostname, ca::LeafKind::Client)?;
+                let (cert, _key) = ca::issue_leaf(&hostname, ca::LeafKind::Client)?;
                 println!("Client certificate issued and stored in the keyring.");
+                println!("  CN:   {}", hostname);
+                println!("  SAN:  DNS:{}", hostname);
+                println!("  EKU:  ClientAuth");
+                println!("  Days: {}", ca::LEAF_VALIDITY_DAYS);
+                println!("  SHA256 fingerprint: {}", ca::fingerprint(&cert)?);
             }
         },
     }
@@ -652,6 +768,7 @@ mod tests {
             reboot,
             dry_run: _,
             list: _,
+            repin: _,
             nodes: _,
         }) = cli.command
         {
@@ -670,6 +787,7 @@ mod tests {
             reboot,
             dry_run,
             list: _,
+            repin: _,
             nodes,
         }) = cli.command
         {
@@ -690,6 +808,7 @@ mod tests {
             reboot,
             dry_run,
             list: _,
+            repin: _,
             nodes,
         }) = cli.command
         {
@@ -710,6 +829,7 @@ mod tests {
             reboot,
             dry_run,
             list: _,
+            repin: _,
             nodes,
         }) = cli.command
         {
@@ -730,6 +850,7 @@ mod tests {
             reboot,
             dry_run,
             list: _,
+            repin: _,
             nodes,
         }) = cli.command
         {
@@ -750,6 +871,7 @@ mod tests {
             reboot,
             dry_run,
             list,
+            repin: _,
             nodes,
         }) = cli.command
         {
@@ -771,6 +893,7 @@ mod tests {
             reboot,
             dry_run,
             list,
+            repin: _,
             nodes,
         }) = cli.command
         {
@@ -792,6 +915,7 @@ mod tests {
             reboot,
             dry_run,
             list,
+            repin: _,
             nodes,
         }) = cli.command
         {
@@ -838,8 +962,17 @@ mod tests {
 
     #[test]
     fn test_run_node_no_action_specified() {
-        let config = Config::default();
-        let err = run_node(false, false, false, false, vec![], &config).unwrap_err();
+        let mut config = Config::default();
+        let err = run_node(
+            false,
+            false,
+            false,
+            false,
+            vec![],
+            &mut config,
+            Path::new(""),
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "either --full-upgrade (-u), --reboot (-r), or --list (-l) must be specified"
@@ -848,8 +981,16 @@ mod tests {
 
     #[test]
     fn test_run_node_list_empty_profile() {
-        let config = Config::default();
-        let result = run_node(false, false, false, true, vec![], &config);
+        let mut config = Config::default();
+        let result = run_node(
+            false,
+            false,
+            false,
+            true,
+            vec![],
+            &mut config,
+            Path::new(""),
+        );
         assert!(result.is_ok());
     }
 
@@ -860,24 +1001,12 @@ mod tests {
             NodeConfig {
                 name: Some("node-1".to_string()),
                 address: "192.168.1.10:4712".to_string(),
+                fingerprint: None,
             },
             NodeConfig {
                 name: None,
                 address: "192.168.1.50:4712".to_string(),
-            },
-        ];
-
-        let result = run_node(false, false, false, true, vec![], &config);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_run_node_list_specific_node() {
-        let mut config = Config::default();
-        config.profiles.get_mut("default").unwrap().nodes = vec![
-            NodeConfig {
-                name: Some("node-1".to_string()),
-                address: "192.168.1.10:4712".to_string(),
+                fingerprint: None,
             },
         ];
 
@@ -886,8 +1015,30 @@ mod tests {
             false,
             false,
             true,
+            vec![],
+            &mut config,
+            Path::new(""),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_node_list_specific_node() {
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
+            name: Some("node-1".to_string()),
+            address: "192.168.1.10:4712".to_string(),
+            fingerprint: None,
+        }];
+
+        let result = run_node(
+            false,
+            false,
+            false,
+            true,
             vec!["node-1".to_string()],
-            &config,
+            &mut config,
+            Path::new(""),
         );
         assert!(result.is_ok());
 
@@ -897,7 +1048,8 @@ mod tests {
             false,
             true,
             vec!["unknown".to_string()],
-            &config,
+            &mut config,
+            Path::new(""),
         )
         .unwrap_err();
         assert_eq!(
@@ -913,10 +1065,12 @@ mod tests {
             NodeConfig {
                 name: Some("node-1".to_string()),
                 address: "192.168.1.10:4712".to_string(),
+                fingerprint: None,
             },
             NodeConfig {
                 name: Some("node-2".to_string()),
                 address: "192.168.1.11:4712".to_string(),
+                fingerprint: None,
             },
         ];
 
@@ -933,10 +1087,12 @@ mod tests {
             NodeConfig {
                 name: Some("node-1".to_string()),
                 address: "192.168.1.10:4712".to_string(),
+                fingerprint: None,
             },
             NodeConfig {
                 name: Some("node-2".to_string()),
                 address: "192.168.1.11:4712".to_string(),
+                fingerprint: None,
             },
         ];
 
@@ -962,10 +1118,10 @@ mod tests {
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: None,
             address: "192.168.1.50:4712".to_string(),
+            fingerprint: None,
         }];
 
-        let resolved =
-            resolve_profile_nodes(&["192.168.1.50:4712".to_string()], &config).unwrap();
+        let resolved = resolve_profile_nodes(&["192.168.1.50:4712".to_string()], &config).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].address, "192.168.1.50:4712");
     }
@@ -1059,12 +1215,30 @@ mod tests {
     #[test]
     fn test_resolve_config_path() {
         let explicit = Some(PathBuf::from("custom.yaml"));
-        let (path, exists) = resolve_config_path(explicit);
+        let (path, exists) = resolve_config_path_inner(explicit, None, PathBuf::from("local.yaml"));
         assert_eq!(path, PathBuf::from("custom.yaml"));
         assert!(exists);
 
-        let (path, _) = resolve_config_path(None);
-        assert!(path.to_string_lossy().contains(".brewmble.yaml"));
+        let temp_dir = std::env::temp_dir().join(format!("brewmble_cfg_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let local = temp_dir.join(".brewmble.yaml");
+        std::fs::write(&local, "profiles:\n").unwrap();
+
+        let (path, exists) = resolve_config_path_inner(None, None, local.clone());
+        assert_eq!(path, local);
+        assert!(exists);
+
+        let home = temp_dir.join("home");
+        let _ = std::fs::create_dir_all(&home);
+        let (path, exists) = resolve_config_path_inner(
+            None,
+            Some(home.clone()),
+            PathBuf::from("does-not-exist.yaml"),
+        );
+        assert_eq!(path, home.join(".brewmble.yaml"));
+        assert!(!exists);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -1095,6 +1269,7 @@ mod tests {
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: None,
             address: "1.1.1.1:8080".to_string(),
+            fingerprint: None,
         }];
 
         let discovered = vec![
@@ -1122,6 +1297,7 @@ mod tests {
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: Some("OldName".to_string()),
             address: "1.1.1.1:8080".to_string(),
+            fingerprint: None,
         }];
 
         let discovered = vec![("1.1.1.1:8080".to_string(), "NewName".to_string())];
@@ -1138,6 +1314,7 @@ mod tests {
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: Some("Custom".to_string()),
             address: "1.1.1.1:8080".to_string(),
+            fingerprint: None,
         }];
 
         let discovered = vec![("1.1.1.1:8080".to_string(), "node1".to_string())];
@@ -1154,6 +1331,7 @@ mod tests {
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: Some("id=raspi1".to_string()),
             address: "1.1.1.1:8080".to_string(),
+            fingerprint: None,
         }];
 
         // Discovered node has the clean name
@@ -1171,6 +1349,7 @@ mod tests {
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
             name: Some("raspi1".to_string()),
             address: "1.1.1.1:8080".to_string(),
+            fingerprint: None,
         }];
 
         // raspi1 changed IP
@@ -1182,6 +1361,24 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].address, "1.1.1.2:8080");
         assert_eq!(nodes[0].name, Some("raspi1".to_string()));
+    }
+
+    #[test]
+    fn test_merge_nodes_clears_fingerprint_on_address_change() {
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
+            name: Some("raspi1".to_string()),
+            address: "1.1.1.1:8080".to_string(),
+            fingerprint: Some("aa:bb".to_string()),
+        }];
+
+        let discovered = vec![("1.1.1.2:8080".to_string(), "raspi1".to_string())];
+
+        let updated = merge_nodes(&mut config, discovered);
+        assert!(updated);
+        let nodes = &config.profiles.get("default").unwrap().nodes;
+        assert_eq!(nodes[0].address, "1.1.1.2:8080");
+        assert!(nodes[0].fingerprint.is_none());
     }
 
     #[test]
@@ -1199,6 +1396,7 @@ mod tests {
         assert_eq!(resolve_url("example.com:80"), "https://example.com:80");
         assert_eq!(resolve_url("::1:8080"), "https://[::1]:8080");
         assert_eq!(resolve_url("[::1]:8080"), "https://[::1]:8080");
+        assert_eq!(resolve_url("::1"), "https://[::1]");
         assert_eq!(resolve_url("localhost"), "https://localhost");
         assert_eq!(resolve_url("1.2.3.4:8080/"), "https://1.2.3.4:8080");
     }
@@ -1233,7 +1431,7 @@ nodes:
     address: "1.2.3.4:8080"
     api_key: "secret-token"
 "#;
-        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let mut config: Config = serde_yaml_ng::from_str(yaml).unwrap();
 
         // Before migration check
         assert_eq!(config.nodes.len(), 1);
@@ -1265,12 +1463,12 @@ fn entry_id(entry: &ResolvedService) -> String {
         .txt_properties
         .iter()
         .find(|p| p.key() == "id")
-        .map(|p| clean_node_id(p.val_str()).to_string())
+        .map(|p| sanitize_display(clean_node_id(p.val_str())))
         .unwrap_or_default()
 }
 
 fn entry_host(entry: &ResolvedService) -> String {
-    entry.host.trim_end_matches('.').to_string()
+    sanitize_display(entry.host.trim_end_matches('.'))
 }
 
 fn entry_addresses(entry: &ResolvedService) -> String {
@@ -1285,10 +1483,7 @@ fn entry_addresses(entry: &ResolvedService) -> String {
 fn entry_instance(entry: &ResolvedService) -> String {
     let fullname = &entry.fullname;
     let suffix = format!(".{}.{}", SERVICE_TYPE.trim_end_matches('.'), SERVICE_DOMAIN);
-    fullname
-        .strip_suffix(&suffix)
-        .unwrap_or(fullname)
-        .to_string()
+    sanitize_display(fullname.strip_suffix(&suffix).unwrap_or(fullname))
 }
 
 fn entry_tls(entry: &ResolvedService) -> String {
@@ -1296,20 +1491,34 @@ fn entry_tls(entry: &ResolvedService) -> String {
         .txt_properties
         .iter()
         .find(|p| p.key() == TXT_TLS)
-        .map(|p| p.val_str().to_string())
+        .map(|p| sanitize_display(p.val_str()))
         .unwrap_or_default()
 }
 
-fn run_version(config: &Config) -> Result<(), Box<dyn Error>> {
+fn run_version(config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Error>> {
     let mut tw = TabWriter::new(std::io::stdout());
     writeln!(tw, "COMPONENT\tVERSION")?;
     writeln!(tw, "CLI (local)\t{}", env!("CARGO_PKG_VERSION"))?;
 
-    let active_profile = config.profiles.get(&config.active_profile);
-    if let Some(profile) = active_profile {
+    let active_profile = config.active_profile.clone();
+    if let Some(profile) = config.profiles.get(&active_profile).cloned() {
         let client = ca::build_client()?;
 
+        let mut pin_updated = false;
         for node in &profile.nodes {
+            match check_pin(node, &node.address) {
+                Ok(PinOutcome::Learned(fp)) => {
+                    println!("Pinned {} {}", pin::node_name(node), fp);
+                    update_node_fingerprint(config, &node.address, &fp);
+                    pin_updated = true;
+                }
+                Ok(PinOutcome::Matched) => {}
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    continue;
+                }
+            }
+
             let url = resolve_url(&node.address);
             let status_url = format!("{}{}", url, PATH_STATUS);
             let request = client.get(&status_url);
@@ -1326,6 +1535,10 @@ fn run_version(config: &Config) -> Result<(), Box<dyn Error>> {
             let name = node.name.as_deref().unwrap_or(&node.address);
             writeln!(tw, "{}\t{}", name, version)?;
         }
+
+        if pin_updated {
+            save_config(config_path, config)?;
+        }
     }
 
     tw.flush()?;
@@ -1335,7 +1548,8 @@ fn run_version(config: &Config) -> Result<(), Box<dyn Error>> {
 fn run_status(
     discover_all: bool,
     targets: Vec<String>,
-    config: &Config,
+    config: &mut Config,
+    config_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let multi = MultiProgress::new();
     let native = Arc::new(NativeProgress::new());
@@ -1346,36 +1560,52 @@ fn run_status(
 
     let (target_tx, target_rx) = flume::unbounded::<(String, Option<String>)>();
 
-    let active_profile = config.profiles.get(&config.active_profile);
+    let active_profile_name = config.active_profile.clone();
+    let profile_nodes = config
+        .profiles
+        .get(&active_profile_name)
+        .map(|p| p.nodes.clone())
+        .unwrap_or_default();
 
-    // 1. Collect explicit targets and profile nodes
-    let mut initial_targets = HashSet::new();
+    // 1. Collect explicit targets and profile nodes, deduplicated by address
+    let mut initial_targets: HashSet<String> = HashSet::new();
     for t in targets {
-        let mut name = None;
-        let mut addr = t.clone();
-        if let Some(profile) = active_profile {
-            if let Some(node) = profile
-                .nodes
-                .iter()
-                .find(|n| n.address == t || n.name.as_ref() == Some(&t))
-            {
-                addr = node.address.clone();
-                name = node.name.clone();
-            }
-        }
-        initial_targets.insert((addr, name));
+        let addr = profile_nodes
+            .iter()
+            .find(|n| n.address == t || n.name.as_ref() == Some(&t))
+            .map(|n| n.address.clone())
+            .unwrap_or(t);
+        initial_targets.insert(addr);
     }
 
     if initial_targets.is_empty() && !discover_all {
-        if let Some(profile) = active_profile {
-            for node in &profile.nodes {
-                initial_targets.insert((node.address.clone(), node.name.clone()));
-            }
+        for node in &profile_nodes {
+            initial_targets.insert(node.address.clone());
         }
     }
 
-    for t in initial_targets {
-        target_tx.send(t)?;
+    // 2. Validate TOFU pins for profile nodes we are about to contact
+    let nodes_to_validate: Vec<NodeConfig> = if initial_targets.is_empty() && discover_all {
+        Vec::new()
+    } else if initial_targets.is_empty() {
+        profile_nodes.clone()
+    } else {
+        profile_nodes
+            .iter()
+            .filter(|n| initial_targets.contains(&n.address))
+            .cloned()
+            .collect()
+    };
+    if validate_and_update_pins(config, &nodes_to_validate)? {
+        save_config(config_path, config)?;
+    }
+
+    for addr in initial_targets {
+        let name = profile_nodes
+            .iter()
+            .find(|n| n.address == addr)
+            .and_then(|n| n.name.clone());
+        target_tx.send((addr, name))?;
     }
 
     // 2. Start discovery in background if requested
@@ -1392,7 +1622,7 @@ fn run_status(
         pb.set_message("Discovering nodes...");
         let tx = target_tx.clone();
         std::thread::spawn(move || {
-            let timeout = Duration::from_secs(5);
+            let timeout = get_default_timeout();
             if let Ok(targets) = discover_targets_with_timeout(timeout) {
                 for (addr, name) in targets {
                     let _ = tx.send((addr, Some(name)));
@@ -1637,9 +1867,30 @@ fn discover_targets_with_timeout(
     Ok(targets)
 }
 
-fn resolve_url(target: &str) -> String {
+pub(crate) fn resolve_url(target: &str) -> String {
+    use std::net::{IpAddr, SocketAddr};
+
     if target.starts_with("http://") || target.starts_with("https://") {
         target.trim_end_matches('/').to_string()
+    } else if let Ok(addr) = target.parse::<SocketAddr>() {
+        match addr {
+            SocketAddr::V6(v6) => format!("https://[{}]:{}", v6.ip(), v6.port()),
+            SocketAddr::V4(v4) => format!("https://{}:{}", v4.ip(), v4.port()),
+        }
+    } else if let Ok(IpAddr::V6(v6)) = target.parse::<IpAddr>() {
+        let is_ipv6_with_port = target.matches(':').count() > 2
+            && target
+                .rsplit_once(':')
+                .map_or(false, |(_, p)| p.chars().all(|c| c.is_ascii_digit()));
+
+        if is_ipv6_with_port {
+            let parts: Vec<&str> = target.split(':').collect();
+            let host = parts[..parts.len() - 1].join(":");
+            let port = parts.last().unwrap();
+            format!("https://[{}]:{}", host, port)
+        } else {
+            format!("https://[{}]", v6)
+        }
     } else if target.contains(':')
         && target
             .split(':')
@@ -1693,13 +1944,62 @@ fn resolve_profile_nodes<'a>(
     }
 }
 
+fn run_repin(name: &str, config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Error>> {
+    let active_profile = config.active_profile.clone();
+    let address = config
+        .profiles
+        .get(&active_profile)
+        .and_then(|p| {
+            p.nodes
+                .iter()
+                .find(|n| n.name.as_deref() == Some(name) || n.address == name)
+                .map(|n| n.address.clone())
+        })
+        .ok_or_else(|| format!("Node '{}' not found in profile '{}'", name, active_profile))?;
+
+    update_node_fingerprint(config, &address, "");
+    if let Some(profile) = config.profiles.get_mut(&active_profile) {
+        if let Some(node) = profile.nodes.iter_mut().find(|n| n.address == address) {
+            node.fingerprint = None;
+        }
+    }
+
+    let node = config
+        .profiles
+        .get(&active_profile)
+        .unwrap()
+        .nodes
+        .iter()
+        .find(|n| n.address == address)
+        .cloned()
+        .unwrap();
+
+    match check_pin(&node, &node.address) {
+        Ok(PinOutcome::Learned(fp)) => {
+            println!("Re-pinned {} {}", pin::node_name(&node), fp);
+            update_node_fingerprint(config, &node.address, &fp);
+            save_config(config_path, config)?;
+            Ok(())
+        }
+        Ok(PinOutcome::Matched) => {
+            println!(
+                "Re-pinned {} (fingerprint unchanged)",
+                pin::node_name(&node)
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn run_node(
     full_upgrade: bool,
     reboot: bool,
     dry_run: bool,
     list: bool,
     nodes: Vec<String>,
-    config: &Config,
+    config: &mut Config,
+    config_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
     if !full_upgrade && !reboot && !list {
         return Err(
@@ -1711,7 +2011,10 @@ fn run_node(
         return Err("--dry-run can only be used with --full-upgrade".into());
     }
 
-    let target_nodes = resolve_profile_nodes(&nodes, config)?;
+    let target_nodes: Vec<NodeConfig> = resolve_profile_nodes(&nodes, config)?
+        .into_iter()
+        .cloned()
+        .collect();
 
     if target_nodes.is_empty() {
         println!("No nodes found.");
@@ -1719,11 +2022,15 @@ fn run_node(
     }
 
     if list {
-        for node in target_nodes {
+        for node in &target_nodes {
             let name = node.name.as_deref().unwrap_or(&node.address);
             println!("{}", name);
         }
         return Ok(());
+    }
+
+    if validate_and_update_pins(config, &target_nodes)? {
+        save_config(config_path, config)?;
     }
 
     let client = ca::build_client()?;
@@ -1731,7 +2038,7 @@ fn run_node(
     let mut tw = TabWriter::new(io::stdout());
     writeln!(tw, "NODE\tSTATUS")?;
 
-    for node in target_nodes {
+    for node in &target_nodes {
         let name = node.name.as_deref().unwrap_or(&node.address);
         let url = resolve_url(&node.address);
 

@@ -17,5 +17,17 @@ User=brewmble
 # Default is brewmbled=info,tower_http=debug,axum::rejection=trace.
 # Environment=RUST_LOG=brewmbled=info
 
+# NOTE: If reboot is enabled, the user below must have a matching sudoers rule:
+#   brewmble ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /usr/sbin/reboot
+# NoNewPrivileges must remain false so sudo can elevate.
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+
 [Install]
 WantedBy=multi-user.target

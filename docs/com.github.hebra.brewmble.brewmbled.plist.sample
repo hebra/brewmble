@@ -22,8 +22,8 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardErrorPath</key>
-    <string>/tmp/com.github.hebra.brewmble.brewmbled.err</string>
+    <string>/Users/USERNAME/Library/Logs/brewmble/brewmbled.err</string>
     <key>StandardOutPath</key>
-    <string>/tmp/com.github.hebra.brewmble.brewmbled.out</string>
+    <string>/Users/USERNAME/Library/Logs/brewmble/brewmbled.out</string>
 </dict>
 </plist>

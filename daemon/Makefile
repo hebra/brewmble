@@ -26,4 +26,5 @@ clean:
 
 container:
 	$(CONTAINER_TOOL) build -t $(IMAGE_NAME) -f Containerfile .
-	$(CONTAINER_TOOL) run --rm --network bridge -p 4712:4712 -p 5353:5353 --name brewmbled $(IMAGE_NAME)
+	# mDNS discovery requires host networking on Linux (or an mDNS reflector).
+	$(CONTAINER_TOOL) run --rm --network host -p 4712:4712 -p 5353:5353/udp --name brewmbled $(IMAGE_NAME)

@@ -1,6 +1,6 @@
 [package]
 name = "brewmbled"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
@@ -15,15 +15,17 @@ mdns-sd = "0.20.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9.34"
-home = "0.5"
+serde_yaml_ng = "0.10"
+time = "0.3"
+x509-parser = "0.17"
 tower = { version = "0.5", features = ["util"] }
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
 
 [dev-dependencies]
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+tempfile = "3"
 time = "0.3"

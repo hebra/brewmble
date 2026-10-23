@@ -33,6 +33,8 @@ pub struct ServerConfig {
     pub hostname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_address: Option<IpAddr>,
     #[serde(default = "default_true")]
     pub mdns: bool,
 }
@@ -43,6 +45,7 @@ impl Default for ServerConfig {
             port: None,
             hostname: None,
             ip: None,
+            bind_address: None,
             mdns: default_true(),
         }
     }
@@ -96,7 +99,7 @@ pub enum ConfigError {
     NotFound { searched_paths: Vec<PathBuf> },
     ExplicitFileNotFound(PathBuf),
     Io(std::io::Error),
-    Parse(serde_yaml::Error),
+    Parse(serde_yaml_ng::Error),
     Validation(Vec<String>),
 }
 
@@ -150,15 +153,15 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
-impl From<serde_yaml::Error> for ConfigError {
-    fn from(err: serde_yaml::Error) -> Self {
+impl From<serde_yaml_ng::Error> for ConfigError {
+    fn from(err: serde_yaml_ng::Error) -> Self {
         ConfigError::Parse(err)
     }
 }
 
 pub fn search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(mut home) = home::home_dir() {
+    if let Some(mut home) = std::env::home_dir() {
         home.push(".config");
         home.push("brewmble");
         home.push("brewmbled.yaml");
@@ -170,7 +173,7 @@ pub fn search_paths() -> Vec<PathBuf> {
 }
 
 pub fn default_config_path() -> PathBuf {
-    if let Some(mut home) = home::home_dir() {
+    if let Some(mut home) = std::env::home_dir() {
         home.push(".config");
         home.push("brewmble");
         home.push("brewmbled.yaml");
@@ -203,7 +206,7 @@ pub fn resolve_config_path(explicit_path: Option<&Path>) -> Result<PathBuf, Conf
 
 pub fn load_config(path: &Path) -> Result<DaemonConfig, ConfigError> {
     let content = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
-    let config: DaemonConfig = serde_yaml::from_str(&content)?;
+    let config: DaemonConfig = serde_yaml_ng::from_str(&content)?;
     Ok(config)
 }
 
@@ -220,6 +223,9 @@ server:
 
   # Explicit IP address to announce via mDNS. Defaults to auto-discovered IP.
   # ip: "192.168.1.10"
+
+  # Local address to bind the HTTPS listener to. Defaults to 0.0.0.0 (all interfaces).
+  # bind_address: "0.0.0.0"
 
   # Enable mDNS service discovery. Defaults to true.
   # mdns: true
@@ -250,14 +256,32 @@ package_manager:
 "#
 }
 
+fn write_config_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        std::io::Write::write_all(&mut file, content.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 pub fn save_config(path: &Path, config: &DaemonConfig) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(ConfigError::Io)?;
         }
     }
-    let serialized = serde_yaml::to_string(config)?;
-    std::fs::write(path, serialized).map_err(ConfigError::Io)?;
+    let serialized = serde_yaml_ng::to_string(config)?;
+    write_config_atomically(path, &serialized).map_err(ConfigError::Io)?;
     Ok(())
 }
 
@@ -274,10 +298,10 @@ pub fn init_config_file(path: &Path, force: bool) -> Result<(), Box<dyn std::err
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(path, default_config_template())?;
+
+    write_config_atomically(path, default_config_template())?;
     Ok(())
 }
-
 pub fn validate_config(config: &DaemonConfig) -> ValidationReport {
     let mut report = ValidationReport::default();
 
@@ -406,6 +430,60 @@ pub fn validate_config(config: &DaemonConfig) -> ValidationReport {
         }
     }
 
+    // Full TLS config load check (pair-match + parse validity)
+    if report.is_valid() {
+        if let Err(e) =
+            crate::load_tls_config(&config.tls.ca_cert, &config.tls.cert, &config.tls.key)
+        {
+            report
+                .errors
+                .push(format!("TLS configuration is invalid: {e}"));
+        }
+    }
+
+    // Expiry and EKU checks on the leaf certificate
+    if report.is_valid() {
+        if let Ok(pem) = std::fs::read_to_string(&config.tls.cert) {
+            if let Ok((_, pem)) = x509_parser::pem::parse_x509_pem(pem.as_bytes()) {
+                if let Ok(cert) = pem.parse_x509() {
+                    let now = x509_parser::time::ASN1Time::now();
+                    let not_after = cert.validity().not_after;
+                    let not_before = cert.validity().not_before;
+
+                    if now < not_before {
+                        report.errors.push(format!(
+                            "TLS daemon certificate is not yet valid (valid from {not_before})"
+                        ));
+                    } else if now > not_after {
+                        report
+                            .errors
+                            .push(format!("TLS daemon certificate expired on {not_after}"));
+                    } else if (not_after - now)
+                        .map(|d| d < time::Duration::seconds(30 * 24 * 60 * 60))
+                        .unwrap_or(false)
+                    {
+                        report.warnings.push(format!(
+                            "TLS daemon certificate expires on {not_after} (less than 30 days)"
+                        ));
+                    }
+
+                    let has_server_auth = cert
+                        .extended_key_usage()
+                        .ok()
+                        .flatten()
+                        .map(|eku| eku.value.server_auth)
+                        .unwrap_or(false);
+                    if !has_server_auth {
+                        report.errors.push(
+                            "TLS daemon certificate missing required ExtendedKeyUsage ServerAuth"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     report
 }
 
@@ -431,7 +509,7 @@ tls:
   cert: /etc/brewmble/daemon.pem
   key: /etc/brewmble/daemon-key.pem
 "#;
-        let config: DaemonConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: DaemonConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.tls.ca_cert, PathBuf::from("/etc/brewmble/ca.pem"));
         assert_eq!(config.tls.cert, PathBuf::from("/etc/brewmble/daemon.pem"));
         assert_eq!(
@@ -467,7 +545,7 @@ features:
 package_manager:
   update_interval_mins: 120
 "#;
-        let config: DaemonConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: DaemonConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.server.port, Some(8080));
         assert_eq!(config.server.hostname, Some("test-node".to_string()));
         assert_eq!(
@@ -490,7 +568,7 @@ package_manager:
 server:
   port: 8080
 "#;
-        let res: Result<DaemonConfig, _> = serde_yaml::from_str(yaml);
+        let res: Result<DaemonConfig, _> = serde_yaml_ng::from_str(yaml);
         assert!(res.is_err());
     }
 
@@ -501,7 +579,7 @@ tls:
   ca_cert: ./ca.pem
   key: ./key.pem
 "#;
-        let res: Result<DaemonConfig, _> = serde_yaml::from_str(yaml);
+        let res: Result<DaemonConfig, _> = serde_yaml_ng::from_str(yaml);
         assert!(res.is_err());
     }
 
@@ -511,14 +589,14 @@ tls:
 server:
   port: [not_a_valid_port
 "#;
-        let res: Result<DaemonConfig, _> = serde_yaml::from_str(yaml);
+        let res: Result<DaemonConfig, _> = serde_yaml_ng::from_str(yaml);
         assert!(res.is_err());
     }
 
     #[test]
     fn test_default_config_template_parsing() {
         let template = default_config_template();
-        let config: DaemonConfig = serde_yaml::from_str(template).unwrap();
+        let config: DaemonConfig = serde_yaml_ng::from_str(template).unwrap();
         assert_eq!(
             config.tls.ca_cert,
             PathBuf::from("/etc/brewmble/tls/ca.pem")
@@ -597,6 +675,35 @@ server:
     }
 
     #[test]
+    fn test_default_bind_address() {
+        let yaml = r#"
+tls:
+  ca_cert: ./ca.pem
+  cert: ./cert.pem
+  key: ./key.pem
+"#;
+        let config: DaemonConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.server.bind_address, None);
+    }
+
+    #[test]
+    fn test_explicit_loopback_bind_address() {
+        let yaml = r#"
+server:
+  bind_address: "127.0.0.1"
+tls:
+  ca_cert: ./ca.pem
+  cert: ./cert.pem
+  key: ./key.pem
+"#;
+        let config: DaemonConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            config.server.bind_address,
+            Some("127.0.0.1".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn test_validation_valid_certs() {
         let temp_dir = std::env::temp_dir().join(format!("brewmble_cert_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
@@ -611,7 +718,8 @@ server:
         let issuer = rcgen::Issuer::new(ca_params_issuer, ca_key);
 
         let daemon_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let daemon_params = rcgen::CertificateParams::default();
+        let mut daemon_params = rcgen::CertificateParams::default();
+        daemon_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         let daemon_cert = daemon_params.signed_by(&daemon_key, &issuer).unwrap();
 
         let ca_path = temp_dir.join("ca.pem");
@@ -627,6 +735,7 @@ server:
                 port: Some(4712),
                 hostname: Some("node-1".to_string()),
                 ip: None,
+                bind_address: None,
                 mdns: true,
             },
             tls: TlsConfig {
@@ -643,5 +752,101 @@ server:
         assert!(ensure_valid_config(&config).is_ok());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn make_test_config_with_certs(
+        ca_cert: rcgen::Certificate,
+        cert: rcgen::Certificate,
+        key: rcgen::KeyPair,
+    ) -> (DaemonConfig, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ca_path = temp_dir.path().join("ca.pem");
+        let cert_path = temp_dir.path().join("daemon.pem");
+        let key_path = temp_dir.path().join("daemon-key.pem");
+
+        fs::write(&ca_path, ca_cert.pem()).unwrap();
+        fs::write(&cert_path, cert.pem()).unwrap();
+        fs::write(&key_path, key.serialize_pem()).unwrap();
+
+        let config = DaemonConfig {
+            server: ServerConfig {
+                port: Some(4712),
+                hostname: Some("node-1".to_string()),
+                ip: None,
+                bind_address: None,
+                mdns: true,
+            },
+            tls: TlsConfig {
+                ca_cert: ca_path,
+                cert: cert_path,
+                key: key_path,
+            },
+            features: FeaturesConfig::default(),
+            package_manager: PackageManagerConfig::default(),
+        };
+        (config, temp_dir)
+    }
+
+    #[test]
+    fn test_validation_expired_cert() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_params_for_issuer = ca_params.clone();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params_for_issuer, ca_key);
+
+        let daemon_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut daemon_params = rcgen::CertificateParams::default();
+        daemon_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        daemon_params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(400);
+        daemon_params.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        let daemon_cert = daemon_params.signed_by(&daemon_key, &issuer).unwrap();
+
+        let (config, _temp_dir) = make_test_config_with_certs(ca_cert, daemon_cert, daemon_key);
+        let report = validate_config(&config);
+        assert!(!report.is_valid());
+        assert!(report.errors.iter().any(|e| e.contains("expired")));
+    }
+
+    #[test]
+    fn test_validation_wrong_eku() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_params_for_issuer = ca_params.clone();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params_for_issuer, ca_key);
+
+        let daemon_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut daemon_params = rcgen::CertificateParams::default();
+        daemon_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let daemon_cert = daemon_params.signed_by(&daemon_key, &issuer).unwrap();
+
+        let (config, _temp_dir) = make_test_config_with_certs(ca_cert, daemon_cert, daemon_key);
+        let report = validate_config(&config);
+        assert!(!report.is_valid());
+        assert!(report.errors.iter().any(|e| e.contains("ServerAuth")));
+    }
+
+    #[test]
+    fn test_validation_mismatched_key() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_params_for_issuer = ca_params.clone();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params_for_issuer, ca_key);
+
+        let daemon_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut daemon_params = rcgen::CertificateParams::default();
+        daemon_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let daemon_cert = daemon_params.signed_by(&daemon_key, &issuer).unwrap();
+
+        let other_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+
+        let (config, _temp_dir) = make_test_config_with_certs(ca_cert, daemon_cert, other_key);
+        let report = validate_config(&config);
+        assert!(!report.is_valid());
     }
 }

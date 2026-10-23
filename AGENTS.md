@@ -19,13 +19,18 @@ This file provides guidance to agents when working with code in this repository.
 - BREWMBLE_TIMEOUT env var accepts both seconds (integer) or humantime format (e.g., "1m", "30s")
 - BREWMBLE_NATIVE_PROGRESS env var controls native terminal progress bars (unset or 1 to enable, 0 to disable); enabled by default
 - Daemon caches 'apt-get update' and 'brew update' results based on their respective update intervals (default 360 mins configured via package_manager.update_interval_mins) - see get_updates()
+- Long-running package-manager subprocesses are wrapped in `tokio::task::spawn_blocking` and share an `Arc<dyn CommandRunner>` for testability
+- `brewmbled config validate` checks TLS file presence, certificate/key pair-match, expiry, and required ExtendedKeyUsage (ServerAuth)
 - CLI uses blocking HTTPS client (reqwest with blocking feature and rustls) while daemon uses async Axum framework over HTTPS
 - Rust edition: uses 2024 across all crates
 - Container builds use podman with ports 4712 (HTTPS) and 5353 (mDNS)
 - Daemon auto-hunts for free port starting from 4712 if server.port is not configured
+- Daemon binds to `server.bind_address` (default 0.0.0.0) for both port probing and the HTTPS listener
 - API authentication is performed via mutual TLS (mTLS); the X-API-Key header has been removed
 - Cluster CA and client certificates are managed by the CLI (`brewmble ca` and `brewmble cert` subcommands) and stored in the OS keyring
 - Daemon requires paths to the cluster CA cert, daemon cert, and daemon key via the `tls:` section in the configuration file
+- CLI uses TOFU-style SHA-256 fingerprint pinning; the first successful connection to a node records its certificate fingerprint in `~/.brewmble.yaml`
+- Reboot feature invokes `/usr/bin/sudo -n /usr/bin/systemctl reboot` with fallback to `/usr/sbin/reboot`; configure a narrow sudoers rule for the daemon user
 
 ## Project Coding Rules (Non-Obvious Only)
 

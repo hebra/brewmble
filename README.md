@@ -120,6 +120,41 @@ Brewmble uses mutual TLS (mTLS) for all CLI-to-daemon communication. A single cl
 - **Client certificate**: `brewmble cert issue --kind client` stores the CLI client certificate in the keyring.
 - **Verification**: The daemon accepts any client certificate signed by the cluster CA. Hostname verification is disabled so DHCP/IP churn does not break connectivity.
 
+#### Certificate Lifecycle and Operational Notes
+
+- **Validity**: Cluster CA certificates are valid for ~10 years; daemon and client leaf certificates are valid for 397 days. Plan renewal before expiry.
+- **Key Usage**: Daemon certificates include `ServerAuth` EKU and a DNS SAN matching the provided `--cn`. Client certificates include `ClientAuth` EKU and a DNS SAN matching the local hostname.
+- **Private keys**: Daemon private keys are written with `0600` permissions. Keep the OS keyring (where the CLI stores CA and client keys) backed up and protected.
+- **Validation**: Run `brewmbled config validate` after rotating daemon certificates. It checks file presence, certificate/key pair-match, expiry (errors if expired, warns if < 30 days), and required EKU.
+- **Rotation workflow**:
+  ```bash
+  # On the admin workstation
+  brewmble cert issue --kind daemon --cn node1 --out-dir ./node1-certs --force
+  # Copy ca.pem, daemon.pem, and daemon-key.pem to the node and update brewmbled.yaml tls: paths
+  brewmbled config validate
+  brewmbled config reload   # if running via systemd
+  ```
+- **Fingerprints**: The CLI logs the SHA-256 fingerprint of every issued certificate. Use `brewmble ca show` to display the CA fingerprint.
+
+### Privilege Model and Service Hardening
+
+The daemon normally runs as an unprivileged user. Only the reboot feature requires elevated privileges, and it is invoked through well-known absolute paths.
+
+- **Reboot commands**: When `features.reboot` is enabled, the daemon uses:
+  - `/usr/bin/sudo -n /usr/bin/systemctl reboot`
+  - fallback: `/usr/bin/sudo -n /usr/sbin/reboot`
+- **Recommended `sudoers` snippet** (use `visudo`):
+  ```sudoers
+  brewmble ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /usr/sbin/reboot
+  ```
+  Replace `brewmble` with the user the daemon runs as. Never grant a blanket `NOPASSWD: ALL` rule.
+- **Systemd unit hardening** (recommended):
+  - Run the daemon as a dedicated user (`User=brewmble`).
+  - Set `Restart=on-failure` and `RestartSec=5`.
+  - Restrict paths with `ProtectSystem=strict`, `ProtectHome=true`, and `ReadWritePaths=/var/lib/brewmble` if needed.
+  - Drop capabilities with `CapabilityBoundingSet=` and allow only `CAP_SYS_BOOT` if reboot is enabled.
+  - Use `NoNewPrivileges=true` and `ProtectKernelTunables=true`.
+
 ### 2. SSH Tunneling
 
 A simple way to secure communication without additional infrastructure:
@@ -183,6 +218,10 @@ To run the daemon build workflow locally:
 ```bash
 act workflow_dispatch
 ```
+
+### Container Notes
+
+The daemon container runs as an unprivileged `brewmble` user. It is intended for brew-less or host-package-manager scenarios; if you need the daemon to perform `apt` operations inside the container, run it as root and supply the required capabilities. mDNS requires `--network host` on Linux or an mDNS reflector; the Makefile target uses host networking and exposes UDP port 5353.
 
 ## License
 

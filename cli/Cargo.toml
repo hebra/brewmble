@@ -1,6 +1,6 @@
 [package]
 name = "brewmble"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
@@ -10,16 +10,16 @@ humantime = "2.3"
 flume = "0.12"
 mdns-sd = "0.20"
 tabwriter = "1.4"
-home = "0.5"
 gethostname = "1.1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 rcgen = "0.14"
+rustls = { version = "0.23", features = ["ring"] }
 sha2 = "0.10"
 time = "0.3"
 rustls-pemfile = "2"
 serde_json = "1.0"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_yaml = "0.9.34"
-keyring = "2.3.2"
+serde_yaml_ng = "0.10"
+keyring = "3"
 rayon = "1.10"
 indicatif = "0.17"

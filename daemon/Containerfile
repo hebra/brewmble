@@ -15,14 +15,19 @@ FROM debian:trixie-slim
 
 RUN apt-get update \
     && apt-get install -y libapt-pkg7.0 \
-    && apt full-upgrade -s
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -r -s /usr/sbin/nologin brewmble
 
 COPY --from=builder /app/target/release/brewmbled /usr/local/bin/brewmbled
 
 # mTLS certificate directory; mount the cluster CA, daemon cert, and daemon key here.
 VOLUME ["/etc/brewmble/tls"]
 
-# Port 4712 serves HTTPS; port 5353 is used for mDNS.
-EXPOSE 4712 5353
+# Port 4712 serves HTTPS; port 5353/udp is used for mDNS.
+EXPOSE 4712
+EXPOSE 5353/udp
+
+USER brewmble
 
 ENTRYPOINT ["/usr/local/bin/brewmbled"]

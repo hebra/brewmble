@@ -13,8 +13,8 @@ const ACCOUNT_CLIENT_CERT: &str = "client-cert";
 const ACCOUNT_CLIENT_KEY: &str = "client-key";
 
 const CA_CN: &str = "brewmble-cluster-ca";
-const CA_VALIDITY_DAYS: i64 = 365 * 10;
-const LEAF_VALIDITY_DAYS: i64 = 397;
+pub const CA_VALIDITY_DAYS: i64 = 365 * 10;
+pub const LEAF_VALIDITY_DAYS: i64 = 397;
 
 pub enum LeafKind {
     Daemon,
@@ -81,17 +81,29 @@ pub fn issue_leaf_with_store(
     Ok((cert, key))
 }
 
-pub fn ca_root() -> Result<reqwest::Certificate, Box<dyn Error>> {
+pub fn ca_root_pem() -> Result<String, Box<dyn Error>> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, ACCOUNT_CA_CERT)?;
-    let pem = entry.get_password()?;
+    Ok(entry.get_password()?)
+}
+
+pub fn ca_root() -> Result<reqwest::Certificate, Box<dyn Error>> {
+    let pem = ca_root_pem()?;
     Ok(reqwest::Certificate::from_pem(pem.as_bytes())?)
 }
 
+pub fn client_cert_pem() -> Result<String, Box<dyn Error>> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, ACCOUNT_CLIENT_CERT)?;
+    Ok(entry.get_password()?)
+}
+
+pub fn client_key_pem() -> Result<String, Box<dyn Error>> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, ACCOUNT_CLIENT_KEY)?;
+    Ok(entry.get_password()?)
+}
+
 pub fn client_identity() -> Result<reqwest::Identity, Box<dyn Error>> {
-    let cert_entry = keyring::Entry::new(KEYRING_SERVICE, ACCOUNT_CLIENT_CERT)?;
-    let key_entry = keyring::Entry::new(KEYRING_SERVICE, ACCOUNT_CLIENT_KEY)?;
-    let cert = cert_entry.get_password()?;
-    let key = key_entry.get_password()?;
+    let cert = client_cert_pem()?;
+    let key = client_key_pem()?;
     let bundle = format!("{}\n{}", cert.trim_end(), key.trim_end());
     Ok(reqwest::Identity::from_pem(bundle.as_bytes())?)
 }
@@ -158,6 +170,7 @@ fn generate_leaf(
     let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
     let mut params = CertificateParams::new(Vec::<String>::new())?;
     params.distinguished_name.push(DnType::CommonName, cn);
+    params.subject_alt_names = vec![rcgen::SanType::DnsName(cn.parse()?)];
 
     match kind {
         LeafKind::Daemon => {

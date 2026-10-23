@@ -46,10 +46,9 @@ To run the daemon securely as a dedicated service account on Linux:
 
 ```bash
 sudo useradd -md /opt/brewmble -s /bin/bash brewmble
-sudo su brewmble
 ```
 
-*Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` commands. See the [Sudo Configuration](#sudo-configuration) section for details.*
+*Note: For Linux systems, you must also configure `sudo` to allow the `brewmble` user to run `apt` and reboot commands. See the [Sudo Configuration](#sudo-configuration) section for details.*
 
 ### Install basic build tools (Linux)
 
@@ -59,6 +58,14 @@ sudo apt install build-essential
 ```
 
 ### Install Rust and Cargo
+
+#### Switch to brewmble user
+
+```bash
+sudo su - brewmble
+```
+
+#### Install Rust toolchain
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -219,8 +226,8 @@ For macOS, you can run `brewmbled` as a background service for the logged-in use
 
 - **View logs**:
   ```bash
-  tail -f /tmp/com.github.hebra.brewmble.brewmbled.out
-  tail -f /tmp/com.github.hebra.brewmble.brewmbled.err
+  tail -f ~/Library/Logs/brewmble/brewmbled.out
+  tail -f ~/Library/Logs/brewmble/brewmbled.err
   ```
 
 #### Sudo Configuration
@@ -235,10 +242,10 @@ The `brewmbled` daemon runs as the `brewmble` user but needs to perform package 
 
 2. **Add the following content**:
    ```text
-   brewmble ALL=(root) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get, /usr/bin/systemctl reboot, /usr/sbin/reboot
+   brewmble ALL=(root) NOPASSWD: /usr/bin/apt-get update, /usr/bin/apt-get -s dist-upgrade, /usr/bin/apt full-upgrade -y, /usr/bin/apt-get autoclean, /usr/bin/apt-get autoremove -y, /usr/bin/systemctl reboot, /usr/sbin/reboot
    ```
 
-   Adjust the paths to match your distribution (`/bin/systemctl`, `/sbin/reboot`, etc.).
+   Adjust the paths to match your distribution if necessary. Use `visudo` to validate the file before saving.
 
 3. **Set correct permissions**:
    The file must have strict permissions:

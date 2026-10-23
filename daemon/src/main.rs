@@ -20,6 +20,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -29,6 +31,13 @@ mod package_manager;
 use package_manager::{PackageManager, get_package_manager};
 
 const DEFAULT_PORT: u16 = 4712;
+
+fn server_bind_ip(config: &config::DaemonConfig) -> IpAddr {
+    config
+        .server
+        .bind_address
+        .unwrap_or_else(|| "0.0.0.0".parse().unwrap())
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "brewmbled", version, disable_version_flag = true)]
@@ -86,7 +95,7 @@ fn run_config_init(path: Option<&Path>, force: bool) -> Result<(), Box<dyn std::
 fn run_config_show(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config::resolve_config_path(path)?;
     let cfg = config::load_config(&config_path)?;
-    let yaml = serde_yaml::to_string(&cfg)?;
+    let yaml = serde_yaml_ng::to_string(&cfg)?;
     print!("{yaml}");
     Ok(())
 }
@@ -105,14 +114,19 @@ fn run_config_edit(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>
     }
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    let status = std::process::Command::new(&editor)
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let extra_args: Vec<&str> = parts.collect();
+    let status = std::process::Command::new(program)
+        .args(extra_args)
         .arg(&target_path)
         .status()
-        .map_err(|e| format!("Failed to launch editor '{editor}': {e}"))?;
+        .map_err(|e| format!("Failed to launch editor '{program}': {e}"))?;
 
     if !status.success() {
-        return Err(format!("Editor '{editor}' exited with status: {status}").into());
+        return Err(format!("Editor '{program}' exited with status: {status}").into());
     }
+
     Ok(())
 }
 
@@ -155,6 +169,23 @@ struct AppState {
     auto_clean: bool,
     auto_remove: bool,
     package_manager: Arc<Box<dyn PackageManager>>,
+    pm_available: bool,
+    pm_version: String,
+    upgrade_handle: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+}
+
+struct UpgradingGuard(Arc<AtomicBool>);
+
+impl UpgradingGuard {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+}
+
+impl Drop for UpgradingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 #[tokio::main]
@@ -212,8 +243,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Loaded configuration from {}", config_path.display());
 
+    let bind_ip = server_bind_ip(&daemon_config);
     let http_port = if let Some(port) = daemon_config.server.port {
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let addr = SocketAddr::from((bind_ip, port));
         let listener = TcpListener::bind(addr).await.map_err(|e| {
             error!("failed to bind to port {port}: {e}");
             e
@@ -223,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let mut port = DEFAULT_PORT;
         loop {
-            let addr = SocketAddr::from(([0, 0, 0, 0], port));
+            let addr = SocketAddr::from((bind_ip, port));
             match TcpListener::bind(addr).await {
                 Ok(listener) => {
                     drop(listener);
@@ -265,11 +297,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         daemon_config.features.auto_remove,
         daemon_config.package_manager.update_interval_mins,
     );
-    info!("using {} package manager backend", pm.name());
-    if !pm.is_available() {
+    let pm_name = pm.name().to_string();
+    let pm_available = pm.is_available();
+    let pm_version = pm.version();
+    info!("using {} package manager backend", pm_name);
+    if !pm_available {
         warn!(
             "The current package manager ({}) is not available on this system.",
-            pm.name()
+            pm_name
         );
     }
 
@@ -279,17 +314,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auto_clean: daemon_config.features.auto_clean,
         auto_remove: daemon_config.features.auto_remove,
         package_manager: Arc::new(pm),
+        pm_available,
+        pm_version,
+        upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
     };
+    let shutdown_state = state.clone();
 
     let app = Router::new()
         .route(PATH_HEALTH, get(health_handler))
         .route(PATH_STATUS, get(status_handler))
         .route(PATH_UPGRADE, post(full_upgrade_handler))
         .route(PATH_REBOOT, post(reboot_handler))
-        .layer(TraceLayer::new_for_http())
+        .layer((
+            TraceLayer::new_for_http(),
+            TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                std::time::Duration::from_secs(300),
+            ),
+        ))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], http_port));
+    let addr = SocketAddr::from((bind_ip, http_port));
     info!("brewmble daemon listening on {}", addr);
 
     let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
@@ -312,6 +357,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("https server error: {err}");
     }
 
+    if let Ok(mut guard) = shutdown_state.upgrade_handle.lock() {
+        if let Some(handle) = guard.take() {
+            let abort_handle = handle.abort_handle();
+            let timeout = tokio::time::Duration::from_secs(30);
+            match tokio::time::timeout(timeout, handle).await {
+                Ok(Ok(())) => info!("upgrade task finished cleanly"),
+                Ok(Err(e)) => error!("upgrade task panicked or was cancelled: {e}"),
+                Err(_) => {
+                    abort_handle.abort();
+                    error!("upgrade task did not finish in time; aborted");
+                }
+            }
+        }
+    }
+
     if let Some(mdns) = mdns_daemon {
         if let Err(err) = mdns.shutdown() {
             error!("mDNS shutdown error: {err}");
@@ -325,7 +385,7 @@ async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
         package_manager: state.package_manager.name().to_string(),
-        package_manager_version: state.package_manager.version(),
+        package_manager_version: state.pm_version.clone(),
         is_upgrading: state.is_upgrading.load(Ordering::SeqCst),
     })
 }
@@ -334,7 +394,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let is_upgrading = state.is_upgrading.load(Ordering::SeqCst);
     let config_flags = (state.allow_reboot, state.auto_clean, state.auto_remove);
 
-    if !state.package_manager.is_available() {
+    if !state.pm_available {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(StatusResponse {
@@ -392,7 +452,7 @@ async fn full_upgrade_handler(
     State(state): State<AppState>,
     Json(payload): Json<UpgradeRequest>,
 ) -> impl IntoResponse {
-    if !state.package_manager.is_available() {
+    if !state.pm_available {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(UpgradeResponse {
@@ -442,15 +502,19 @@ async fn full_upgrade_handler(
         );
     }
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
+        let _guard = UpgradingGuard::new(state.is_upgrading.clone());
         info!("starting full upgrade");
         let result = state.package_manager.full_upgrade().await;
 
         if let Err(e) = result {
             error!("failed to execute full upgrade: {e}");
         }
-        state.is_upgrading.store(false, Ordering::SeqCst);
     });
+
+    if let Ok(mut guard) = state.upgrade_handle.lock() {
+        *guard = Some(handle);
+    }
 
     (
         StatusCode::OK,
@@ -461,11 +525,55 @@ async fn full_upgrade_handler(
     )
 }
 
+#[async_trait::async_trait]
+trait RebootRunner {
+    async fn run(&self, program: &str, args: &[&str]) -> std::io::Result<std::process::ExitStatus>;
+}
+
+struct TokioRebootRunner;
+
+#[async_trait::async_trait]
+impl RebootRunner for TokioRebootRunner {
+    async fn run(&self, program: &str, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
+        tokio::process::Command::new(program)
+            .args(args)
+            .status()
+            .await
+    }
+}
+
+async fn execute_reboot<R: RebootRunner + Send + Sync>(delay_secs: Option<u64>, runner: &R) {
+    if let Some(d) = delay_secs {
+        tokio::time::sleep(std::time::Duration::from_secs(d)).await;
+    }
+
+    match runner
+        .run("/usr/bin/sudo", &["-n", "/usr/bin/systemctl", "reboot"])
+        .await
+    {
+        Ok(status) if status.success() => {
+            info!("system reboot initiated via systemctl");
+            return;
+        }
+        Ok(status) => error!("systemctl reboot failed: exit status {status}"),
+        Err(e) => error!("failed to execute systemctl reboot command: {e}"),
+    }
+
+    match runner
+        .run("/usr/bin/sudo", &["-n", "/usr/sbin/reboot"])
+        .await
+    {
+        Ok(status) if status.success() => info!("system reboot initiated via fallback"),
+        Ok(status) => error!("failed to initiate reboot: fallback exit status {status}"),
+        Err(e) => error!("failed to execute fallback reboot command: {e}"),
+    }
+}
+
 async fn reboot_handler(
     State(state): State<AppState>,
     Json(_payload): Json<RebootRequest>,
 ) -> impl IntoResponse {
-    if !state.package_manager.is_available() {
+    if !state.pm_available {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(RebootResponse {
@@ -495,20 +603,10 @@ async fn reboot_handler(
         );
     }
 
+    let delay = _payload.delay_secs;
     tokio::spawn(async move {
         info!("scheduling system reboot");
-        // Try systemd first, then fall back to the traditional reboot command.
-        let result = tokio::process::Command::new("sudo")
-            .args(["systemctl", "reboot"])
-            .status()
-            .await
-            .or_else(|_| std::process::Command::new("sudo").args(["reboot"]).status());
-
-        match result {
-            Ok(status) if status.success() => info!("system reboot initiated"),
-            Ok(status) => error!("failed to initiate reboot: exit status {}", status),
-            Err(e) => error!("failed to execute reboot command: {e}"),
-        }
+        execute_reboot(delay, &TokioRebootRunner).await;
     });
 
     (
@@ -595,7 +693,7 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
     Some(daemon)
 }
 
-fn load_tls_config(
+pub(crate) fn load_tls_config(
     ca_path: &Path,
     cert_path: &Path,
     key_path: &Path,
@@ -731,6 +829,9 @@ mod tests {
                 name: "mock".to_string(),
                 available: true,
             })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -764,6 +865,9 @@ mod tests {
                 name: "mock".to_string(),
                 available: false,
             })),
+            pm_available: false,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -796,6 +900,9 @@ mod tests {
                 name: "mock".to_string(),
                 available: true,
             })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         let app = Router::new()
             .route(PATH_HEALTH, get(health_handler))
@@ -829,6 +936,9 @@ mod tests {
                 name: "mock".to_string(),
                 available: true,
             })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         let app = Router::new()
             .route(PATH_UPGRADE, post(full_upgrade_handler))
@@ -922,6 +1032,83 @@ mod tests {
         }
     }
 
+    struct PanickingMockPackageManager;
+
+    #[async_trait::async_trait]
+    impl PackageManager for PanickingMockPackageManager {
+        fn name(&self) -> &str {
+            "panic-mock"
+        }
+        fn version(&self) -> String {
+            "1.0.0".to_string()
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        async fn get_updates(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![])
+        }
+        async fn dry_run_upgrade(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![])
+        }
+        async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            panic!("simulated upgrade panic");
+        }
+        fn auto_clean(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn auto_remove(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_full_upgrade_guard_resets_on_panic() {
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
+            package_manager: Arc::new(Box::new(PanickingMockPackageManager)),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let app = Router::new()
+            .route(PATH_UPGRADE, post(full_upgrade_handler))
+            .with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(PATH_UPGRADE)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if !state.is_upgrading.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(!state.is_upgrading.load(Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn test_reboot_handler_allowed() {
         let state = AppState {
@@ -933,6 +1120,9 @@ mod tests {
                 name: "mock".to_string(),
                 available: true,
             })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -966,6 +1156,9 @@ mod tests {
                 name: "mock".to_string(),
                 available: true,
             })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -999,6 +1192,9 @@ mod tests {
                 name: "mock".to_string(),
                 available: true,
             })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -1021,6 +1217,92 @@ mod tests {
         assert_eq!(response.status(), StatusCode::LOCKED);
     }
 
+    struct MockRebootRunner {
+        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+        responses: std::sync::Mutex<Vec<std::io::Result<std::process::ExitStatus>>>,
+    }
+
+    impl MockRebootRunner {
+        fn new(responses: Vec<std::io::Result<std::process::ExitStatus>>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                responses: std::sync::Mutex::new(responses),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RebootRunner for MockRebootRunner {
+        async fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> std::io::Result<std::process::ExitStatus> {
+            self.calls.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            ));
+            self.responses.lock().unwrap().remove(0)
+        }
+    }
+
+    fn exit_success() -> std::process::ExitStatus {
+        std::process::Command::new("true").status().unwrap()
+    }
+
+    fn exit_failure() -> std::process::ExitStatus {
+        std::process::Command::new("false").status().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_execute_reboot_uses_sudo_n() {
+        let runner = MockRebootRunner::new(vec![Ok(exit_success())]);
+        execute_reboot(None, &runner).await;
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "/usr/bin/sudo");
+        assert_eq!(calls[0].1, vec!["-n", "/usr/bin/systemctl", "reboot"]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_reboot_falls_back_on_nonzero() {
+        let runner = MockRebootRunner::new(vec![Ok(exit_failure()), Ok(exit_success())]);
+        execute_reboot(None, &runner).await;
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1, vec!["-n", "/usr/bin/systemctl", "reboot"]);
+        assert_eq!(calls[1].1, vec!["-n", "/usr/sbin/reboot"]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_reboot_falls_back_on_spawn_error() {
+        let runner = MockRebootRunner::new(vec![
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "not found",
+            )),
+            Ok(exit_success()),
+        ]);
+        execute_reboot(None, &runner).await;
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].1, vec!["-n", "/usr/sbin/reboot"]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_reboot_honors_delay() {
+        let runner = MockRebootRunner::new(vec![Ok(exit_success())]);
+        let start = tokio::time::Instant::now();
+        execute_reboot(Some(0), &runner).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= tokio::time::Duration::from_secs(0));
+        assert!(runner.calls().len() == 1);
+    }
+
     #[tokio::test]
     async fn test_status_handler_exposes_config_flags() {
         let state = AppState {
@@ -1032,6 +1314,9 @@ mod tests {
                 name: "mock".to_string(),
                 available: true,
             })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -1129,6 +1414,7 @@ mod tests {
                 port: Some(9090),
                 hostname: Some("node-startup".to_string()),
                 ip: None,
+                bind_address: None,
                 mdns: true,
             },
             tls: config::TlsConfig {
@@ -1165,6 +1451,9 @@ mod tests {
             auto_clean: loaded.features.auto_clean,
             auto_remove: loaded.features.auto_remove,
             package_manager: Arc::new(pm),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
 
         assert!(state.allow_reboot);
@@ -1308,6 +1597,9 @@ mod tests {
                 name: "mock".to_string(),
                 available: true,
             })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         let app = Router::new()
             .route(PATH_HEALTH, get(health_handler))
@@ -1482,6 +1774,7 @@ mod tests {
                 port: Some(4712),
                 hostname: Some("node-1".to_string()),
                 ip: None,
+                bind_address: None,
                 mdns: true,
             },
             tls: config::TlsConfig {

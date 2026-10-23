@@ -1,5 +1,8 @@
 use super::{CommandRunner, PackageManager, RealCommandRunner};
 use async_trait::async_trait;
+use std::io;
+use std::process::Output;
+use std::sync::Arc;
 #[cfg(any(target_os = "linux", test))]
 use std::sync::Mutex;
 #[cfg(any(target_os = "linux", test))]
@@ -7,7 +10,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 pub struct Apt {
-    pub runner: Box<dyn CommandRunner>,
+    pub runner: Arc<dyn CommandRunner>,
     pub auto_clean: bool,
     pub auto_remove: bool,
     #[cfg(any(target_os = "linux", test))]
@@ -19,7 +22,7 @@ pub struct Apt {
 impl Apt {
     pub fn new(auto_clean: bool, auto_remove: bool, update_interval_mins: u64) -> Self {
         Self {
-            runner: Box::new(RealCommandRunner),
+            runner: Arc::new(RealCommandRunner),
             auto_clean,
             auto_remove,
             #[cfg(any(target_os = "linux", test))]
@@ -27,6 +30,29 @@ impl Apt {
             #[cfg(any(target_os = "linux", test))]
             cache_ttl: Duration::from_secs(update_interval_mins * 60),
         }
+    }
+
+    async fn run_async(
+        &self,
+        program: &'static str,
+        args: &'static [&'static str],
+    ) -> io::Result<Output> {
+        let runner = self.runner.clone();
+        tokio::task::spawn_blocking(move || runner.run(program, args))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    }
+
+    async fn run_async_with_env(
+        &self,
+        program: &'static str,
+        args: &'static [&'static str],
+        env: Vec<(String, String)>,
+    ) -> io::Result<Output> {
+        let runner = self.runner.clone();
+        tokio::task::spawn_blocking(move || runner.run_with_env(program, args, &env))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
     }
 }
 
@@ -64,7 +90,7 @@ impl PackageManager for Apt {
     #[cfg(any(target_os = "linux", test))]
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let should_update = {
-            let last_update = self.last_update.lock().unwrap();
+            let last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
             match *last_update {
                 Some(last) if self.cache_ttl.as_secs() > 0 => last.elapsed() >= self.cache_ttl,
                 _ => true,
@@ -73,7 +99,7 @@ impl PackageManager for Apt {
 
         if should_update {
             info!("updating apt cache...");
-            let output = self.runner.run("sudo", &["apt-get", "update"])?;
+            let output = self.run_async("sudo", &["apt-get", "update"]).await?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let err_msg = if stderr.contains("Permission denied")
@@ -93,7 +119,7 @@ impl PackageManager for Apt {
                 return Err(err_msg.into());
             }
             // Update the last update time
-            let mut last_update = self.last_update.lock().unwrap();
+            let mut last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
             *last_update = Some(Instant::now());
         } else {
             info!(
@@ -107,8 +133,8 @@ impl PackageManager for Apt {
         // This requires sudo because apt needs to lock the cache even for simulated upgrades
         // if run as a non-root user.
         let output = self
-            .runner
-            .run("sudo", &["apt-get", "-s", "dist-upgrade"])?;
+            .run_async("sudo", &["apt-get", "-s", "dist-upgrade"])
+            .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let err_msg = format!(
@@ -151,7 +177,22 @@ impl PackageManager for Apt {
 
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("starting apt full upgrade");
-        let output = self.runner.run("sudo", &["apt", "full-upgrade", "-y"]);
+        let env = vec![("DEBIAN_FRONTEND".to_string(), "noninteractive".to_string())];
+        let output = self
+            .run_async_with_env(
+                "sudo",
+                &[
+                    "apt",
+                    "full-upgrade",
+                    "-y",
+                    "-o",
+                    "Dpkg::Options::=--force-confdef",
+                    "-o",
+                    "Dpkg::Options::=--force-confold",
+                ],
+                env,
+            )
+            .await;
 
         match output {
             Ok(output) => {
@@ -264,7 +305,7 @@ mod tests {
             stderr: "".to_string(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -281,7 +322,7 @@ mod tests {
             stderr: "".to_string(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -298,7 +339,7 @@ mod tests {
             stderr: "".to_string(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -316,7 +357,7 @@ mod tests {
             stderr: "".to_string(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -333,7 +374,7 @@ mod tests {
             stderr: "dpkg error".to_string(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -353,7 +394,7 @@ mod tests {
             stderr: "".to_string(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -378,7 +419,7 @@ mod tests {
                     .to_string(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -403,7 +444,7 @@ mod tests {
             stderr: "network error".to_string(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -443,7 +484,7 @@ mod tests {
             calls: calls.clone(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -473,7 +514,7 @@ mod tests {
             calls: calls.clone(),
         };
         let apt2 = Apt {
-            runner: Box::new(runner2),
+            runner: Arc::new(runner2),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -524,7 +565,7 @@ mod tests {
             calls: calls.clone(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: true,
             auto_remove: true,
             last_update: Mutex::new(None),
@@ -563,7 +604,7 @@ mod tests {
             calls: calls.clone(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: false,
             auto_remove: false,
             last_update: Mutex::new(None),
@@ -610,7 +651,7 @@ mod tests {
             calls: calls.clone(),
         };
         let apt = Apt {
-            runner: Box::new(runner),
+            runner: Arc::new(runner),
             auto_clean: true,
             auto_remove: false,
             last_update: Mutex::new(None),
