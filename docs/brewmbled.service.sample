@@ -6,7 +6,10 @@ Documentation=https://codeberg.org/heb/brewmble
 
 [Service]
 Type=simple
-ExecStart=/opt/brewmble/.cargo/bin/brewmbled --config /etc/brewmble/brewmbled.yaml
+# Use the default configuration file in the brewmbled home folder
+ExecStart=/opt/brewmble/.cargo/bin/brewmbled
+# Or, point to a specific configuration file
+#ExecStart=/opt/brewmble/.cargo/bin/brewmbled --config /etc/brewmble/brewmbled.yaml
 Restart=on-failure
 User=brewmble
 
