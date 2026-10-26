@@ -28,6 +28,7 @@ This file provides guidance to agents when working with code in this repository.
 - Daemon binds to `server.bind_address` (default 0.0.0.0) for both port probing and the HTTPS listener
 - API authentication is performed via mutual TLS (mTLS); the X-API-Key header has been removed
 - Cluster CA and client certificates are managed by the CLI (`brewmble ca` and `brewmble cert` subcommands) and stored in the OS keyring
+- On macOS, keychain access uses the modern `SecItem*` API via `security-framework::item` (not the keyring crate's legacy `SecKeychain*` path, which is broken on macOS 27+); `brewmble ca migrate` re-stores legacy entries
 - Daemon requires paths to the cluster CA cert, daemon cert, and daemon key via the `tls:` section in the configuration file
 - CLI uses TOFU-style SHA-256 fingerprint pinning; the first successful connection to a node records its certificate fingerprint in `~/.brewmble.yaml`
 - Reboot feature invokes `/usr/bin/sudo -n /usr/bin/systemctl reboot` with fallback to `/usr/sbin/reboot`; configure a narrow sudoers rule for the daemon user

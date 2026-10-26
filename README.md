@@ -135,6 +135,7 @@ Brewmble uses mutual TLS (mTLS) for all CLI-to-daemon communication. A single cl
   brewmbled config reload   # if running via systemd
   ```
 - **Fingerprints**: The CLI logs the SHA-256 fingerprint of every issued certificate. Use `brewmble ca show` to display the CA fingerprint.
+- **Keyring store migration**: After upgrading the CLI, run `brewmble ca migrate` to verify that CA and client credentials are accessible. On macOS, the CLI uses the modern `SecItem*` keychain API; entries created by older CLI versions (via the legacy `SecKeychain*` API) are detected and re-stored automatically. Use `--dry-run` to preview changes.
 
 ### Privilege Model and Service Hardening
 

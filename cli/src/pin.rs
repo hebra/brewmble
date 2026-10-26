@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -76,6 +76,43 @@ impl ServerCertVerifier for CapturingVerifier {
 
 pub fn fetch_fingerprint(url: &str) -> Result<String, Box<dyn Error>> {
     let ca_pem = ca::ca_root_pem()?;
+    let client_cert = load_client_cert()?;
+    fetch_fingerprint_with_certs(url, &ca_pem, client_cert, crate::get_default_timeout())
+}
+
+fn fetch_fingerprint_with_certs(
+    url: &str,
+    ca_pem: &str,
+    client_cert: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+    timeout: std::time::Duration,
+) -> Result<String, Box<dyn Error>> {
+    let (server_name, addrs) = resolve_url_addresses(url)?;
+    fetch_fingerprint_with_addrs(server_name, addrs, ca_pem, client_cert, timeout)
+}
+
+fn resolve_url_addresses(
+    url: &str,
+) -> Result<(ServerName<'static>, Vec<std::net::SocketAddr>), Box<dyn Error>> {
+    let (host, port) = parse_host_port(url)?;
+    // IPv6 URLs use brackets; strip them for DNS/IP resolution and SNI.
+    let resolution_host = host.trim_start_matches('[').trim_end_matches(']');
+    let server_name = ServerName::try_from(resolution_host.to_string())?;
+    let addrs: Vec<std::net::SocketAddr> = (resolution_host, port)
+        .to_socket_addrs()?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("could not resolve {}:{}", host, port).into());
+    }
+    Ok((server_name, addrs))
+}
+
+fn fetch_fingerprint_with_addrs(
+    server_name: ServerName<'static>,
+    addrs: Vec<std::net::SocketAddr>,
+    ca_pem: &str,
+    client_cert: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+    timeout: std::time::Duration,
+) -> Result<String, Box<dyn Error>> {
     let mut ca_reader = std::io::BufReader::new(ca_pem.as_bytes());
     let ca_certs: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
@@ -85,22 +122,62 @@ pub fn fetch_fingerprint(url: &str) -> Result<String, Box<dyn Error>> {
     }
 
     let verifier = Arc::new(CapturingVerifier::new(roots)?);
-    let client_cert = load_client_cert()?;
 
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier.clone())
         .with_client_auth_cert(client_cert.0, client_cert.1)?;
 
-    let (host, port) = parse_host_port(url)?;
-    let server_name = ServerName::try_from(host.clone())?;
-    let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)?;
-    let mut sock = TcpStream::connect((host.as_str(), port))?;
-    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
-    tls.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
-    let _ = tls.flush();
-    let mut buf = [0u8; 1];
-    let _ = tls.read(&mut buf);
+    let config = Arc::new(config);
+    let mut last_err: Option<Box<dyn Error>> = None;
+    for addr in addrs {
+        match try_fetch_at_address(addr, server_name.clone(), config.clone(), verifier.clone(), timeout) {
+            Ok(fp) => return Ok(fp),
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| "all addresses failed".into()))
+}
+
+fn try_fetch_at_address(
+    addr: std::net::SocketAddr,
+    server_name: ServerName<'static>,
+    config: Arc<ClientConfig>,
+    verifier: Arc<CapturingVerifier>,
+    timeout: std::time::Duration,
+) -> Result<String, Box<dyn Error>> {
+    let sock = TcpStream::connect_timeout(&addr, timeout)?;
+
+    // Run the TLS handshake in a worker thread and enforce a wall-clock
+    // timeout. rustls's Stream retries on WouldBlock, so socket-level
+    // read/write timeouts are not sufficient on their own.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut conn = match rustls::ClientConnection::new(config, server_name) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(Err(format!("tls init: {e}")));
+                return;
+            }
+        };
+        let mut stream = sock;
+        let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+        let result = tls
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .and_then(|()| tls.flush())
+            .and_then(|()| {
+                let mut buf = [0u8; 1];
+                tls.read(&mut buf).map(|_| ())
+            });
+        let _ = tx.send(result.map_err(|e| format!("tls handshake: {e}")));
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(format!("pin check timed out after {:?}", timeout).into()),
+    }
 
     let leaf = verifier.take_leaf().ok_or("no leaf certificate captured")?;
     Ok(format_fingerprint(&leaf))
@@ -281,5 +358,218 @@ mod tests {
         assert!(msg.contains("expected aa:bb"));
         assert!(msg.contains("got cc:dd"));
         assert!(msg.contains("brewmble node --repin node1"));
+    }
+
+    fn test_certs() -> (String, String, String, String, String) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            PKCS_ECDSA_P256_SHA256, SanType,
+        };
+        let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.distinguished_name.push(DnType::CommonName, "test-ca");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let issuer = rcgen::Issuer::new(
+            {
+                let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+                p.distinguished_name.push(DnType::CommonName, "test-ca");
+                p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+                p
+            },
+            ca_key,
+        );
+
+        let server_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut server_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        server_params.distinguished_name.push(DnType::CommonName, "test-server");
+        server_params.subject_alt_names = vec![SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        ))];
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+        let client_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut client_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        client_params.distinguished_name.push(DnType::CommonName, "test-client");
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client_cert = client_params.signed_by(&client_key, &issuer).unwrap();
+
+        (
+            ca_cert.pem(),
+            server_cert.pem(),
+            server_key.serialize_pem(),
+            client_cert.pem(),
+            client_key.serialize_pem(),
+        )
+    }
+
+    fn run_tls_server(
+        ca_pem: &str,
+        server_cert_pem: &str,
+        server_key_pem: &str,
+    ) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut cert_reader = std::io::BufReader::new(server_cert_pem.as_bytes());
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>().unwrap();
+        let mut key_reader = std::io::BufReader::new(server_key_pem.as_bytes());
+        let key = rustls_pemfile::private_key(&mut key_reader).unwrap().unwrap();
+
+        let mut roots = RootCertStore::empty();
+        let mut ca_reader = std::io::BufReader::new(ca_pem.as_bytes());
+        for cert in rustls_pemfile::certs(&mut ca_reader) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+
+        let config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                    .build()
+                    .unwrap(),
+            )
+            .with_single_cert(certs, key)
+            .unwrap();
+        let config = Arc::new(config);
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut conn = rustls::ServerConnection::new(config).unwrap();
+            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+            let mut buf = [0u8; 1024];
+            let _ = tls.read(&mut buf);
+            let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            let _ = tls.flush();
+        });
+
+        addr
+    }
+
+    fn load_client_cert_from_pem(
+        cert_pem: &str,
+        key_pem: &str,
+    ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let mut cert_reader = std::io::BufReader::new(cert_pem.as_bytes());
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>().unwrap();
+        let mut key_reader = std::io::BufReader::new(key_pem.as_bytes());
+        let key = rustls_pemfile::private_key(&mut key_reader).unwrap().unwrap();
+        (certs, key)
+    }
+
+    #[test]
+    fn test_fetch_fingerprint_times_out_on_stalled_handshake() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                // Accept the connection but never send any data back.
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        });
+
+        let (ca_pem, _, _, client_cert_pem, client_key_pem) = test_certs();
+        let (certs, key) = load_client_cert_from_pem(&client_cert_pem, &client_key_pem);
+
+        let timeout = std::time::Duration::from_secs(1);
+        let start = std::time::Instant::now();
+        let result = fetch_fingerprint_with_certs(
+            &format!("https://127.0.0.1:{}", port),
+            &ca_pem,
+            (certs, key),
+            timeout,
+        );
+        let elapsed = start.elapsed();
+
+        drop(handle);
+
+        assert!(result.is_err(), "expected error from stalled handshake");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "timed out but took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_resolve_url_addresses_ipv4() {
+        let (server_name, addrs) = resolve_url_addresses("https://127.0.0.1:4712").unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert!(addrs[0].is_ipv4());
+        assert!(matches!(server_name, ServerName::IpAddress(_)));
+    }
+
+    #[test]
+    fn test_resolve_url_addresses_ipv6() {
+        let (server_name, addrs) = resolve_url_addresses("https://[::1]:4712").unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert!(addrs[0].is_ipv6());
+        assert!(matches!(server_name, ServerName::IpAddress(_)));
+    }
+
+    #[test]
+    fn test_fetch_fingerprint_fallback_to_second_address() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) =
+            test_certs();
+        let server_addr = run_tls_server(&ca_pem, &server_cert_pem, &server_key_pem);
+        let port = server_addr.port();
+        let (certs, key) = load_client_cert_from_pem(&client_cert_pem, &client_key_pem);
+
+        let server_name = ServerName::try_from("127.0.0.1".to_string()).unwrap();
+        let addrs = vec![
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                port,
+            ),
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port,
+            ),
+        ];
+
+        let result = fetch_fingerprint_with_addrs(
+            server_name,
+            addrs,
+            &ca_pem,
+            (certs, key),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            result.is_ok(),
+            "expected fallback to IPv4 to succeed: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().len(), 95);
+    }
+
+    #[test]
+    fn test_fetch_fingerprint_fails_when_all_addresses_fail() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (ca_pem, _, _, client_cert_pem, client_key_pem) = test_certs();
+        let (certs, key) = load_client_cert_from_pem(&client_cert_pem, &client_key_pem);
+
+        let server_name = ServerName::try_from("127.0.0.1".to_string()).unwrap();
+        let addrs = vec![std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            1,
+        )];
+
+        let result = fetch_fingerprint_with_addrs(
+            server_name,
+            addrs,
+            &ca_pem,
+            (certs, key),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(result.is_err());
     }
 }

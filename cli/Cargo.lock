@@ -158,10 +158,11 @@ dependencies = [
 
 [[package]]
 name = "brewmble"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "brewmble-rest",
  "clap",
+ "core-foundation",
  "flume",
  "gethostname",
  "humantime",
@@ -173,6 +174,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pemfile",
+ "security-framework",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -183,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "brewmble-rest"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
 ]

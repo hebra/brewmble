@@ -254,7 +254,7 @@ fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
     updated
 }
 
-fn get_default_timeout() -> Duration {
+pub(crate) fn get_default_timeout() -> Duration {
     std::env::var("BREWMBLE_TIMEOUT")
         .ok()
         .and_then(|v| {
@@ -359,6 +359,12 @@ enum CaCommands {
     },
     /// Show the cluster CA certificate and fingerprint
     Show,
+    /// Migrate CA and client credentials from a legacy keyring store
+    Migrate {
+        /// Report what would be migrated without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(ValueEnum, Clone)]
@@ -401,6 +407,7 @@ enum ProfileCommands {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     if cli.version {
         println!("brewmble {}", env!("CARGO_PKG_VERSION"));
@@ -546,14 +553,12 @@ fn run_profile(
 fn run_ca(subcommand: CaCommands) -> Result<(), Box<dyn Error>> {
     match subcommand {
         CaCommands::Init { force } => {
-            if !force && ca::ensure_ca().is_ok_and(|(c, k)| !c.is_empty() && !k.is_empty()) {
+            if !force && ca::ca_root_pem().is_ok() {
                 return Err("cluster CA already exists; use --force to overwrite".into());
             }
             if force {
-                let _ = keyring::Entry::new("brewmble-cli", "cluster-ca-cert")
-                    .and_then(|e| e.delete_credential());
-                let _ = keyring::Entry::new("brewmble-cli", "cluster-ca-key")
-                    .and_then(|e| e.delete_credential());
+                let _ = ca::delete_credential("cluster-ca-cert");
+                let _ = ca::delete_credential("cluster-ca-key");
             }
             let (cert, _key) = ca::ensure_ca()?;
             println!("Cluster CA created.");
@@ -562,10 +567,24 @@ fn run_ca(subcommand: CaCommands) -> Result<(), Box<dyn Error>> {
             println!("  SHA256 fingerprint: {}", ca::fingerprint(&cert)?);
         }
         CaCommands::Show => {
-            let entry = keyring::Entry::new("brewmble-cli", "cluster-ca-cert")?;
-            let cert = entry.get_password()?;
+            let cert = ca::ca_root_pem()?;
             println!("{}", cert);
             println!("Fingerprint: {}", ca::fingerprint(&cert)?);
+        }
+        CaCommands::Migrate { dry_run } => {
+            let report = ca::migrate_ca(dry_run)?;
+            if dry_run {
+                println!("Dry run — no changes written.");
+            }
+            for entry in &report.entries {
+                println!("{:<18} {}", entry.account, entry.status);
+            }
+            if !report.ca_ready() {
+                return Err(
+                    "CA certificate or key still missing after migration; run `brewmble ca init`"
+                        .into(),
+                );
+            }
         }
     }
     Ok(())
@@ -615,11 +634,7 @@ fn run_cert(subcommand: CertCommands) -> Result<(), Box<dyn Error>> {
                 println!("  SHA256 fingerprint: {}", ca::fingerprint(&cert)?);
             }
             CertKind::Client => {
-                if !force
-                    && keyring::Entry::new("brewmble-cli", "client-cert")
-                        .and_then(|e| e.get_password())
-                        .is_ok()
-                {
+                if !force && ca::client_cert_pem().is_ok() {
                     return Err("client certificate already exists; use --force to re-issue".into());
                 }
                 let hostname = gethostname::gethostname().to_string_lossy().into_owned();

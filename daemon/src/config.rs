@@ -500,6 +500,15 @@ mod tests {
     use super::*;
     use std::fs;
     use std::net::Ipv4Addr;
+    use std::sync::Once;
+
+    static INIT_CRYPTO: Once = Once::new();
+
+    fn ensure_crypto_provider() {
+        INIT_CRYPTO.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
 
     #[test]
     fn test_deserialization_minimal() {
@@ -705,6 +714,7 @@ tls:
 
     #[test]
     fn test_validation_valid_certs() {
+        ensure_crypto_provider();
         let temp_dir = std::env::temp_dir().join(format!("brewmble_cert_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
 
@@ -789,6 +799,7 @@ tls:
 
     #[test]
     fn test_validation_expired_cert() {
+        ensure_crypto_provider();
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut ca_params = rcgen::CertificateParams::default();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -811,6 +822,7 @@ tls:
 
     #[test]
     fn test_validation_wrong_eku() {
+        ensure_crypto_provider();
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut ca_params = rcgen::CertificateParams::default();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -831,6 +843,7 @@ tls:
 
     #[test]
     fn test_validation_mismatched_key() {
+        ensure_crypto_provider();
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut ca_params = rcgen::CertificateParams::default();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
