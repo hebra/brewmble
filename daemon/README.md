@@ -242,7 +242,7 @@ The `brewmbled` daemon runs as the `brewmble` user but needs to perform package 
 
 2. **Add the following content**:
    ```text
-   brewmble ALL=(root) NOPASSWD: /usr/bin/apt-get update, /usr/bin/apt-get -s dist-upgrade, /usr/bin/apt full-upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold, /usr/bin/apt-get autoclean, /usr/bin/apt-get autoremove -y, /usr/bin/systemctl reboot, /usr/sbin/reboot
+   brewmble ALL=(root) NOPASSWD: /usr/bin/apt-get update, /usr/bin/apt-get -s dist-upgrade, /usr/bin/apt full-upgrade -y -o Dpkg\:\:Options\:\:=--force-confdef -o Dpkg\:\:Options\:\:=--force-confold, /usr/bin/apt-get autoclean, /usr/bin/apt-get autoremove -y, /usr/bin/systemctl reboot, /usr/sbin/reboot
    ```
 
    Adjust the paths to match your distribution if necessary. Use `visudo` to validate the file before saving.
