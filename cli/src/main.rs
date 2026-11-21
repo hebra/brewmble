@@ -1566,6 +1566,8 @@ fn run_status(
     config: &mut Config,
     config_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
+    println!("Querying status...");
+
     let multi = MultiProgress::new();
     let native = Arc::new(NativeProgress::new());
     let native_supported = native.is_supported();
