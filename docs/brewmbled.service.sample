@@ -27,7 +27,8 @@ PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-CapabilityBoundingSet=
+# Do not set an empty CapabilityBoundingSet: it prevents sudo (including
+# sudo-rs) from switching users after setuid-root elevation.
 
 [Install]
 WantedBy=multi-user.target

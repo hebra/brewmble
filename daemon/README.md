@@ -140,6 +140,12 @@ For Linux systems, a sample systemd service file is provided in the `docs` folde
    sudo nano /etc/systemd/system/brewmbled.service
    ```
 
+   Keep `NoNewPrivileges=false` and do not set an empty `CapabilityBoundingSet=`.
+   These restrictions prevent `sudo` from elevating privileges under systemd;
+   with sudo-rs (the default on Ubuntu 25.10 and later), an empty capability
+   bounding set can cause a `could not restore to saved user id` panic when
+   handling a status request.
+
 3. **Reload systemd**:
    ```bash
    sudo systemctl daemon-reload
@@ -232,7 +238,7 @@ For macOS, you can run `brewmbled` as a background service for the logged-in use
 
 #### Sudo Configuration
 
-The `brewmbled` daemon runs as the `brewmble` user but needs to perform package management operations that require root privileges. To enable this, you must configure `sudo` to allow the `brewmble` user to run `apt` commands without a password.
+The `brewmbled` daemon runs as the `brewmble` user but needs to perform package management operations that require root privileges. To enable this, you must configure `sudo` to allow the `brewmble` user to run `apt-get` commands without a password.
 
 1. **Create a sudoers file**:
    It is recommended to create a separate file in `/etc/sudoers.d/`:
@@ -242,14 +248,20 @@ The `brewmbled` daemon runs as the `brewmble` user but needs to perform package 
 
 2. **Add the following content**:
    ```text
-   brewmble ALL=(root) NOPASSWD: /usr/bin/apt-get update, /usr/bin/apt-get -s dist-upgrade, /usr/bin/apt full-upgrade -y -o Dpkg\:\:Options\:\:=--force-confdef -o Dpkg\:\:Options\:\:=--force-confold, /usr/bin/apt-get autoclean, /usr/bin/apt-get autoremove -y, /usr/bin/systemctl reboot, /usr/sbin/reboot
+   brewmble ALL=(root) NOPASSWD: /usr/bin/apt-get update, /usr/bin/apt-get -s dist-upgrade, /usr/bin/apt-get dist-upgrade -y -o Dpkg\:\:Options\:\:=--force-confdef -o Dpkg\:\:Options\:\:=--force-confold, /usr/bin/apt-get autoclean, /usr/bin/apt-get autoremove -y, /usr/bin/systemctl reboot, /usr/sbin/reboot
    ```
 
-   Adjust the paths to match your distribution if necessary. Use `visudo` to validate the file before saving.
+   Sudoers matches the resolved binary path and arguments exactly; for example,
+   `sudo apt update` is not covered by the `/usr/bin/apt-get update` entry.
+   Adjust the paths to match your distribution if necessary. Use `visudo` to
+   validate the file before saving. Existing deployments upgrading from a
+   release that used `apt full-upgrade` must update this rule before triggering
+   their next upgrade.
 
 3. **Set correct permissions**:
-   The file must have strict permissions:
+   The file must be owned by `root:root` and have strict permissions:
    ```bash
+   sudo chown root:root /etc/sudoers.d/brewmble
    sudo chmod 440 /etc/sudoers.d/brewmble
    ```
 
@@ -409,7 +421,7 @@ curl --cert client.pem --key client-key.pem --cacert ca.pem \
 
 ### `POST /packages/full-upgrade`
 
-Triggers a full system upgrade (e.g., `apt full-upgrade -y` or `brew upgrade`). This operation is asynchronous; the endpoint returns immediately while the upgrade runs in the background.
+Triggers a full system upgrade (e.g., `apt-get dist-upgrade -y` or `brew upgrade`). This operation is asynchronous; the endpoint returns immediately while the upgrade runs in the background.
 
 **Request body:**
 ```json

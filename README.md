@@ -139,8 +139,9 @@ Brewmble uses mutual TLS (mTLS) for all CLI-to-daemon communication. A single cl
 
 ### Privilege Model and Service Hardening
 
-The daemon normally runs as an unprivileged user. Only the reboot feature requires elevated privileges, and it is invoked through well-known absolute paths.
+The daemon normally runs as an unprivileged user. Linux package management and the optional reboot feature require elevated privileges through `sudo`, using well-known command paths.
 
+- **Linux package management**: The daemon uses `apt-get` for updates, upgrades, autoclean, and autoremove. Configure the exact commands as shown in the [daemon README](daemon/README.md#sudo-configuration); sudoers matches both the resolved binary path and its arguments.
 - **Reboot commands**: When `features.reboot` is enabled, the daemon uses:
   - `/usr/bin/sudo -n /usr/bin/systemctl reboot`
   - fallback: `/usr/bin/sudo -n /usr/sbin/reboot`
@@ -152,9 +153,9 @@ The daemon normally runs as an unprivileged user. Only the reboot feature requir
 - **Systemd unit hardening** (recommended):
   - Run the daemon as a dedicated user (`User=brewmble`).
   - Set `Restart=on-failure` and `RestartSec=5`.
-  - Restrict paths with `ProtectSystem=strict`, `ProtectHome=true`, and `ReadWritePaths=/var/lib/brewmble` if needed.
-  - Drop capabilities with `CapabilityBoundingSet=` and allow only `CAP_SYS_BOOT` if reboot is enabled.
-  - Use `NoNewPrivileges=true` and `ProtectKernelTunables=true`.
+  - Restrict paths with `ProtectSystem=full` and `ProtectHome=read-only`, as in the sample unit.
+  - Keep `NoNewPrivileges=false` and leave `CapabilityBoundingSet` unrestricted. Setting `NoNewPrivileges=true` or an empty `CapabilityBoundingSet=` prevents `sudo` from elevating privileges; on distributions using sudo-rs, the latter can also produce a `could not restore to saved user id` panic.
+  - Use `ProtectKernelTunables=true`.
 
 ### 2. SSH Tunneling
 

@@ -80,7 +80,7 @@ Security is handled exclusively via mutual TLS (mTLS); there are no API keys.
 3. The TLS handshake authenticates the CLI's client certificate against the cluster CA (no request-level authentication takes place).
 4. If `dry_run` is `true`, the daemon simulates the upgrade and returns the list of packages that would be changed.
 5. If `dry_run` is `false`, the daemon sets an `is_upgrading` flag (AtomicBool) to prevent concurrent upgrades.
-6. Daemon spawns a background task to perform the upgrade (e.g., `apt full-upgrade -y` or `brew upgrade`), optionally followed by `autoclean`/`autoremove` cleanup steps.
+6. Daemon spawns a background task to perform the upgrade (e.g., `apt-get dist-upgrade -y` or `brew upgrade`), optionally followed by `autoclean`/`autoremove` cleanup steps.
 7. Daemon immediately returns `200 OK` (with a "triggered" message) to the CLI.
 8. The CLI informs the user that the upgrade has started.
 

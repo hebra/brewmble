@@ -182,8 +182,8 @@ impl PackageManager for Apt {
             .run_async_with_env(
                 "sudo",
                 &[
-                    "apt",
-                    "full-upgrade",
+                    "apt-get",
+                    "dist-upgrade",
                     "-y",
                     "-o",
                     "Dpkg::Options::=--force-confdef",
@@ -575,7 +575,7 @@ mod tests {
         assert!(apt.full_upgrade().await.is_ok());
 
         let c = calls.lock().unwrap();
-        assert!(c.iter().any(|s| s.contains("apt full-upgrade")));
+        assert!(c.iter().any(|s| s == "sudo apt-get dist-upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"));
         assert!(c.iter().any(|s| s.contains("apt-get autoclean")));
         assert!(c.iter().any(|s| s.contains("apt-get autoremove")));
     }
@@ -614,7 +614,7 @@ mod tests {
         assert!(apt.full_upgrade().await.is_ok());
 
         let c = calls.lock().unwrap();
-        assert!(c.iter().any(|s| s.contains("apt full-upgrade")));
+        assert!(c.iter().any(|s| s.contains("apt-get dist-upgrade")));
         assert!(!c.iter().any(|s| s.contains("apt-get autoclean")));
         assert!(!c.iter().any(|s| s.contains("apt-get autoremove")));
     }
@@ -661,7 +661,7 @@ mod tests {
         assert!(apt.full_upgrade().await.is_ok());
 
         let c = calls.lock().unwrap();
-        assert!(c.iter().any(|s| s.contains("apt full-upgrade")));
+        assert!(c.iter().any(|s| s.contains("apt-get dist-upgrade")));
         assert!(c.iter().any(|s| s.contains("apt-get autoclean")));
     }
 }

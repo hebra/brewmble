@@ -32,6 +32,8 @@ This file provides guidance to agents when working with code in this repository.
 - Daemon requires paths to the cluster CA cert, daemon cert, and daemon key via the `tls:` section in the configuration file
 - CLI uses TOFU-style SHA-256 fingerprint pinning; the first successful connection to a node records its certificate fingerprint in `~/.brewmble.yaml`
 - Reboot feature invokes `/usr/bin/sudo -n /usr/bin/systemctl reboot` with fallback to `/usr/sbin/reboot`; configure a narrow sudoers rule for the daemon user
+- Linux package management uses `apt-get` via `sudo`, including `dist-upgrade` for full upgrades; sudoers rules must match the documented absolute paths and exact arguments
+- The systemd unit must keep `NoNewPrivileges=false` and leave `CapabilityBoundingSet` unrestricted; restricting either prevents sudo elevation, and an empty capability set can make sudo-rs panic
 
 ## Project Coding Rules (Non-Obvious Only)
 
