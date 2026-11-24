@@ -341,11 +341,6 @@ pub fn ca_root_pem() -> Result<String, Box<dyn Error>> {
         .ok_or_else(|| "no cluster CA found".into())
 }
 
-pub fn ca_root() -> Result<reqwest::Certificate, Box<dyn Error>> {
-    let pem = ca_root_pem()?;
-    Ok(reqwest::Certificate::from_pem(pem.as_bytes())?)
-}
-
 pub fn client_cert_pem() -> Result<String, Box<dyn Error>> {
     KeyringStore
         .get(ACCOUNT_CLIENT_CERT)?
@@ -379,28 +374,6 @@ fn macos_sec_item_delete(account: &str) -> Result<(), Box<dyn Error>> {
 fn macos_sec_item_delete(account: &str) -> Result<(), Box<dyn Error>> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, account)?;
     entry.delete_credential().map_err(|e| -> Box<dyn Error> { Box::new(e) })
-}
-
-pub fn client_identity() -> Result<reqwest::Identity, Box<dyn Error>> {
-    let cert = client_cert_pem()?;
-    let key = client_key_pem()?;
-    let bundle = format!("{}\n{}", cert.trim_end(), key.trim_end());
-    Ok(reqwest::Identity::from_pem(bundle.as_bytes())?)
-}
-
-pub fn build_client() -> Result<reqwest::blocking::Client, Box<dyn Error>> {
-    let identity = client_identity().map_err(|_| {
-        "no client certificate found — run `brewmble ca init` and `brewmble cert issue --kind client`"
-    })?;
-    let ca = ca_root().map_err(|_| "no cluster CA found — run `brewmble ca init`")?;
-
-    Ok(reqwest::blocking::Client::builder()
-        .identity(identity)
-        .tls_certs_only([ca])
-        .tls_danger_accept_invalid_hostnames(true)
-        .https_only(true)
-        .timeout(super::get_default_timeout())
-        .build()?)
 }
 
 pub fn fingerprint(cert_pem: &str) -> Result<String, Box<dyn Error>> {

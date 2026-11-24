@@ -160,25 +160,6 @@ fn update_node_fingerprint(config: &mut Config, address: &str, fingerprint: &str
     }
 }
 
-fn validate_and_update_pins(
-    config: &mut Config,
-    nodes: &[NodeConfig],
-) -> Result<bool, Box<dyn Error>> {
-    let mut updated = false;
-    for node in nodes {
-        match check_pin(node, &node.address) {
-            Ok(PinOutcome::Learned(fp)) => {
-                println!("Pinned {} {}", pin::node_name(node), fp);
-                update_node_fingerprint(config, &node.address, &fp);
-                updated = true;
-            }
-            Ok(PinOutcome::Matched) => {}
-            Err(e) => eprintln!("error: {e}"),
-        }
-    }
-    Ok(updated)
-}
-
 fn write_config_atomically(path: &Path, content: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -1587,21 +1568,19 @@ fn run_version(config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Er
 
     let active_profile = config.active_profile.clone();
     if let Some(profile) = config.profiles.get(&active_profile).cloned() {
-        let client = ca::build_client()?;
-
         let mut pin_updated = false;
         for node in &profile.nodes {
-            match check_pin(node, &node.address) {
-                Ok(PinOutcome::Learned(fp)) => {
-                    println!("Pinned {} {}", pin::node_name(node), fp);
-                    update_node_fingerprint(config, &node.address, &fp);
-                    pin_updated = true;
-                }
-                Ok(PinOutcome::Matched) => {}
+            let (client, outcome) = match pin::connect(node) {
+                Ok(connection) => connection,
                 Err(e) => {
                     eprintln!("error: {e}");
                     continue;
                 }
+            };
+            if let PinOutcome::Learned(fp) = outcome {
+                println!("Pinned {} {}", pin::node_name(node), fp);
+                update_node_fingerprint(config, &node.address, &fp);
+                pin_updated = true;
             }
 
             let url = resolve_url(&node.address);
@@ -1653,6 +1632,15 @@ fn run_status(
         .get(&active_profile_name)
         .map(|p| p.nodes.clone())
         .unwrap_or_default();
+    let saved_targets: HashMap<_, _> = profile_nodes
+        .iter()
+        .rev()
+        .filter_map(|node| {
+            reqwest::Url::parse(&resolve_url(&node.address))
+                .ok()
+                .map(|url| (url, node))
+        })
+        .collect();
 
     // 1. Collect explicit targets and profile nodes, deduplicated by address
     let mut initial_targets: HashSet<String> = HashSet::new();
@@ -1669,22 +1657,6 @@ fn run_status(
         for node in &profile_nodes {
             initial_targets.insert(node.address.clone());
         }
-    }
-
-    // 2. Validate TOFU pins for profile nodes we are about to contact
-    let nodes_to_validate: Vec<NodeConfig> = if initial_targets.is_empty() && discover_all {
-        Vec::new()
-    } else if initial_targets.is_empty() {
-        profile_nodes.clone()
-    } else {
-        profile_nodes
-            .iter()
-            .filter(|n| initial_targets.contains(&n.address))
-            .cloned()
-            .collect()
-    };
-    if validate_and_update_pins(config, &nodes_to_validate)? {
-        save_config(config_path, config)?;
     }
 
     for addr in initial_targets {
@@ -1721,10 +1693,9 @@ fn run_status(
 
     drop(target_tx); // Close tx so rx finishes when discovery is done
 
-    let client = ca::build_client()?;
-
     let seen_targets = Arc::new(Mutex::new(HashSet::new()));
     let node_reports = Arc::new(Mutex::new(Vec::<(String, bool, bool)>::new()));
+    let learned_pins = Mutex::new(Vec::new());
 
     let pb = if native_supported {
         let pb = ProgressBar::new(0);
@@ -1746,9 +1717,12 @@ fn run_status(
 
     rayon::scope(|s| {
         while let Ok((target_addr, target_name)) = target_rx.recv() {
-            let client = client.clone();
             let seen_targets = Arc::clone(&seen_targets);
             let node_reports = Arc::clone(&node_reports);
+            let learned_pins = &learned_pins;
+            let saved_node = reqwest::Url::parse(&resolve_url(&target_addr))
+                .ok()
+                .and_then(|url| saved_targets.get(&url).copied());
             let pb = pb.clone();
             let multi = multi.clone();
             let native = Arc::clone(&native);
@@ -1758,15 +1732,35 @@ fn run_status(
             native.set_progress(pb.position(), pb.length());
 
             s.spawn(move |_| {
-                if !seen_targets.lock().unwrap().insert(target_addr.clone()) {
+                let address = saved_node.map_or(target_addr.as_str(), |node| &node.address);
+                if !seen_targets.lock().unwrap().insert(address.to_owned()) {
                     pb.inc_length(0); // Adjust length if skipped
                     pb.inc(1);
                     native.set_progress(pb.position(), pb.length());
                     return;
                 }
 
-                let (status, message, details, failed, outdated) =
-                    query_status(&client, &target_addr);
+                let discovered_node = NodeConfig {
+                    address: target_addr.clone(),
+                    name: target_name.clone(),
+                    fingerprint: None,
+                };
+                let node = saved_node.unwrap_or(&discovered_node);
+                let (status, message, details, failed, outdated) = match pin::connect(node) {
+                    Ok((client, outcome)) => {
+                        if let (Some(saved), PinOutcome::Learned(fp)) = (saved_node, outcome) {
+                            learned_pins.lock().unwrap().push((saved, fp));
+                        }
+                        query_status(&client, &node.address)
+                    }
+                    Err(err) => (
+                        format!("Pin verification failed: {err}"),
+                        String::new(),
+                        String::new(),
+                        true,
+                        false,
+                    ),
+                };
 
                 if failed {
                     any_failed.store(true, Ordering::Relaxed);
@@ -1798,6 +1792,15 @@ fn run_status(
     });
 
     pb.finish_and_clear();
+
+    let learned_pins = learned_pins.into_inner().unwrap();
+    if !learned_pins.is_empty() {
+        for (node, fingerprint) in learned_pins {
+            println!("Pinned {} {}", pin::node_name(node), fingerprint);
+            update_node_fingerprint(config, &node.address, &fingerprint);
+        }
+        save_config(config_path, config)?;
+    }
 
     let reports = node_reports.lock().unwrap();
     if !reports.is_empty() {
@@ -2116,17 +2119,23 @@ fn run_node(
         return Ok(());
     }
 
-    if validate_and_update_pins(config, &target_nodes)? {
-        save_config(config_path, config)?;
-    }
-
-    let client = ca::build_client()?;
-
     let mut tw = TabWriter::new(io::stdout());
     writeln!(tw, "NODE\tSTATUS")?;
 
     for node in &target_nodes {
         let name = node.name.as_deref().unwrap_or(&node.address);
+        let (client, outcome) = match pin::connect(node) {
+            Ok(connection) => connection,
+            Err(err) => {
+                writeln!(tw, "{}\tPin verification failed: {}", name, err)?;
+                continue;
+            }
+        };
+        if let PinOutcome::Learned(fp) = outcome {
+            println!("Pinned {} {}", name, fp);
+            update_node_fingerprint(config, &node.address, &fp);
+            save_config(config_path, config)?;
+        }
         let url = resolve_url(&node.address);
 
         let (status, body, updates) = if reboot {

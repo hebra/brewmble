@@ -7,21 +7,22 @@ use rustls::{
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
-struct CapturingVerifier {
+struct PinVerifier {
     inner: Arc<rustls::client::WebPkiServerVerifier>,
+    expected: Option<String>,
     leaf: Mutex<Option<Vec<u8>>>,
 }
 
-impl CapturingVerifier {
-    fn new(roots: RootCertStore) -> Result<Self, Box<dyn Error>> {
+impl PinVerifier {
+    fn new(roots: RootCertStore, expected: Option<String>) -> Result<Self, Box<dyn Error>> {
         let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots)).build()?;
         Ok(Self {
             inner,
+            expected,
             leaf: Mutex::new(None),
         })
     }
@@ -31,7 +32,7 @@ impl CapturingVerifier {
     }
 }
 
-impl ServerCertVerifier for CapturingVerifier {
+impl ServerCertVerifier for PinVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -47,7 +48,15 @@ impl ServerCertVerifier for CapturingVerifier {
             ocsp_response,
             now,
         )?;
-        *self.leaf.lock().unwrap() = Some(end_entity.as_ref().to_vec());
+        if let Some(expected) = &self.expected {
+            if !expected.eq_ignore_ascii_case(&format_fingerprint(end_entity.as_ref())) {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::ApplicationVerificationFailure,
+                ));
+            }
+        } else {
+            *self.leaf.lock().unwrap() = Some(end_entity.as_ref().to_vec());
+        }
         Ok(result)
     }
 
@@ -78,6 +87,47 @@ pub fn fetch_fingerprint(url: &str) -> Result<String, Box<dyn Error>> {
     let ca_pem = ca::ca_root_pem()?;
     let client_cert = load_client_cert()?;
     fetch_fingerprint_with_certs(url, &ca_pem, client_cert, crate::get_default_timeout())
+}
+
+pub(crate) fn connect(
+    node: &crate::NodeConfig,
+) -> Result<(reqwest::blocking::Client, PinOutcome), Box<dyn Error>> {
+    connect_with(node, fetch_fingerprint, |expected| {
+        build_client(
+            &ca::ca_root_pem()?,
+            load_client_cert()?,
+            expected,
+            crate::get_default_timeout(),
+        )
+    })
+}
+
+fn connect_with(
+    node: &crate::NodeConfig,
+    fetch: impl FnOnce(&str) -> Result<String, Box<dyn Error>>,
+    build: impl FnOnce(String) -> Result<reqwest::blocking::Client, Box<dyn Error>>,
+) -> Result<(reqwest::blocking::Client, PinOutcome), Box<dyn Error>> {
+    let outcome = check_pin_with_fetcher(node, &node.address, fetch)?;
+    let expected = match &outcome {
+        PinOutcome::Learned(fp) => fp,
+        PinOutcome::Matched => node.fingerprint.as_ref().unwrap(),
+    };
+    Ok((build(expected.clone())?, outcome))
+}
+
+fn build_client(
+    ca_pem: &str,
+    client_cert: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+    expected: String,
+    timeout: std::time::Duration,
+) -> Result<reqwest::blocking::Client, Box<dyn Error>> {
+    let verifier = Arc::new(PinVerifier::new(root_store(ca_pem)?, Some(expected))?);
+    Ok(reqwest::blocking::Client::builder()
+        .tls_backend_preconfigured(tls_config(verifier, client_cert)?)
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()?)
 }
 
 fn fetch_fingerprint_with_certs(
@@ -113,25 +163,15 @@ fn fetch_fingerprint_with_addrs(
     client_cert: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
     timeout: std::time::Duration,
 ) -> Result<String, Box<dyn Error>> {
-    let mut ca_reader = std::io::BufReader::new(ca_pem.as_bytes());
-    let ca_certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
-    let mut roots = RootCertStore::empty();
-    for cert in ca_certs {
-        roots.add(cert)?;
-    }
-
-    let verifier = Arc::new(CapturingVerifier::new(roots)?);
-
-    let config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(verifier.clone())
-        .with_client_auth_cert(client_cert.0, client_cert.1)?;
-
-    let config = Arc::new(config);
+    let roots = root_store(ca_pem)?;
     let mut last_err: Option<Box<dyn Error>> = None;
     for addr in addrs {
-        match try_fetch_at_address(addr, server_name.clone(), config.clone(), verifier.clone(), timeout) {
+        let verifier = Arc::new(PinVerifier::new(roots.clone(), None)?);
+        let config = Arc::new(tls_config(
+            verifier.clone(),
+            (client_cert.0.clone(), client_cert.1.clone_key()),
+        )?);
+        match try_fetch_at_address(addr, server_name.clone(), config, verifier, timeout) {
             Ok(fp) => return Ok(fp),
             Err(e) => last_err = Some(e),
         }
@@ -140,18 +180,35 @@ fn fetch_fingerprint_with_addrs(
     Err(last_err.unwrap_or_else(|| "all addresses failed".into()))
 }
 
+fn root_store(ca_pem: &str) -> Result<RootCertStore, Box<dyn Error>> {
+    let mut ca_reader = std::io::BufReader::new(ca_pem.as_bytes());
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_reader) {
+        roots.add(cert?)?;
+    }
+    Ok(roots)
+}
+
+fn tls_config(
+    verifier: Arc<PinVerifier>,
+    client_cert: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+) -> Result<ClientConfig, rustls::Error> {
+    ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(client_cert.0, client_cert.1)
+}
+
 fn try_fetch_at_address(
     addr: std::net::SocketAddr,
     server_name: ServerName<'static>,
     config: Arc<ClientConfig>,
-    verifier: Arc<CapturingVerifier>,
+    verifier: Arc<PinVerifier>,
     timeout: std::time::Duration,
 ) -> Result<String, Box<dyn Error>> {
     let sock = TcpStream::connect_timeout(&addr, timeout)?;
+    let mut stream = sock.try_clone()?;
 
-    // Run the TLS handshake in a worker thread and enforce a wall-clock
-    // timeout. rustls's Stream retries on WouldBlock, so socket-level
-    // read/write timeouts are not sufficient on their own.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut conn = match rustls::ClientConnection::new(config, server_name) {
@@ -161,22 +218,17 @@ fn try_fetch_at_address(
                 return;
             }
         };
-        let mut stream = sock;
-        let mut tls = rustls::Stream::new(&mut conn, &mut stream);
-        let result = tls
-            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .and_then(|()| tls.flush())
-            .and_then(|()| {
-                let mut buf = [0u8; 1];
-                tls.read(&mut buf).map(|_| ())
-            });
+        let result = conn.complete_io(&mut stream).map(|_| ());
         let _ = tx.send(result.map_err(|e| format!("tls handshake: {e}")));
     });
 
     match rx.recv_timeout(timeout) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Err(format!("pin check timed out after {:?}", timeout).into()),
+        Err(_) => {
+            let _ = sock.shutdown(Shutdown::Both);
+            return Err(format!("pin check timed out after {:?}", timeout).into());
+        }
     }
 
     let leaf = verifier.take_leaf().ok_or("no leaf certificate captured")?;
@@ -409,7 +461,9 @@ mod tests {
         ca_pem: &str,
         server_cert_pem: &str,
         server_key_pem: &str,
-    ) -> std::net::SocketAddr {
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -435,17 +489,24 @@ mod tests {
             .unwrap();
         let config = Arc::new(config);
 
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             let mut conn = rustls::ServerConnection::new(config).unwrap();
             let mut tls = rustls::Stream::new(&mut conn, &mut stream);
             let mut buf = [0u8; 1024];
-            let _ = tls.read(&mut buf);
-            let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
-            let _ = tls.flush();
+            let bytes = tls.read(&mut buf).unwrap_or(0);
+            if bytes > 0 {
+                tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                tls.flush().unwrap();
+            }
+            bytes
         });
 
-        addr
+        (addr, worker)
     }
 
     fn load_client_cert_from_pem(
@@ -458,6 +519,54 @@ mod tests {
         let mut key_reader = std::io::BufReader::new(key_pem.as_bytes());
         let key = rustls_pemfile::private_key(&mut key_reader).unwrap().unwrap();
         (certs, key)
+    }
+
+    #[test]
+    fn test_failed_probe_sends_no_http_request() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (ca_pem, server_cert, server_key, client_cert, client_key) = test_certs();
+        let (addr, server) = run_tls_server(&ca_pem, &server_cert, &server_key);
+        let node = crate::NodeConfig {
+            name: None,
+            address: addr.to_string(),
+            fingerprint: Some(format_fingerprint(b"different certificate")),
+        };
+        let result = connect_with(
+            &node,
+            |url| {
+                fetch_fingerprint_with_certs(
+                    url,
+                    &ca_pem,
+                    load_client_cert_from_pem(&client_cert, &client_key),
+                    std::time::Duration::from_secs(5),
+                )
+            },
+            |_| panic!("must not create a request client after a failed probe"),
+        );
+        assert!(matches!(result, Err(err) if err.to_string().contains("fingerprint mismatch")));
+        assert_eq!(server.join().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_http_connection_enforces_pin() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (ca_pem, server_cert, server_key, client_cert, client_key) = test_certs();
+        for (fingerprint, matches) in [
+            (format_fingerprint(b"different certificate"), false),
+            (ca::fingerprint(&server_cert).unwrap().to_uppercase(), true),
+        ] {
+            let (addr, server) = run_tls_server(&ca_pem, &server_cert, &server_key);
+            let client = build_client(
+                &ca_pem,
+                load_client_cert_from_pem(&client_cert, &client_key),
+                fingerprint,
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+            let response = client.get(format!("https://{addr}/status")).send();
+            assert_eq!(response.is_ok(), matches);
+            assert_eq!(server.join().unwrap() > 0, matches);
+        }
     }
 
     #[test]
@@ -519,7 +628,7 @@ mod tests {
 
         let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) =
             test_certs();
-        let server_addr = run_tls_server(&ca_pem, &server_cert_pem, &server_key_pem);
+        let (server_addr, server) = run_tls_server(&ca_pem, &server_cert_pem, &server_key_pem);
         let port = server_addr.port();
         let (certs, key) = load_client_cert_from_pem(&client_cert_pem, &client_key_pem);
 
@@ -548,6 +657,7 @@ mod tests {
             result.err()
         );
         assert_eq!(result.unwrap().len(), 95);
+        assert_eq!(server.join().unwrap(), 0);
     }
 
     #[test]

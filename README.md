@@ -118,7 +118,7 @@ Brewmble uses mutual TLS (mTLS) for all CLI-to-daemon communication. A single cl
 - **CA management**: `brewmble ca init` creates a self-signed ECDSA P-256 cluster CA in the OS keyring.
 - **Daemon certificates**: `brewmble cert issue --kind daemon --cn <hostname> --out-dir <dir>` produces `ca.pem`, `daemon.pem`, and `daemon-key.pem`.
 - **Client certificate**: `brewmble cert issue --kind client` stores the CLI client certificate in the keyring.
-- **Verification**: The daemon accepts any client certificate signed by the cluster CA. Hostname verification is disabled so DHCP/IP churn does not break connectivity.
+- **Verification**: The daemon accepts client certificates issued by the cluster CA. The CLI checks the daemon's certificate against the cluster CA, verifies that it matches the target hostname or IP address, and checks the leaf fingerprint on the connection carrying the request. A pin failure prevents requests to that target. Use the DNS name in the daemon certificate, or use an IP address only if the certificate includes that IP as a subject alternative name.
 
 #### Certificate Lifecycle and Operational Notes
 
