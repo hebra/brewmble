@@ -234,7 +234,9 @@ fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
         if let Some(index) = found_index {
             let node = &mut profile.nodes[index];
             let mut node_updated = false;
-            if node.address != addr {
+            let has_hostname = reqwest::Url::parse(&resolve_url(&node.address))
+                .is_ok_and(|url| url.domain().is_some());
+            if node.address != addr && !has_hostname {
                 let name = pin::node_name(node).to_string();
                 node.address = addr;
                 if node.fingerprint.take().is_some() {
@@ -1527,6 +1529,25 @@ mod tests {
         let nodes = &config.profiles.get("default").unwrap().nodes;
         assert_eq!(nodes[0].address, "1.1.1.2:8080");
         assert!(nodes[0].fingerprint.is_none());
+    }
+
+    #[test]
+    fn test_merge_nodes_preserves_saved_hostname_and_fingerprint() {
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
+            name: Some("node1".to_string()),
+            address: "node1.local:4712".to_string(),
+            fingerprint: Some("aa:bb".to_string()),
+        }];
+
+        let updated = merge_nodes(
+            &mut config,
+            vec![("192.0.2.10:4712".to_string(), "node1".to_string())],
+        );
+        assert!(!updated);
+        let node = &config.profiles["default"].nodes[0];
+        assert_eq!(node.address, "node1.local:4712");
+        assert_eq!(node.fingerprint.as_deref(), Some("aa:bb"));
     }
 
     #[test]
