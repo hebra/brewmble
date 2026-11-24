@@ -23,7 +23,7 @@ jobs:
         crate: [cli, daemon, rest]
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: ${{ matrix.crate }}
+      - run: cargo install cargo-audit --locked
+      # Run inside the crate so cargo-audit loads its `.cargo/audit.toml`.
+      - run: cargo audit
+        working-directory: ${{ matrix.crate }}
