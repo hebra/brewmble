@@ -160,6 +160,34 @@ fn update_node_fingerprint(config: &mut Config, address: &str, fingerprint: &str
     }
 }
 
+fn save_learned_status_pins(
+    path: &Path,
+    profile_name: &str,
+    learned_pins: Vec<(&NodeConfig, String)>,
+) -> Result<(), Box<dyn Error>> {
+    if learned_pins.is_empty() {
+        return Ok(());
+    }
+    let mut latest = load_config(path)?;
+    let Some(profile) = latest.profiles.get_mut(profile_name) else {
+        return Ok(());
+    };
+    let mut updated = false;
+    for (target, fingerprint) in learned_pins {
+        if let Some(node) = profile.nodes.iter_mut().find(|n| n.address == target.address)
+            && node.fingerprint.is_none()
+        {
+            println!("Pinned {} {}", pin::node_name(node), fingerprint);
+            node.fingerprint = Some(fingerprint);
+            updated = true;
+        }
+    }
+    if updated {
+        save_config(path, &latest)?;
+    }
+    Ok(())
+}
+
 fn write_config_atomically(path: &Path, content: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -442,7 +470,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if targets.is_empty() && !all && !config_exists {
                 println!("No config file was found or set.");
             }
-            run_status(all, targets, &mut config, &config_path)
+            run_status(all, targets, &config, &config_path)
         }
         Some(Commands::Node {
             full_upgrade,
@@ -1358,6 +1386,60 @@ mod tests {
     }
 
     #[test]
+    fn test_save_status_pins_preserves_concurrent_profile_changes() {
+        let dir = std::env::temp_dir().join(format!("brewmble_status_pins_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let node = |address: &str, fingerprint: Option<&str>| NodeConfig {
+            name: None,
+            address: address.to_string(),
+            fingerprint: fingerprint.map(str::to_string),
+        };
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![
+            node("one:4712", None),
+            node("two:4712", None),
+            node("removed:4712", None),
+        ];
+        save_config(&path, &config).unwrap();
+        let original = load_config(&path).unwrap();
+
+        config.active_profile = "other".to_string();
+        config.profiles.get_mut("default").unwrap().nodes = vec![
+            node("one:4712", None),
+            node("two:4712", Some("newer-pin")),
+            node("three:4712", None),
+        ];
+        config.profiles.insert(
+            "other".to_string(),
+            ProfileConfig {
+                nodes: vec![node("one:4712", None)],
+            },
+        );
+        save_config(&path, &config).unwrap();
+        save_learned_status_pins(
+            &path,
+            "default",
+            vec![
+                (&original.profiles["default"].nodes[0], "learned".to_string()),
+                (&original.profiles["default"].nodes[1], "stale".to_string()),
+                (&original.profiles["default"].nodes[2], "stale".to_string()),
+            ],
+        )
+        .unwrap();
+
+        let latest = load_config(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(latest.active_profile, "other");
+        assert!(latest.profiles["other"].nodes[0].fingerprint.is_none());
+        let nodes = &latest.profiles["default"].nodes;
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].fingerprint.as_deref(), Some("learned"));
+        assert_eq!(nodes[1].fingerprint.as_deref(), Some("newer-pin"));
+        assert_eq!(nodes[2].address, "three:4712");
+    }
+
+    #[test]
     fn test_merge_nodes_updates_name() {
         let mut config = Config::default();
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
@@ -1612,7 +1694,7 @@ fn run_version(config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Er
 fn run_status(
     discover_all: bool,
     targets: Vec<String>,
-    config: &mut Config,
+    config: &Config,
     config_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
     println!("Querying status...");
@@ -1793,14 +1875,11 @@ fn run_status(
 
     pb.finish_and_clear();
 
-    let learned_pins = learned_pins.into_inner().unwrap();
-    if !learned_pins.is_empty() {
-        for (node, fingerprint) in learned_pins {
-            println!("Pinned {} {}", pin::node_name(node), fingerprint);
-            update_node_fingerprint(config, &node.address, &fingerprint);
-        }
-        save_config(config_path, config)?;
-    }
+    save_learned_status_pins(
+        config_path,
+        &active_profile_name,
+        learned_pins.into_inner().unwrap(),
+    )?;
 
     let reports = node_reports.lock().unwrap();
     if !reports.is_empty() {
