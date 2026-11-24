@@ -174,6 +174,21 @@ struct AppState {
     pm_available: bool,
     pm_version: String,
     upgrade_handle: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    reboot: Arc<std::sync::Mutex<RebootState>>,
+}
+
+/// Longest delay a client may request before a scheduled reboot.
+const MAX_REBOOT_DELAY_SECS: u64 = 3600;
+
+/// At most one reboot is scheduled at a time. While one is pending or running,
+/// new upgrades and reboots are refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RebootState {
+    #[default]
+    Idle,
+    /// Waiting out its delay; the id lets a cancelled task recognise it was replaced.
+    Pending(u64),
+    Rebooting,
 }
 
 struct UpgradingGuard(Arc<AtomicBool>);
@@ -330,6 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pm_available,
         pm_version,
         upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+        reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
     };
     let shutdown_state = state.clone();
 
@@ -496,18 +512,32 @@ async fn full_upgrade_handler(
         }
     }
 
-    if state
-        .is_upgrading
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
     {
-        return (
-            StatusCode::PRECONDITION_FAILED,
-            Json(UpgradeResponse {
-                message: "a full upgrade is currently running".to_string(),
-                updates: None,
-            }),
-        );
+        // Hold the reboot state while claiming the upgrade lock, so a pending reboot
+        // always wins against an upgrade that arrives as its delay expires.
+        let reboot = lock_reboot(&state.reboot);
+        if *reboot != RebootState::Idle {
+            return (
+                StatusCode::LOCKED,
+                Json(UpgradeResponse {
+                    message: "a reboot is scheduled; cancel it before upgrading".to_string(),
+                    updates: None,
+                }),
+            );
+        }
+        if state
+            .is_upgrading
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(UpgradeResponse {
+                    message: "a full upgrade is currently running".to_string(),
+                    updates: None,
+                }),
+            );
+        }
     }
 
     let handle = tokio::spawn(async move {
@@ -550,18 +580,49 @@ impl RebootRunner for TokioRebootRunner {
     }
 }
 
-async fn execute_reboot<R: RebootRunner + Send + Sync>(delay_secs: Option<u64>, runner: &R) {
-    if let Some(d) = delay_secs {
-        tokio::time::sleep(std::time::Duration::from_secs(d)).await;
-    }
+fn lock_reboot(reboot: &std::sync::Mutex<RebootState>) -> std::sync::MutexGuard<'_, RebootState> {
+    reboot.lock().unwrap_or_else(|e| e.into_inner())
+}
 
+/// Waits out the delay, then reboots only if this reboot is still the scheduled
+/// one and no upgrade is running.
+async fn run_scheduled_reboot<R: RebootRunner + Send + Sync>(
+    id: u64,
+    delay_secs: u64,
+    reboot: Arc<std::sync::Mutex<RebootState>>,
+    is_upgrading: Arc<AtomicBool>,
+    runner: &R,
+) {
+    if delay_secs > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+    }
+    {
+        let mut current = lock_reboot(&reboot);
+        if *current != RebootState::Pending(id) {
+            info!("scheduled reboot was cancelled");
+            return;
+        }
+        if is_upgrading.load(Ordering::SeqCst) {
+            warn!("skipping scheduled reboot: a full upgrade is running");
+            *current = RebootState::Idle;
+            return;
+        }
+        *current = RebootState::Rebooting;
+    }
+    if !execute_reboot(runner).await {
+        *lock_reboot(&reboot) = RebootState::Idle;
+    }
+}
+
+/// Returns whether a reboot command succeeded.
+async fn execute_reboot<R: RebootRunner + Send + Sync>(runner: &R) -> bool {
     match runner
         .run("/usr/bin/sudo", &["-n", "/usr/bin/systemctl", "reboot"])
         .await
     {
         Ok(status) if status.success() => {
             info!("system reboot initiated via systemctl");
-            return;
+            return true;
         }
         Ok(status) => error!("systemctl reboot failed: exit status {status}"),
         Err(e) => error!("failed to execute systemctl reboot command: {e}"),
@@ -571,15 +632,19 @@ async fn execute_reboot<R: RebootRunner + Send + Sync>(delay_secs: Option<u64>, 
         .run("/usr/bin/sudo", &["-n", "/usr/sbin/reboot"])
         .await
     {
-        Ok(status) if status.success() => info!("system reboot initiated via fallback"),
+        Ok(status) if status.success() => {
+            info!("system reboot initiated via fallback");
+            return true;
+        }
         Ok(status) => error!("failed to initiate reboot: fallback exit status {status}"),
         Err(e) => error!("failed to execute fallback reboot command: {e}"),
     }
+    false
 }
 
 async fn reboot_handler(
     State(state): State<AppState>,
-    Json(_payload): Json<RebootRequest>,
+    Json(payload): Json<RebootRequest>,
 ) -> impl IntoResponse {
     if !state.pm_available {
         return (
@@ -593,15 +658,6 @@ async fn reboot_handler(
         );
     }
 
-    if state.is_upgrading.load(Ordering::SeqCst) {
-        return (
-            StatusCode::LOCKED,
-            Json(RebootResponse {
-                message: "a full upgrade is currently running".to_string(),
-            }),
-        );
-    }
-
     if !state.allow_reboot {
         return (
             StatusCode::FORBIDDEN,
@@ -611,16 +667,75 @@ async fn reboot_handler(
         );
     }
 
-    let delay = _payload.delay_secs;
+    let delay = payload.delay_secs.unwrap_or(0);
+    if delay > MAX_REBOOT_DELAY_SECS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(RebootResponse {
+                message: format!("delay_secs must be at most {MAX_REBOOT_DELAY_SECS}"),
+            }),
+        );
+    }
+
+    let id = {
+        let mut current = lock_reboot(&state.reboot);
+        if *current != RebootState::Idle {
+            return (
+                StatusCode::CONFLICT,
+                Json(RebootResponse {
+                    message: "a reboot is already scheduled".to_string(),
+                }),
+            );
+        }
+        if state.is_upgrading.load(Ordering::SeqCst) {
+            return (
+                StatusCode::LOCKED,
+                Json(RebootResponse {
+                    message: "a full upgrade is currently running".to_string(),
+                }),
+            );
+        }
+        let id = NEXT_REBOOT_ID.fetch_add(1, Ordering::SeqCst);
+        *current = RebootState::Pending(id);
+        id
+    };
+
+    let reboot = state.reboot.clone();
+    let is_upgrading = state.is_upgrading.clone();
     tokio::spawn(async move {
-        info!("scheduling system reboot");
-        execute_reboot(delay, &TokioRebootRunner).await;
+        info!("scheduling system reboot in {delay}s");
+        run_scheduled_reboot(id, delay, reboot, is_upgrading, &TokioRebootRunner).await;
     });
 
     (
         StatusCode::OK,
         Json(RebootResponse {
-            message: "reboot triggered".to_string(),
+            message: if delay > 0 {
+                format!("reboot scheduled in {delay}s")
+            } else {
+                "reboot triggered".to_string()
+            },
+        }),
+    )
+}
+
+static NEXT_REBOOT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+async fn cancel_reboot_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let mut current = lock_reboot(&state.reboot);
+    let (status, message) = match *current {
+        RebootState::Pending(_) => {
+            *current = RebootState::Idle;
+            info!("scheduled reboot cancelled");
+            (StatusCode::OK, "reboot cancelled")
+        }
+        RebootState::Rebooting => (StatusCode::CONFLICT, "the reboot is already in progress"),
+        RebootState::Idle => (StatusCode::NOT_FOUND, "no reboot is scheduled"),
+    };
+    (
+        status,
+        Json(RebootResponse {
+            message: message.to_string(),
         }),
     )
 }
@@ -712,7 +827,10 @@ fn build_router(state: AppState, access: client_auth::ClientAccess) -> Router {
         ));
     let operator_routes = Router::new()
         .route(PATH_UPGRADE, post(full_upgrade_handler))
-        .route(PATH_REBOOT, post(reboot_handler))
+        .route(
+            PATH_REBOOT,
+            post(reboot_handler).delete(cancel_reboot_handler),
+        )
         .route_layer(from_fn_with_state(access, client_auth::require_operator));
     read_routes.merge(operator_routes).with_state(state)
 }
@@ -856,6 +974,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -892,6 +1011,7 @@ mod tests {
             pm_available: false,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -927,6 +1047,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
             .route(PATH_HEALTH, get(health_handler))
@@ -963,6 +1084,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
             .route(PATH_UPGRADE, post(full_upgrade_handler))
@@ -999,6 +1121,7 @@ mod tests {
                 pm_available: true,
                 pm_version: "test".to_string(),
                 upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+                reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             };
             let app = Router::new()
                 .route("/status", get(status_handler))
@@ -1105,6 +1228,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
             .route(PATH_UPGRADE, post(full_upgrade_handler))
@@ -1151,6 +1275,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -1187,6 +1312,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -1223,6 +1349,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -1289,7 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_reboot_uses_sudo_n() {
         let runner = MockRebootRunner::new(vec![Ok(exit_success())]);
-        execute_reboot(None, &runner).await;
+        execute_reboot(&runner).await;
         let calls = runner.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "/usr/bin/sudo");
@@ -1299,7 +1426,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_reboot_falls_back_on_nonzero() {
         let runner = MockRebootRunner::new(vec![Ok(exit_failure()), Ok(exit_success())]);
-        execute_reboot(None, &runner).await;
+        execute_reboot(&runner).await;
         let calls = runner.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].1, vec!["-n", "/usr/bin/systemctl", "reboot"]);
@@ -1315,20 +1442,225 @@ mod tests {
             )),
             Ok(exit_success()),
         ]);
-        execute_reboot(None, &runner).await;
+        execute_reboot(&runner).await;
         let calls = runner.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].1, vec!["-n", "/usr/sbin/reboot"]);
     }
 
+    fn reboot_state(state: RebootState) -> Arc<std::sync::Mutex<RebootState>> {
+        Arc::new(std::sync::Mutex::new(state))
+    }
+
     #[tokio::test]
-    async fn test_execute_reboot_honors_delay() {
+    async fn test_scheduled_reboot_runs_when_still_pending() {
         let runner = MockRebootRunner::new(vec![Ok(exit_success())]);
-        let start = tokio::time::Instant::now();
-        execute_reboot(Some(0), &runner).await;
-        let elapsed = start.elapsed();
-        assert!(elapsed >= tokio::time::Duration::from_secs(0));
-        assert!(runner.calls().len() == 1);
+        let reboot = reboot_state(RebootState::Pending(7));
+        let upgrading = Arc::new(AtomicBool::new(false));
+        run_scheduled_reboot(7, 0, reboot.clone(), upgrading.clone(), &runner).await;
+        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(*reboot.lock().unwrap(), RebootState::Rebooting);
+        assert!(!upgrading.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_reboot_skipped_after_cancel() {
+        let runner = MockRebootRunner::new(vec![]);
+        let reboot = reboot_state(RebootState::Idle);
+        run_scheduled_reboot(
+            7,
+            0,
+            reboot.clone(),
+            Arc::new(AtomicBool::new(false)),
+            &runner,
+        )
+        .await;
+        assert!(runner.calls().is_empty());
+        assert_eq!(*reboot.lock().unwrap(), RebootState::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_reboot_skipped_when_replaced() {
+        let runner = MockRebootRunner::new(vec![]);
+        let reboot = reboot_state(RebootState::Pending(8));
+        run_scheduled_reboot(
+            7,
+            0,
+            reboot.clone(),
+            Arc::new(AtomicBool::new(false)),
+            &runner,
+        )
+        .await;
+        assert!(runner.calls().is_empty());
+        assert_eq!(*reboot.lock().unwrap(), RebootState::Pending(8));
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_reboot_rechecks_upgrade_lock_after_delay() {
+        let runner = MockRebootRunner::new(vec![]);
+        let reboot = reboot_state(RebootState::Pending(7));
+        let upgrading = Arc::new(AtomicBool::new(true));
+        run_scheduled_reboot(7, 0, reboot.clone(), upgrading, &runner).await;
+        assert!(runner.calls().is_empty());
+        assert_eq!(*reboot.lock().unwrap(), RebootState::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_reboot_failure_clears_state() {
+        let runner = MockRebootRunner::new(vec![Ok(exit_failure()), Ok(exit_failure())]);
+        let reboot = reboot_state(RebootState::Pending(7));
+        run_scheduled_reboot(
+            7,
+            0,
+            reboot.clone(),
+            Arc::new(AtomicBool::new(false)),
+            &runner,
+        )
+        .await;
+        assert_eq!(runner.calls().len(), 2);
+        assert_eq!(*reboot.lock().unwrap(), RebootState::Idle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_scheduled_reboot_waits_for_delay() {
+        let runner = Arc::new(MockRebootRunner::new(vec![Ok(exit_success())]));
+        let reboot = reboot_state(RebootState::Pending(7));
+        let task = {
+            let runner = runner.clone();
+            let reboot = reboot.clone();
+            tokio::spawn(async move {
+                run_scheduled_reboot(7, 60, reboot, Arc::new(AtomicBool::new(false)), &*runner)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(59)).await;
+        assert!(runner.calls().is_empty());
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        task.await.unwrap();
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    fn reboot_test_state(allow_reboot: bool) -> AppState {
+        AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            allow_reboot,
+            auto_clean: false,
+            auto_remove: false,
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+        }
+    }
+
+    fn reboot_app(state: AppState) -> Router {
+        Router::new()
+            .route(
+                PATH_REBOOT,
+                post(reboot_handler).delete(cancel_reboot_handler),
+            )
+            .route(PATH_UPGRADE, post(full_upgrade_handler))
+            .with_state(state)
+    }
+
+    async fn send(app: &Router, method: &str, uri: &str, body: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn test_reboot_handler_rejects_long_delay() {
+        let state = reboot_test_state(true);
+        let app = reboot_app(state.clone());
+        let body = format!("{{\"delay_secs\":{}}}", MAX_REBOOT_DELAY_SECS + 1);
+        assert_eq!(
+            send(&app, "POST", PATH_REBOOT, &body).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(*state.reboot.lock().unwrap(), RebootState::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_reboot_pending_blocks_second_reboot_and_upgrade_until_cancelled() {
+        let state = reboot_test_state(true);
+        let app = reboot_app(state.clone());
+        let body = format!("{{\"delay_secs\":{MAX_REBOOT_DELAY_SECS}}}");
+        assert_eq!(send(&app, "POST", PATH_REBOOT, &body).await, StatusCode::OK);
+        assert!(matches!(
+            *state.reboot.lock().unwrap(),
+            RebootState::Pending(_)
+        ));
+
+        assert_eq!(
+            send(&app, "POST", PATH_REBOOT, "{}").await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            send(&app, "POST", PATH_UPGRADE, r#"{"dry_run":false}"#).await,
+            StatusCode::LOCKED
+        );
+        assert!(!state.is_upgrading.load(Ordering::SeqCst));
+
+        assert_eq!(send(&app, "DELETE", PATH_REBOOT, "").await, StatusCode::OK);
+        assert_eq!(*state.reboot.lock().unwrap(), RebootState::Idle);
+        assert_eq!(
+            send(&app, "DELETE", PATH_REBOOT, "").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pending_reboot_wins_over_upgrade_at_expiry() {
+        let state = reboot_test_state(true);
+        *state.reboot.lock().unwrap() = RebootState::Pending(7);
+        let app = reboot_app(state.clone());
+        // Upgrade admission is refused without touching the upgrade lock...
+        assert_eq!(
+            send(&app, "POST", PATH_UPGRADE, r#"{"dry_run":false}"#).await,
+            StatusCode::LOCKED
+        );
+        assert!(!state.is_upgrading.load(Ordering::SeqCst));
+        // ...so the expiring timer still reboots.
+        let runner = MockRebootRunner::new(vec![Ok(exit_success())]);
+        run_scheduled_reboot(
+            7,
+            0,
+            state.reboot.clone(),
+            state.is_upgrading.clone(),
+            &runner,
+        )
+        .await;
+        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(*state.reboot.lock().unwrap(), RebootState::Rebooting);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_reboot_in_progress_conflicts() {
+        let state = reboot_test_state(true);
+        *state.reboot.lock().unwrap() = RebootState::Rebooting;
+        let app = reboot_app(state.clone());
+        assert_eq!(
+            send(&app, "DELETE", PATH_REBOOT, "").await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            send(&app, "POST", PATH_UPGRADE, r#"{"dry_run":false}"#).await,
+            StatusCode::LOCKED
+        );
     }
 
     #[tokio::test]
@@ -1345,6 +1677,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -1483,6 +1816,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
 
         assert!(state.allow_reboot);
@@ -1608,6 +1942,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         }
     }
 
@@ -1783,6 +2118,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let access = client_auth::ClientAccess::default();
         let app = build_router(state, access.clone());
