@@ -743,7 +743,7 @@ fn run_cert(subcommand: CertCommands) -> Result<(), Box<dyn Error>> {
 
 fn write_private_key(path: &Path, key: &str) -> Result<(), Box<dyn Error>> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -755,6 +755,7 @@ fn write_private_key(path: &Path, key: &str) -> Result<(), Box<dyn Error>> {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    file.set_len(0)?;
     file.write_all(key.as_bytes())?;
     Ok(())
 }
