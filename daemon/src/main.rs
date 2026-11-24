@@ -986,6 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "runs a real package upgrade on the host"]
     async fn test_full_upgrade_flow() {
         #[cfg(target_os = "linux")]
         {
