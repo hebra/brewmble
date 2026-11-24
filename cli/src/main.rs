@@ -160,23 +160,32 @@ fn update_node_fingerprint(config: &mut Config, address: &str, fingerprint: &str
     }
 }
 
-fn validate_and_update_pins(
-    config: &mut Config,
-    nodes: &[NodeConfig],
-) -> Result<bool, Box<dyn Error>> {
+fn save_learned_status_pins(
+    path: &Path,
+    profile_name: &str,
+    learned_pins: Vec<(&NodeConfig, String)>,
+) -> Result<(), Box<dyn Error>> {
+    if learned_pins.is_empty() {
+        return Ok(());
+    }
+    let mut latest = load_config(path)?;
+    let Some(profile) = latest.profiles.get_mut(profile_name) else {
+        return Ok(());
+    };
     let mut updated = false;
-    for node in nodes {
-        match check_pin(node, &node.address) {
-            Ok(PinOutcome::Learned(fp)) => {
-                println!("Pinned {} {}", pin::node_name(node), fp);
-                update_node_fingerprint(config, &node.address, &fp);
-                updated = true;
-            }
-            Ok(PinOutcome::Matched) => {}
-            Err(e) => eprintln!("error: {e}"),
+    for (target, fingerprint) in learned_pins {
+        if let Some(node) = profile.nodes.iter_mut().find(|n| n.address == target.address)
+            && node.fingerprint.is_none()
+        {
+            println!("Pinned {} {}", pin::node_name(node), fingerprint);
+            node.fingerprint = Some(fingerprint);
+            updated = true;
         }
     }
-    Ok(updated)
+    if updated {
+        save_config(path, &latest)?;
+    }
+    Ok(())
 }
 
 fn write_config_atomically(path: &Path, content: &str) -> io::Result<()> {
@@ -225,7 +234,9 @@ fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
         if let Some(index) = found_index {
             let node = &mut profile.nodes[index];
             let mut node_updated = false;
-            if node.address != addr {
+            let has_hostname = reqwest::Url::parse(&resolve_url(&node.address))
+                .is_ok_and(|url| url.domain().is_some());
+            if node.address != addr && !has_hostname {
                 let name = pin::node_name(node).to_string();
                 node.address = addr;
                 if node.fingerprint.take().is_some() {
@@ -461,7 +472,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if targets.is_empty() && !all && !config_exists {
                 println!("No config file was found or set.");
             }
-            run_status(all, targets, &mut config, &config_path)
+            run_status(all, targets, &config, &config_path)
         }
         Some(Commands::Node {
             full_upgrade,
@@ -1377,6 +1388,60 @@ mod tests {
     }
 
     #[test]
+    fn test_save_status_pins_preserves_concurrent_profile_changes() {
+        let dir = std::env::temp_dir().join(format!("brewmble_status_pins_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let node = |address: &str, fingerprint: Option<&str>| NodeConfig {
+            name: None,
+            address: address.to_string(),
+            fingerprint: fingerprint.map(str::to_string),
+        };
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![
+            node("one:4712", None),
+            node("two:4712", None),
+            node("removed:4712", None),
+        ];
+        save_config(&path, &config).unwrap();
+        let original = load_config(&path).unwrap();
+
+        config.active_profile = "other".to_string();
+        config.profiles.get_mut("default").unwrap().nodes = vec![
+            node("one:4712", None),
+            node("two:4712", Some("newer-pin")),
+            node("three:4712", None),
+        ];
+        config.profiles.insert(
+            "other".to_string(),
+            ProfileConfig {
+                nodes: vec![node("one:4712", None)],
+            },
+        );
+        save_config(&path, &config).unwrap();
+        save_learned_status_pins(
+            &path,
+            "default",
+            vec![
+                (&original.profiles["default"].nodes[0], "learned".to_string()),
+                (&original.profiles["default"].nodes[1], "stale".to_string()),
+                (&original.profiles["default"].nodes[2], "stale".to_string()),
+            ],
+        )
+        .unwrap();
+
+        let latest = load_config(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(latest.active_profile, "other");
+        assert!(latest.profiles["other"].nodes[0].fingerprint.is_none());
+        let nodes = &latest.profiles["default"].nodes;
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].fingerprint.as_deref(), Some("learned"));
+        assert_eq!(nodes[1].fingerprint.as_deref(), Some("newer-pin"));
+        assert_eq!(nodes[2].address, "three:4712");
+    }
+
+    #[test]
     fn test_merge_nodes_updates_name() {
         let mut config = Config::default();
         config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
@@ -1464,6 +1529,25 @@ mod tests {
         let nodes = &config.profiles.get("default").unwrap().nodes;
         assert_eq!(nodes[0].address, "1.1.1.2:8080");
         assert!(nodes[0].fingerprint.is_none());
+    }
+
+    #[test]
+    fn test_merge_nodes_preserves_saved_hostname_and_fingerprint() {
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![NodeConfig {
+            name: Some("node1".to_string()),
+            address: "node1.local:4712".to_string(),
+            fingerprint: Some("aa:bb".to_string()),
+        }];
+
+        let updated = merge_nodes(
+            &mut config,
+            vec![("192.0.2.10:4712".to_string(), "node1".to_string())],
+        );
+        assert!(!updated);
+        let node = &config.profiles["default"].nodes[0];
+        assert_eq!(node.address, "node1.local:4712");
+        assert_eq!(node.fingerprint.as_deref(), Some("aa:bb"));
     }
 
     #[test]
@@ -1581,27 +1665,26 @@ fn entry_tls(entry: &ResolvedService) -> String {
 }
 
 fn run_version(config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Error>> {
+    let clients = pin::PinnedClients::load()?;
     let mut tw = TabWriter::new(std::io::stdout());
     writeln!(tw, "COMPONENT\tVERSION")?;
     writeln!(tw, "CLI (local)\t{}", env!("CARGO_PKG_VERSION"))?;
 
     let active_profile = config.active_profile.clone();
     if let Some(profile) = config.profiles.get(&active_profile).cloned() {
-        let client = ca::build_client()?;
-
         let mut pin_updated = false;
         for node in &profile.nodes {
-            match check_pin(node, &node.address) {
-                Ok(PinOutcome::Learned(fp)) => {
-                    println!("Pinned {} {}", pin::node_name(node), fp);
-                    update_node_fingerprint(config, &node.address, &fp);
-                    pin_updated = true;
-                }
-                Ok(PinOutcome::Matched) => {}
+            let (client, outcome) = match clients.connect(node) {
+                Ok(connection) => connection,
                 Err(e) => {
                     eprintln!("error: {e}");
                     continue;
                 }
+            };
+            if let PinOutcome::Learned(fp) = outcome {
+                println!("Pinned {} {}", pin::node_name(node), fp);
+                update_node_fingerprint(config, &node.address, &fp);
+                pin_updated = true;
             }
 
             let url = resolve_url(&node.address);
@@ -1627,15 +1710,16 @@ fn run_version(config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Er
     }
 
     tw.flush()?;
-    Ok(())
+    clients.finish()
 }
 
 fn run_status(
     discover_all: bool,
     targets: Vec<String>,
-    config: &mut Config,
+    config: &Config,
     config_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
+    let clients = pin::PinnedClients::load()?;
     println!("Querying status...");
 
     let multi = MultiProgress::new();
@@ -1653,6 +1737,15 @@ fn run_status(
         .get(&active_profile_name)
         .map(|p| p.nodes.clone())
         .unwrap_or_default();
+    let saved_targets: HashMap<_, _> = profile_nodes
+        .iter()
+        .rev()
+        .filter_map(|node| {
+            reqwest::Url::parse(&resolve_url(&node.address))
+                .ok()
+                .map(|url| (url, node))
+        })
+        .collect();
 
     // 1. Collect explicit targets and profile nodes, deduplicated by address
     let mut initial_targets: HashSet<String> = HashSet::new();
@@ -1669,22 +1762,6 @@ fn run_status(
         for node in &profile_nodes {
             initial_targets.insert(node.address.clone());
         }
-    }
-
-    // 2. Validate TOFU pins for profile nodes we are about to contact
-    let nodes_to_validate: Vec<NodeConfig> = if initial_targets.is_empty() && discover_all {
-        Vec::new()
-    } else if initial_targets.is_empty() {
-        profile_nodes.clone()
-    } else {
-        profile_nodes
-            .iter()
-            .filter(|n| initial_targets.contains(&n.address))
-            .cloned()
-            .collect()
-    };
-    if validate_and_update_pins(config, &nodes_to_validate)? {
-        save_config(config_path, config)?;
     }
 
     for addr in initial_targets {
@@ -1721,10 +1798,9 @@ fn run_status(
 
     drop(target_tx); // Close tx so rx finishes when discovery is done
 
-    let client = ca::build_client()?;
-
     let seen_targets = Arc::new(Mutex::new(HashSet::new()));
     let node_reports = Arc::new(Mutex::new(Vec::<(String, bool, bool)>::new()));
+    let learned_pins = Mutex::new(Vec::new());
 
     let pb = if native_supported {
         let pb = ProgressBar::new(0);
@@ -1746,9 +1822,13 @@ fn run_status(
 
     rayon::scope(|s| {
         while let Ok((target_addr, target_name)) = target_rx.recv() {
-            let client = client.clone();
+            let clients = &clients;
             let seen_targets = Arc::clone(&seen_targets);
             let node_reports = Arc::clone(&node_reports);
+            let learned_pins = &learned_pins;
+            let saved_node = reqwest::Url::parse(&resolve_url(&target_addr))
+                .ok()
+                .and_then(|url| saved_targets.get(&url).copied());
             let pb = pb.clone();
             let multi = multi.clone();
             let native = Arc::clone(&native);
@@ -1758,15 +1838,35 @@ fn run_status(
             native.set_progress(pb.position(), pb.length());
 
             s.spawn(move |_| {
-                if !seen_targets.lock().unwrap().insert(target_addr.clone()) {
+                let address = saved_node.map_or(target_addr.as_str(), |node| &node.address);
+                if !seen_targets.lock().unwrap().insert(address.to_owned()) {
                     pb.inc_length(0); // Adjust length if skipped
                     pb.inc(1);
                     native.set_progress(pb.position(), pb.length());
                     return;
                 }
 
-                let (status, message, details, failed, outdated) =
-                    query_status(&client, &target_addr);
+                let discovered_node = NodeConfig {
+                    address: target_addr.clone(),
+                    name: target_name.clone(),
+                    fingerprint: None,
+                };
+                let node = saved_node.unwrap_or(&discovered_node);
+                let (status, message, details, failed, outdated) = match clients.connect(node) {
+                    Ok((client, outcome)) => {
+                        if let (Some(saved), PinOutcome::Learned(fp)) = (saved_node, outcome) {
+                            learned_pins.lock().unwrap().push((saved, fp));
+                        }
+                        query_status(&client, &node.address)
+                    }
+                    Err(err) => (
+                        format!("Pin verification failed: {err}"),
+                        String::new(),
+                        String::new(),
+                        true,
+                        false,
+                    ),
+                };
 
                 if failed {
                     any_failed.store(true, Ordering::Relaxed);
@@ -1798,6 +1898,12 @@ fn run_status(
     });
 
     pb.finish_and_clear();
+
+    save_learned_status_pins(
+        config_path,
+        &active_profile_name,
+        learned_pins.into_inner().unwrap(),
+    )?;
 
     let reports = node_reports.lock().unwrap();
     if !reports.is_empty() {
@@ -1843,7 +1949,7 @@ fn run_status(
         native.clear();
     }
 
-    Ok(())
+    clients.finish()
 }
 
 fn query_status(
@@ -2116,17 +2222,24 @@ fn run_node(
         return Ok(());
     }
 
-    if validate_and_update_pins(config, &target_nodes)? {
-        save_config(config_path, config)?;
-    }
-
-    let client = ca::build_client()?;
-
+    let clients = pin::PinnedClients::load()?;
     let mut tw = TabWriter::new(io::stdout());
     writeln!(tw, "NODE\tSTATUS")?;
 
     for node in &target_nodes {
         let name = node.name.as_deref().unwrap_or(&node.address);
+        let (client, outcome) = match clients.connect(node) {
+            Ok(connection) => connection,
+            Err(err) => {
+                writeln!(tw, "{}\tPin verification failed: {}", name, err)?;
+                continue;
+            }
+        };
+        if let PinOutcome::Learned(fp) = outcome {
+            println!("Pinned {} {}", name, fp);
+            update_node_fingerprint(config, &node.address, &fp);
+            save_config(config_path, config)?;
+        }
         let url = resolve_url(&node.address);
 
         let (status, body, updates) = if reboot {
@@ -2177,5 +2290,5 @@ fn run_node(
 
     tw.flush()?;
 
-    Ok(())
+    clients.finish()
 }
