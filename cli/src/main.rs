@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tabwriter::TabWriter;
 
 mod ca;
+mod export;
 mod pin;
 mod progress;
 mod sanitize;
@@ -26,7 +27,7 @@ use pin::{PinOutcome, check_pin};
 use progress::NativeProgress;
 use sanitize::sanitize_display;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Config {
     #[serde(default = "default_profile_name")]
     active_profile: String,
@@ -345,6 +346,27 @@ enum Commands {
         #[command(subcommand)]
         subcommand: CertCommands,
     },
+    /// Export profiles, certificate pins, and credentials to an encrypted age file
+    Export {
+        /// Destination .age file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Overwrite an existing export file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Import profiles, certificate pins, and credentials from an encrypted age file
+    Import {
+        /// Source .age file
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Replace existing configuration and credentials
+        #[arg(long)]
+        force: bool,
+        /// Validate and summarize the import without writing any state
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show version information for CLI and daemons
     Version,
 }
@@ -414,6 +436,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let (config_path, config_exists) = resolve_config_path(cli.config);
+    if let Some(Commands::Import {
+        input,
+        force,
+        dry_run,
+    }) = &cli.command
+    {
+        return export::run_import(&ca::KeyringStore, input, &config_path, *force, *dry_run);
+    }
     let mut config = match load_config(&config_path) {
         Ok(c) => c,
         Err(err) => {
@@ -462,6 +492,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(Commands::Ca { subcommand }) => run_ca(subcommand),
         Some(Commands::Cert { subcommand }) => run_cert(subcommand),
+        Some(Commands::Export { output, force }) => {
+            export::run_export(&config, &ca::KeyringStore, &output, force, &config_path)
+        }
+        Some(Commands::Import { .. }) => unreachable!("imports are handled before loading config"),
         Some(Commands::Version) => run_version(&mut config, &config_path),
         None => {
             // This case might be reached if only options are provided but no command.
@@ -1224,6 +1258,42 @@ mod tests {
             assert!(!force);
         } else {
             panic!("Expected cert issue client command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_export() {
+        let cli = Cli::parse_from(["brewmble", "export", "--output", "backup.age", "--force"]);
+        match cli.command {
+            Some(Commands::Export { output, force }) => {
+                assert_eq!(output, PathBuf::from("backup.age"));
+                assert!(force);
+            }
+            _ => panic!("Expected export command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_import() {
+        let cli = Cli::parse_from([
+            "brewmble",
+            "import",
+            "--input",
+            "backup.age",
+            "--force",
+            "--dry-run",
+        ]);
+        match cli.command {
+            Some(Commands::Import {
+                input,
+                force,
+                dry_run,
+            }) => {
+                assert_eq!(input, PathBuf::from("backup.age"));
+                assert!(force);
+                assert!(dry_run);
+            }
+            _ => panic!("Expected import command"),
         }
     }
 

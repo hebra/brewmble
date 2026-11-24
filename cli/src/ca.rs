@@ -7,10 +7,10 @@ use std::error::Error;
 use time::{Duration, OffsetDateTime};
 
 const KEYRING_SERVICE: &str = "brewmble-cli";
-const ACCOUNT_CA_CERT: &str = "cluster-ca-cert";
-const ACCOUNT_CA_KEY: &str = "cluster-ca-key";
-const ACCOUNT_CLIENT_CERT: &str = "client-cert";
-const ACCOUNT_CLIENT_KEY: &str = "client-key";
+pub(crate) const ACCOUNT_CA_CERT: &str = "cluster-ca-cert";
+pub(crate) const ACCOUNT_CA_KEY: &str = "cluster-ca-key";
+pub(crate) const ACCOUNT_CLIENT_CERT: &str = "client-cert";
+pub(crate) const ACCOUNT_CLIENT_KEY: &str = "client-key";
 
 const CA_CN: &str = "brewmble-cluster-ca";
 pub const CA_VALIDITY_DAYS: i64 = 365 * 10;
@@ -24,6 +24,7 @@ pub enum LeafKind {
 pub trait CredentialStore: Send + Sync {
     fn get(&self, account: &str) -> Result<Option<String>, Box<dyn Error>>;
     fn set(&self, account: &str, value: &str) -> Result<(), Box<dyn Error>>;
+    fn delete(&self, account: &str) -> Result<(), Box<dyn Error>>;
 }
 
 pub trait LegacyStore: Send + Sync {
@@ -89,7 +90,7 @@ fn delete_legacy(_account: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-const MIGRATION_ACCOUNTS: [&str; 4] = [
+pub(crate) const CREDENTIAL_ACCOUNTS: [&str; 4] = [
     ACCOUNT_CA_CERT,
     ACCOUNT_CA_KEY,
     ACCOUNT_CLIENT_CERT,
@@ -152,7 +153,7 @@ pub fn migrate_ca_with_stores(
     dry_run: bool,
 ) -> Result<MigrationReport, Box<dyn Error>> {
     let mut entries = Vec::new();
-    for account in MIGRATION_ACCOUNTS {
+    for account in CREDENTIAL_ACCOUNTS {
         let status = migrate_account(store, legacy, account, dry_run);
         entries.push(MigrationEntry { account, status });
     }
@@ -210,6 +211,10 @@ impl CredentialStore for KeyringStore {
         let entry = keyring::Entry::new(KEYRING_SERVICE, account)?;
         entry.set_password(value).map_err(|err| Box::new(err) as _)
     }
+
+    fn delete(&self, account: &str) -> Result<(), Box<dyn Error>> {
+        delete_credential(account)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -223,6 +228,10 @@ impl CredentialStore for KeyringStore {
 
     fn set(&self, account: &str, value: &str) -> Result<(), Box<dyn Error>> {
         macos_sec_item_set(account, value)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), Box<dyn Error>> {
+        delete_credential(account)
     }
 }
 
@@ -483,6 +492,11 @@ mod tests {
                 .insert(account.to_string(), value.to_string());
             Ok(())
         }
+
+        fn delete(&self, account: &str) -> Result<(), Box<dyn Error>> {
+            self.data.lock().unwrap().remove(account);
+            Ok(())
+        }
     }
 
     #[test]
@@ -554,7 +568,7 @@ mod tests {
     fn test_migrate_all_from_legacy() {
         let store = MemoryStore::default();
         let legacy = MemoryLegacyStore::default();
-        for account in MIGRATION_ACCOUNTS {
+        for account in CREDENTIAL_ACCOUNTS {
             legacy.insert(account, &format!("value-{account}"));
         }
         let report = migrate_ca_with_stores(&store, &legacy, false).unwrap();
@@ -562,7 +576,7 @@ mod tests {
         for entry in &report.entries {
             assert_eq!(entry.status, MigrationStatus::Migrated);
         }
-        for account in MIGRATION_ACCOUNTS {
+        for account in CREDENTIAL_ACCOUNTS {
             assert_eq!(
                 store.get(account).unwrap(),
                 Some(format!("value-{account}"))

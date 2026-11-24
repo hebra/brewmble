@@ -11,6 +11,7 @@ The Brewmble CLI (`brewmble`) is a command-line interface for managing Brewmble 
   - [Node Management](#node-management)
   - [Certificate Management](#certificate-management)
   - [Profile Management](#profile-management)
+  - [Export and Import](#export-and-import)
   - [Version Information](#version-information)
 - [Security](#security)
 - [Configuration](#configuration)
@@ -121,6 +122,33 @@ brewmble profile delete <name>
 # Open the configuration file in $EDITOR
 brewmble profile edit
 ```
+
+### Export and Import
+
+Migrate all profiles, node certificate pins, and the cluster CA and client credentials to another machine using one passphrase-encrypted [age](https://age-encryption.org/) file:
+
+```bash
+# Export the CLI state; prompts for a passphrase and confirmation
+brewmble export --output brewmble-backup.age
+
+# Validate the backup and preview its non-sensitive contents without writing
+brewmble import --input brewmble-backup.age --dry-run
+
+# Restore onto a machine with no existing Brewmble configuration or credentials
+brewmble import --input brewmble-backup.age
+
+# Explicitly replace existing configuration and keyring credentials
+brewmble import --input brewmble-backup.age --force
+
+# Preview a replacement when state already exists
+brewmble import --input brewmble-backup.age --force --dry-run
+```
+
+The export preserves all profiles and the active profile, together with the cluster CA certificate and private key and the client certificate and private key. This retains both the existing mTLS identity and the ability to issue future daemon and client certificates. The input and output paths must differ from the configuration path; `--config` works with both commands.
+
+Exports are binary age files created with mode `0600` on Unix. Existing export files are not overwritten without `--force`. Imports validate the archive version, certificate validity and usage, matching certificate/key pairs, and the client's CA signature before writing any state. Existing configuration and credentials are never merged with the imported state.
+
+The backup contains highly sensitive private keys. Use a strong passphrase, protect the file during transfer and storage, and delete the backup when it is no longer needed.
 
 ### Version Information
 

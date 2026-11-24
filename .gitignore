@@ -8,3 +8,4 @@ target/
 .*.txt
 .brewmble.yaml
 **/*.pem
+**/*.age
