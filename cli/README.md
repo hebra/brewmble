@@ -100,7 +100,11 @@ brewmble cert issue --kind daemon --cn <hostname> --out-dir <dir>
 brewmble cert issue --kind client
 # Re-issue an existing client certificate
 brewmble cert issue --kind client --force
+# Issue a read-only (health/status) client certificate to files for another host or tool
+brewmble cert issue --kind client --role read --cn monitor --out-dir ./monitor-certs
 ```
+
+Client certificates carry a role: `operator` (default; may also upgrade and reboot) or `read` (`/health` and `/status` only). The command prints the certificate's SHA-256 fingerprint; add it to `tls.allowed_clients` on each daemon that should accept it, and reload the daemon.
 
 ### Profile Management
 

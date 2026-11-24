@@ -11,6 +11,51 @@ pub const PATH_HEALTH: &str = "/health";
 pub const PATH_UPGRADE: &str = "/packages/full-upgrade";
 pub const PATH_REBOOT: &str = "/node/reboot";
 
+/// Prefix of the subject OU attribute that carries a client certificate's role.
+pub const CLIENT_ROLE_OU_PREFIX: &str = "brewmble-role:";
+
+/// Authorization level carried by a client certificate. `Operator` includes `Read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientRole {
+    /// May call `GET /health` and `GET /status`.
+    Read,
+    /// May also call `POST /packages/full-upgrade` and `POST /node/reboot`.
+    Operator,
+}
+
+impl ClientRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClientRole::Read => "read",
+            ClientRole::Operator => "operator",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "read" => Some(ClientRole::Read),
+            "operator" => Some(ClientRole::Operator),
+            _ => None,
+        }
+    }
+
+    /// Value of the subject OU attribute that encodes this role.
+    pub fn subject_ou(self) -> String {
+        format!("{CLIENT_ROLE_OU_PREFIX}{}", self.as_str())
+    }
+
+    pub fn allows(self, required: ClientRole) -> bool {
+        self >= required
+    }
+}
+
+impl std::fmt::Display for ClientRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StatusResponse {
     pub message: String,
@@ -59,6 +104,28 @@ pub struct UpgradeResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_client_role_round_trip_and_ordering() {
+        for role in [ClientRole::Read, ClientRole::Operator] {
+            assert_eq!(ClientRole::parse(role.as_str()), Some(role));
+            assert_eq!(role.to_string(), role.as_str());
+            assert_eq!(
+                role.subject_ou(),
+                format!("brewmble-role:{}", role.as_str())
+            );
+        }
+        assert_eq!(ClientRole::parse("admin"), None);
+        assert_eq!(ClientRole::parse("Operator"), None);
+        assert!(ClientRole::Operator.allows(ClientRole::Read));
+        assert!(ClientRole::Operator.allows(ClientRole::Operator));
+        assert!(ClientRole::Read.allows(ClientRole::Read));
+        assert!(!ClientRole::Read.allows(ClientRole::Operator));
+        assert_eq!(
+            serde_json::to_string(&ClientRole::Operator).unwrap(),
+            "\"operator\""
+        );
+    }
 
     #[test]
     fn test_status_response_serialization() {

@@ -16,7 +16,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "pro
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml_ng = "0.10"
+sha2 = "0.10"
 time = "0.3"
+tokio-rustls = { version = "0.26", default-features = false }
 x509-parser = "0.17"
 tower = { version = "0.5", features = ["util"] }
 async-trait = "0.1"

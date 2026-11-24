@@ -117,13 +117,15 @@ Brewmble uses mutual TLS (mTLS) for all CLI-to-daemon communication. A single cl
 
 - **CA management**: `brewmble ca init` creates a self-signed ECDSA P-256 cluster CA in the OS keyring.
 - **Daemon certificates**: `brewmble cert issue --kind daemon --cn <hostname> --out-dir <dir>` produces `ca.pem`, `daemon.pem`, and `daemon-key.pem`.
-- **Client certificate**: `brewmble cert issue --kind client` stores the CLI client certificate in the keyring.
-- **Verification**: The daemon accepts client certificates issued by the cluster CA. The CLI checks the daemon's certificate against the cluster CA, verifies that it matches the target hostname or IP address, and checks the leaf fingerprint on the connection carrying the request. A pin failure prevents requests to that target. Use the DNS name in the daemon certificate, or use an IP address only if the certificate includes that IP as a subject alternative name.
+- **Client certificate**: `brewmble cert issue --kind client` stores the CLI client certificate in the keyring. Add `--role read` for a certificate limited to `/health` and `/status`, and `--out-dir <dir>` to write the certificate to files (for another host or a monitoring tool) instead of replacing the CLI's own.
+- **Roles**: Each client certificate carries a role in its subject (`OU=brewmble-role:read` or `OU=brewmble-role:operator`, the default). `read` may call `GET /health` and `GET /status`; `operator` may also call `POST /packages/full-upgrade` and `POST /node/reboot`. Certificates without a role, such as those issued by older CLI versions, are treated as `read`; re-issue them with `brewmble cert issue --kind client --force`.
+- **Allow-list and revocation**: List the SHA-256 fingerprints of permitted client certificates under `tls.allowed_clients` in `brewmbled.yaml`. The daemon rejects any other certificate with `403 Forbidden`, even one signed by the cluster CA. To revoke a certificate, remove its fingerprint and reload the daemon (`systemctl reload brewmbled`, or send it `SIGHUP`); the change also applies to open connections. If `tls.allowed_clients` is not set, every certificate signed by the cluster CA is accepted, and `brewmbled config validate` warns about it.
+- **Verification**: The daemon accepts client certificates issued by the cluster CA, subject to the allow-list and role checks above. The CLI checks the daemon's certificate against the cluster CA, verifies that it matches the target hostname or IP address, and checks the leaf fingerprint on the connection carrying the request. A pin failure prevents requests to that target. Use the DNS name in the daemon certificate, or use an IP address only if the certificate includes that IP as a subject alternative name.
 
 #### Certificate Lifecycle and Operational Notes
 
 - **Validity**: Cluster CA certificates are valid for ~10 years; daemon and client leaf certificates are valid for 397 days. Plan renewal before expiry.
-- **Key Usage**: Daemon certificates include `ServerAuth` EKU and a DNS SAN matching the provided `--cn`. Client certificates include `ClientAuth` EKU and a DNS SAN matching the local hostname.
+- **Key Usage**: Daemon certificates include `ServerAuth` EKU and a DNS SAN matching the provided `--cn`. Client certificates include `ClientAuth` EKU, a DNS SAN matching the local hostname (or `--cn`), and their role as a subject OU.
 - **Private keys**: Daemon private keys are written with `0600` permissions. Keep the OS keyring (where the CLI stores CA and client keys) backed up and protected.
 - **Validation**: Run `brewmbled config validate` after rotating daemon certificates. It checks file presence, certificate/key pair-match, expiry (errors if expired, warns if < 30 days), and required EKU.
 - **Rotation workflow**:

@@ -1,3 +1,4 @@
+use brewmble_rest::ClientRole;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     PKCS_ECDSA_P256_SHA256,
@@ -18,7 +19,7 @@ pub const LEAF_VALIDITY_DAYS: i64 = 397;
 
 pub enum LeafKind {
     Daemon,
-    Client,
+    Client(ClientRole),
 }
 
 pub trait CredentialStore: Send + Sync {
@@ -324,15 +325,28 @@ pub fn issue_leaf_with_store(
     kind: LeafKind,
     store: &dyn CredentialStore,
 ) -> Result<(String, String), Box<dyn Error>> {
-    let (ca_cert_pem, ca_key_pem) = ensure_ca_with_store(store)?;
-    let (cert, key) = generate_leaf(cn, &kind, &ca_cert_pem, &ca_key_pem)?;
+    let (cert, key) = issue_unstored_leaf_with_store(cn, &kind, store)?;
 
-    if matches!(kind, LeafKind::Client) {
+    if matches!(kind, LeafKind::Client(_)) {
         store.set(ACCOUNT_CLIENT_CERT, &cert)?;
         store.set(ACCOUNT_CLIENT_KEY, &key)?;
     }
 
     Ok((cert, key))
+}
+
+/// Issues a leaf certificate without storing it as this CLI's client certificate.
+pub fn issue_unstored_leaf(cn: &str, kind: LeafKind) -> Result<(String, String), Box<dyn Error>> {
+    issue_unstored_leaf_with_store(cn, &kind, &KeyringStore)
+}
+
+pub fn issue_unstored_leaf_with_store(
+    cn: &str,
+    kind: &LeafKind,
+    store: &dyn CredentialStore,
+) -> Result<(String, String), Box<dyn Error>> {
+    let (ca_cert_pem, ca_key_pem) = ensure_ca_with_store(store)?;
+    generate_leaf(cn, kind, &ca_cert_pem, &ca_key_pem)
 }
 
 pub fn ca_root_pem() -> Result<String, Box<dyn Error>> {
@@ -373,7 +387,9 @@ fn macos_sec_item_delete(account: &str) -> Result<(), Box<dyn Error>> {
 #[cfg(not(target_os = "macos"))]
 fn macos_sec_item_delete(account: &str) -> Result<(), Box<dyn Error>> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, account)?;
-    entry.delete_credential().map_err(|e| -> Box<dyn Error> { Box::new(e) })
+    entry
+        .delete_credential()
+        .map_err(|e| -> Box<dyn Error> { Box::new(e) })
 }
 
 pub fn fingerprint(cert_pem: &str) -> Result<String, Box<dyn Error>> {
@@ -429,7 +445,10 @@ fn generate_leaf(
         LeafKind::Daemon => {
             params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         }
-        LeafKind::Client => {
+        LeafKind::Client(role) => {
+            params
+                .distinguished_name
+                .push(DnType::OrganizationalUnitName, role.subject_ou());
             params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         }
     }
@@ -499,9 +518,49 @@ mod tests {
         let store = MemoryStore::default();
         let (_ca_cert, _ca_key) = ensure_ca_with_store(&store).unwrap();
         let (_cert_pem, _key_pem) =
-            issue_leaf_with_store("client1", LeafKind::Client, &store).unwrap();
+            issue_leaf_with_store("client1", LeafKind::Client(ClientRole::Operator), &store)
+                .unwrap();
         assert!(store.get(ACCOUNT_CLIENT_CERT).unwrap().is_some());
         assert!(store.get(ACCOUNT_CLIENT_KEY).unwrap().is_some());
+    }
+
+    fn subject_role_ous(cert_pem: &str) -> Vec<String> {
+        let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).unwrap();
+        let cert = pem.parse_x509().unwrap();
+        cert.subject()
+            .iter_organizational_unit()
+            .map(|ou| ou.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_client_leaf_carries_role() {
+        let store = MemoryStore::default();
+        for role in [ClientRole::Read, ClientRole::Operator] {
+            let (cert_pem, _key) =
+                issue_unstored_leaf_with_store("client1", &LeafKind::Client(role), &store).unwrap();
+            assert_eq!(subject_role_ous(&cert_pem), vec![role.subject_ou()]);
+        }
+    }
+
+    #[test]
+    fn test_daemon_leaf_has_no_role() {
+        let store = MemoryStore::default();
+        let (cert_pem, _key) =
+            issue_unstored_leaf_with_store("daemon1", &LeafKind::Daemon, &store).unwrap();
+        assert!(subject_role_ous(&cert_pem).is_empty());
+    }
+
+    #[test]
+    fn test_unstored_client_leaf_does_not_replace_keyring_client() {
+        let store = MemoryStore::default();
+        let (stored, _) =
+            issue_leaf_with_store("cli", LeafKind::Client(ClientRole::Operator), &store).unwrap();
+        let (other, _) =
+            issue_unstored_leaf_with_store("monitor", &LeafKind::Client(ClientRole::Read), &store)
+                .unwrap();
+        assert_ne!(stored, other);
+        assert_eq!(store.get(ACCOUNT_CLIENT_CERT).unwrap(), Some(stored));
     }
 
     #[test]
