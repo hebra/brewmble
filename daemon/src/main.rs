@@ -512,31 +512,32 @@ async fn full_upgrade_handler(
         }
     }
 
-    if state
-        .is_upgrading
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
     {
-        return (
-            StatusCode::PRECONDITION_FAILED,
-            Json(UpgradeResponse {
-                message: "a full upgrade is currently running".to_string(),
-                updates: None,
-            }),
-        );
-    }
-
-    // Checked after taking the upgrade lock: reboot_handler checks the lock while
-    // holding the reboot state, so an upgrade and a reboot can never both start.
-    if *lock_reboot(&state.reboot) != RebootState::Idle {
-        state.is_upgrading.store(false, Ordering::SeqCst);
-        return (
-            StatusCode::LOCKED,
-            Json(UpgradeResponse {
-                message: "a reboot is scheduled; cancel it before upgrading".to_string(),
-                updates: None,
-            }),
-        );
+        // Hold the reboot state while claiming the upgrade lock, so a pending reboot
+        // always wins against an upgrade that arrives as its delay expires.
+        let reboot = lock_reboot(&state.reboot);
+        if *reboot != RebootState::Idle {
+            return (
+                StatusCode::LOCKED,
+                Json(UpgradeResponse {
+                    message: "a reboot is scheduled; cancel it before upgrading".to_string(),
+                    updates: None,
+                }),
+            );
+        }
+        if state
+            .is_upgrading
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(UpgradeResponse {
+                    message: "a full upgrade is currently running".to_string(),
+                    updates: None,
+                }),
+            );
+        }
     }
 
     let handle = tokio::spawn(async move {
@@ -1620,6 +1621,31 @@ mod tests {
             send(&app, "DELETE", PATH_REBOOT, "").await,
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn test_pending_reboot_wins_over_upgrade_at_expiry() {
+        let state = reboot_test_state(true);
+        *state.reboot.lock().unwrap() = RebootState::Pending(7);
+        let app = reboot_app(state.clone());
+        // Upgrade admission is refused without touching the upgrade lock...
+        assert_eq!(
+            send(&app, "POST", PATH_UPGRADE, r#"{"dry_run":false}"#).await,
+            StatusCode::LOCKED
+        );
+        assert!(!state.is_upgrading.load(Ordering::SeqCst));
+        // ...so the expiring timer still reboots.
+        let runner = MockRebootRunner::new(vec![Ok(exit_success())]);
+        run_scheduled_reboot(
+            7,
+            0,
+            state.reboot.clone(),
+            state.is_upgrading.clone(),
+            &runner,
+        )
+        .await;
+        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(*state.reboot.lock().unwrap(), RebootState::Rebooting);
     }
 
     #[tokio::test]
