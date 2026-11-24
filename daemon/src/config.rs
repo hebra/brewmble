@@ -59,8 +59,22 @@ pub struct TlsConfig {
     pub key: PathBuf,
     /// SHA-256 fingerprints of the client certificates allowed to call the API.
     /// When unset, every client certificate signed by the cluster CA is accepted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A key with no value (`allowed_clients:`) is an empty list and rejects every client.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_list",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub allowed_clients: Option<Vec<String>>,
+}
+
+fn deserialize_present_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(
+        Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default(),
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -807,6 +821,24 @@ server:
         let config = config_with_allowed_clients(None);
         let yaml = serde_yaml_ng::to_string(&config).unwrap();
         assert!(!yaml.contains("allowed_clients"));
+    }
+
+    #[test]
+    fn test_allowed_clients_blank_key_rejects_all() {
+        let config: DaemonConfig = serde_yaml_ng::from_str(
+            "tls:\n  ca_cert: /ca.pem\n  cert: /c.pem\n  key: /k.pem\n  allowed_clients:\n",
+        )
+        .unwrap();
+        assert_eq!(config.tls.allowed_clients, Some(vec![]));
+        assert_eq!(
+            allowed_client_fingerprints(&config.tls).unwrap(),
+            Some(HashSet::new())
+        );
+
+        let config: DaemonConfig =
+            serde_yaml_ng::from_str("tls:\n  ca_cert: /ca.pem\n  cert: /c.pem\n  key: /k.pem\n")
+                .unwrap();
+        assert_eq!(config.tls.allowed_clients, None);
     }
 
     #[test]
