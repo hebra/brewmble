@@ -471,7 +471,12 @@ mod tests {
     fn populated_store() -> MemoryStore {
         let store = MemoryStore::default();
         ensure_ca_with_store(&store).unwrap();
-        issue_leaf_with_store("test-client", LeafKind::Client, &store).unwrap();
+        issue_leaf_with_store(
+            "test-client",
+            LeafKind::Client(brewmble_rest::ClientRole::Operator),
+            &store,
+        )
+        .unwrap();
         store
     }
 

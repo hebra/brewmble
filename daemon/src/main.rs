@@ -2,6 +2,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
+    middleware::from_fn_with_state,
     response::IntoResponse,
     routing::{get, post},
 };
@@ -26,6 +27,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod client_auth;
 pub mod config;
 mod package_manager;
 use package_manager::{PackageManager, get_package_manager};
@@ -243,6 +245,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Loaded configuration from {}", config_path.display());
 
+    let allowed_clients = config::allowed_client_fingerprints(&daemon_config.tls)?;
+    match &allowed_clients {
+        Some(list) => info!("client allow-list active: {} certificate(s)", list.len()),
+        None => warn!(
+            "tls.allowed_clients is not set; any client certificate signed by the cluster CA is accepted"
+        ),
+    }
+    let client_access = client_auth::ClientAccess::new(allowed_clients);
+    #[cfg(unix)]
+    client_auth::spawn_reload_on_sighup(config_path.clone(), client_access.clone());
+
     let bind_ip = server_bind_ip(&daemon_config);
     let http_port = if let Some(port) = daemon_config.server.port {
         let addr = SocketAddr::from((bind_ip, port));
@@ -320,19 +333,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let shutdown_state = state.clone();
 
-    let app = Router::new()
-        .route(PATH_HEALTH, get(health_handler))
-        .route(PATH_STATUS, get(status_handler))
-        .route(PATH_UPGRADE, post(full_upgrade_handler))
-        .route(PATH_REBOOT, post(reboot_handler))
-        .layer((
-            TraceLayer::new_for_http(),
-            TimeoutLayer::with_status_code(
-                StatusCode::REQUEST_TIMEOUT,
-                std::time::Duration::from_secs(300),
-            ),
-        ))
-        .with_state(state);
+    let app = build_router(state, client_access).layer((
+        TraceLayer::new_for_http(),
+        TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(300),
+        ),
+    ));
 
     let addr = SocketAddr::from((bind_ip, http_port));
     info!("brewmble daemon listening on {}", addr);
@@ -340,6 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
     let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
     let server = axum_server::bind_rustls(addr, rustls_config)
+        .map(client_auth::ClientIdentityAcceptor::new)
         .handle(handle.clone())
         .serve(app.into_make_service());
 
@@ -693,6 +701,22 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
     Some(daemon)
 }
 
+/// API routes, each guarded by the client-certificate role it requires.
+fn build_router(state: AppState, access: client_auth::ClientAccess) -> Router {
+    let read_routes = Router::new()
+        .route(PATH_HEALTH, get(health_handler))
+        .route(PATH_STATUS, get(status_handler))
+        .route_layer(from_fn_with_state(
+            access.clone(),
+            client_auth::require_read,
+        ));
+    let operator_routes = Router::new()
+        .route(PATH_UPGRADE, post(full_upgrade_handler))
+        .route(PATH_REBOOT, post(reboot_handler))
+        .route_layer(from_fn_with_state(access, client_auth::require_operator));
+    read_routes.merge(operator_routes).with_state(state)
+}
+
 pub(crate) fn load_tls_config(
     ca_path: &Path,
     cert_path: &Path,
@@ -970,7 +994,10 @@ mod tests {
                 allow_reboot: false,
                 auto_clean: false,
                 auto_remove: false,
-                package_manager: Arc::new(get_package_manager(false, false)),
+                package_manager: Arc::new(get_package_manager(false, false, 0)),
+                pm_available: true,
+                pm_version: "test".to_string(),
+                upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             };
             let app = Router::new()
                 .route("/status", get(status_handler))
@@ -1421,6 +1448,7 @@ mod tests {
                 ca_cert: ca_path,
                 cert: cert_path,
                 key: key_path,
+                allowed_clients: None,
             },
             features: config::FeaturesConfig {
                 allow_reboot: true,
@@ -1528,9 +1556,19 @@ mod tests {
 
     fn generate_test_leaf(
         cn: &str,
+        ca_cert: &str,
+        ca_key: &str,
+        eku: ExtendedKeyUsagePurpose,
+    ) -> (String, String) {
+        generate_test_leaf_with_role(cn, ca_cert, ca_key, eku, None)
+    }
+
+    fn generate_test_leaf_with_role(
+        cn: &str,
         _ca_cert: &str,
         ca_key: &str,
         eku: ExtendedKeyUsagePurpose,
+        role: Option<brewmble_rest::ClientRole>,
     ) -> (String, String) {
         let ca_key = KeyPair::from_pem(ca_key).unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -1543,12 +1581,149 @@ mod tests {
         let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.distinguished_name.push(DnType::CommonName, cn);
+        if let Some(role) = role {
+            params
+                .distinguished_name
+                .push(DnType::OrganizationalUnitName, role.subject_ou());
+        }
         params.extended_key_usages = vec![eku];
         let not_before = OffsetDateTime::now_utc() - time::Duration::days(1);
         params.not_before = not_before;
         params.not_after = not_before + time::Duration::days(397);
         let cert = params.signed_by(&leaf_key, &issuer).unwrap();
         (cert.pem(), leaf_key.serialize_pem())
+    }
+
+    fn router_test_state() -> AppState {
+        AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    async fn route_status(
+        app: &Router,
+        method: &str,
+        path: &str,
+        identity: Option<client_auth::ClientIdentity>,
+    ) -> StatusCode {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Content-Type", "application/json");
+        if let Some(identity) = identity {
+            builder = builder.extension(identity);
+        }
+        let body = if method == "POST" {
+            axum::body::Body::from("{}")
+        } else {
+            axum::body::Body::empty()
+        };
+        app.clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn test_router_enforces_roles_per_route() {
+        use brewmble_rest::ClientRole;
+        let access = client_auth::ClientAccess::default();
+        let app = build_router(router_test_state(), access);
+        let id = |role| client_auth::ClientIdentity {
+            fingerprint: "aa".to_string(),
+            role,
+        };
+
+        for path in [PATH_HEALTH, PATH_STATUS] {
+            assert_eq!(
+                route_status(&app, "GET", path, None).await,
+                StatusCode::UNAUTHORIZED
+            );
+            for role in [None, Some(ClientRole::Read), Some(ClientRole::Operator)] {
+                assert_eq!(
+                    route_status(&app, "GET", path, Some(id(role))).await,
+                    StatusCode::OK
+                );
+            }
+        }
+
+        for path in [PATH_UPGRADE, PATH_REBOOT] {
+            assert_eq!(
+                route_status(&app, "POST", path, None).await,
+                StatusCode::UNAUTHORIZED
+            );
+            for role in [None, Some(ClientRole::Read)] {
+                assert_eq!(
+                    route_status(&app, "POST", path, Some(id(role))).await,
+                    StatusCode::FORBIDDEN
+                );
+            }
+        }
+        // Operators reach the handlers: reboot is disabled and the upgrade body is invalid
+        // (dry_run is required), so neither does anything.
+        assert_eq!(
+            route_status(
+                &app,
+                "POST",
+                PATH_REBOOT,
+                Some(id(Some(ClientRole::Operator)))
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            route_status(
+                &app,
+                "POST",
+                PATH_UPGRADE,
+                Some(id(Some(ClientRole::Operator)))
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn test_router_rejects_clients_missing_from_allow_list() {
+        use brewmble_rest::ClientRole;
+        let access = client_auth::ClientAccess::new(Some(std::collections::HashSet::from([
+            "aa".to_string()
+        ])));
+        let app = build_router(router_test_state(), access.clone());
+        let id = |fp: &str| client_auth::ClientIdentity {
+            fingerprint: fp.to_string(),
+            role: Some(ClientRole::Operator),
+        };
+
+        assert_eq!(
+            route_status(&app, "GET", PATH_HEALTH, Some(id("aa"))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            route_status(&app, "GET", PATH_HEALTH, Some(id("bb"))).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            route_status(&app, "POST", PATH_REBOOT, Some(id("bb"))).await,
+            StatusCode::FORBIDDEN
+        );
+
+        access.replace(Some(std::collections::HashSet::new()));
+        assert_eq!(
+            route_status(&app, "GET", PATH_HEALTH, Some(id("aa"))).await,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]
@@ -1570,6 +1745,13 @@ mod tests {
             &ca_cert,
             &ca_key,
             ExtendedKeyUsagePurpose::ClientAuth,
+        );
+        let (operator_cert, operator_key) = generate_test_leaf_with_role(
+            "test-operator",
+            &ca_cert,
+            &ca_key,
+            ExtendedKeyUsagePurpose::ClientAuth,
+            Some(brewmble_rest::ClientRole::Operator),
         );
         let (other_ca, other_key) = generate_test_ca("other-ca");
         let (other_client_cert, other_client_key) = generate_test_leaf(
@@ -1601,15 +1783,14 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         };
-        let app = Router::new()
-            .route(PATH_HEALTH, get(health_handler))
-            .route(PATH_STATUS, get(status_handler))
-            .with_state(state);
+        let access = client_auth::ClientAccess::default();
+        let app = build_router(state, access.clone());
 
         let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
         let server = axum_server::bind_rustls(addr, rustls_config)
+            .map(client_auth::ClientIdentityAcceptor::new)
             .handle(handle.clone())
             .serve(app.into_make_service());
         tokio::spawn(server);
@@ -1653,6 +1834,65 @@ mod tests {
 
         let response = client_ok
             .get(format!("{}{}", base, PATH_STATUS))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        // A certificate without a role is read-only.
+        let response = client_ok
+            .post(format!("{}{}", base, PATH_REBOOT))
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert!(body["message"].as_str().unwrap().contains("role 'read'"));
+
+        // An operator certificate passes authorization and reaches the reboot handler.
+        let operator_identity =
+            reqwest::Identity::from_pem(format!("{}\n{}", operator_cert, operator_key).as_bytes())
+                .unwrap();
+        let client_operator = reqwest::Client::builder()
+            .identity(operator_identity)
+            .tls_certs_only([ca_root.clone()])
+            .tls_danger_accept_invalid_hostnames(true)
+            .https_only(true)
+            .build()
+            .unwrap();
+        let response = client_operator
+            .post(format!("{}{}", base, PATH_REBOOT))
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(body["message"], "reboot is not enabled on this daemon");
+
+        // Restricting the allow-list revokes the read-only certificate, including on
+        // its already open connection.
+        let operator_fp = {
+            let der = rustls_pemfile::certs(&mut operator_cert.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap();
+            client_auth::fingerprint(der.as_ref())
+        };
+        access.replace(Some(std::collections::HashSet::from([operator_fp])));
+        let response = client_ok
+            .get(format!("{}{}", base, PATH_HEALTH))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        let response = client_operator
+            .get(format!("{}{}", base, PATH_HEALTH))
             .send()
             .await
             .unwrap();
@@ -1781,6 +2021,7 @@ mod tests {
                 ca_cert: ca_path,
                 cert: cert_path,
                 key: key_path,
+                allowed_clients: None,
             },
             features: config::FeaturesConfig::default(),
             package_manager: config::PackageManagerConfig::default(),

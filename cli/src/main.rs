@@ -416,13 +416,33 @@ enum CertCommands {
         /// Common name for the certificate (required for daemon certs)
         #[arg(short, long)]
         cn: Option<String>,
-        /// Output directory for daemon certificate files
+        /// Output directory for certificate files (required for daemon certs; for client
+        /// certs, writes the files there instead of replacing this CLI's keyring certificate)
         #[arg(short, long)]
         out_dir: Option<PathBuf>,
+        /// Role of a client certificate: `read` (health/status) or `operator` (also
+        /// upgrade/reboot). Defaults to `operator`
+        #[arg(short, long, value_enum)]
+        role: Option<CertRole>,
         /// Overwrite existing client certificate or output files
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CertRole {
+    Read,
+    Operator,
+}
+
+impl From<CertRole> for brewmble_rest::ClientRole {
+    fn from(role: CertRole) -> Self {
+        match role {
+            CertRole::Read => brewmble_rest::ClientRole::Read,
+            CertRole::Operator => brewmble_rest::ClientRole::Operator,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -641,9 +661,13 @@ fn run_cert(subcommand: CertCommands) -> Result<(), Box<dyn Error>> {
             kind,
             cn,
             out_dir,
+            role,
             force,
         } => match kind {
             CertKind::Daemon => {
+                if role.is_some() {
+                    return Err("--role applies only to client certificates".into());
+                }
                 let cn = cn.ok_or("--cn is required for daemon certificates")?;
                 let out_dir = out_dir.ok_or("--out-dir is required for daemon certificates")?;
                 std::fs::create_dir_all(&out_dir)?;
@@ -661,15 +685,7 @@ fn run_cert(subcommand: CertCommands) -> Result<(), Box<dyn Error>> {
 
                 std::fs::write(&ca_path, ca_cert)?;
                 std::fs::write(&cert_path, &cert)?;
-                std::fs::write(&key_path, key)?;
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perms = std::fs::metadata(&key_path)?.permissions();
-                    perms.set_mode(0o600);
-                    std::fs::set_permissions(&key_path, perms)?;
-                }
+                write_private_key(&key_path, &key)?;
 
                 println!("Daemon certificate written to {}", out_dir.display());
                 println!("  CN:   {}", cn);
@@ -679,19 +695,58 @@ fn run_cert(subcommand: CertCommands) -> Result<(), Box<dyn Error>> {
                 println!("  SHA256 fingerprint: {}", ca::fingerprint(&cert)?);
             }
             CertKind::Client => {
-                if !force && ca::client_cert_pem().is_ok() {
-                    return Err("client certificate already exists; use --force to re-issue".into());
-                }
-                let hostname = gethostname::gethostname().to_string_lossy().into_owned();
-                let (cert, _key) = ca::issue_leaf(&hostname, ca::LeafKind::Client)?;
-                println!("Client certificate issued and stored in the keyring.");
-                println!("  CN:   {}", hostname);
-                println!("  SAN:  DNS:{}", hostname);
+                let role: brewmble_rest::ClientRole = role.unwrap_or(CertRole::Operator).into();
+                let cn =
+                    cn.unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
+                let cert = if let Some(out_dir) = out_dir {
+                    std::fs::create_dir_all(&out_dir)?;
+                    let ca_path = out_dir.join("ca.pem");
+                    let cert_path = out_dir.join("client.pem");
+                    let key_path = out_dir.join("client-key.pem");
+                    if !force && (ca_path.exists() || cert_path.exists() || key_path.exists()) {
+                        return Err("output files already exist; use --force to overwrite".into());
+                    }
+                    let (ca_cert, _ca_key) = ca::ensure_ca()?;
+                    let (cert, key) = ca::issue_unstored_leaf(&cn, ca::LeafKind::Client(role))?;
+                    std::fs::write(&ca_path, ca_cert)?;
+                    std::fs::write(&cert_path, &cert)?;
+                    write_private_key(&key_path, &key)?;
+                    println!("Client certificate written to {}", out_dir.display());
+                    cert
+                } else {
+                    if !force && ca::client_cert_pem().is_ok() {
+                        return Err(
+                            "client certificate already exists; use --force to re-issue".into()
+                        );
+                    }
+                    let (cert, _key) = ca::issue_leaf(&cn, ca::LeafKind::Client(role))?;
+                    println!("Client certificate issued and stored in the keyring.");
+                    cert
+                };
+                let fingerprint = ca::fingerprint(&cert)?;
+                println!("  CN:   {}", cn);
+                println!("  SAN:  DNS:{}", cn);
                 println!("  EKU:  ClientAuth");
+                println!("  Role: {}", role);
                 println!("  Days: {}", ca::LEAF_VALIDITY_DAYS);
-                println!("  SHA256 fingerprint: {}", ca::fingerprint(&cert)?);
+                println!("  SHA256 fingerprint: {}", fingerprint);
+                println!();
+                println!("To allow this certificate, add its fingerprint to tls.allowed_clients");
+                println!("in brewmbled.yaml on each node and reload the daemon:");
+                println!("  allowed_clients:");
+                println!("    - \"{}\"", fingerprint);
             }
         },
+    }
+    Ok(())
+}
+
+fn write_private_key(path: &Path, key: &str) -> Result<(), Box<dyn Error>> {
+    std::fs::write(path, key)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }
@@ -1239,16 +1294,72 @@ mod tests {
                     kind: CertKind::Daemon,
                     cn,
                     out_dir,
+                    role,
                     force,
                 },
         }) = cli.command
         {
             assert_eq!(cn, Some("host1".to_string()));
             assert_eq!(out_dir, Some(PathBuf::from("/tmp/certs")));
+            assert!(role.is_none());
             assert!(!force);
         } else {
             panic!("Expected cert issue daemon command");
         }
+    }
+
+    #[test]
+    fn test_cli_parse_cert_issue_client_with_role() {
+        let cli = Cli::parse_from(&[
+            "brewmble",
+            "cert",
+            "issue",
+            "--kind",
+            "client",
+            "--role",
+            "read",
+            "--cn",
+            "monitor",
+            "--out-dir",
+            "/tmp/monitor",
+        ]);
+        if let Some(Commands::Cert {
+            subcommand:
+                CertCommands::Issue {
+                    kind: CertKind::Client,
+                    cn,
+                    out_dir,
+                    role,
+                    ..
+                },
+        }) = cli.command
+        {
+            assert_eq!(cn.as_deref(), Some("monitor"));
+            assert_eq!(out_dir, Some(PathBuf::from("/tmp/monitor")));
+            assert_eq!(role, Some(CertRole::Read));
+            assert_eq!(
+                brewmble_rest::ClientRole::from(CertRole::Read),
+                brewmble_rest::ClientRole::Read
+            );
+            assert_eq!(
+                brewmble_rest::ClientRole::from(CertRole::Operator),
+                brewmble_rest::ClientRole::Operator
+            );
+        } else {
+            panic!("Expected cert issue client command");
+        }
+    }
+
+    #[test]
+    fn test_cert_issue_daemon_rejects_role() {
+        let result = run_cert(CertCommands::Issue {
+            kind: CertKind::Daemon,
+            cn: Some("node1".to_string()),
+            out_dir: Some(PathBuf::from("/nonexistent")),
+            role: Some(CertRole::Read),
+            force: false,
+        });
+        assert!(result.unwrap_err().to_string().contains("--role"));
     }
 
     #[test]
@@ -1260,12 +1371,14 @@ mod tests {
                     kind: CertKind::Client,
                     cn,
                     out_dir,
+                    role,
                     force,
                 },
         }) = cli.command
         {
             assert!(cn.is_none());
             assert!(out_dir.is_none());
+            assert!(role.is_none());
             assert!(!force);
         } else {
             panic!("Expected cert issue client command");

@@ -10,6 +10,8 @@ Type=simple
 ExecStart=/opt/brewmble/.cargo/bin/brewmbled
 # Or, point to a specific configuration file
 #ExecStart=/opt/brewmble/.cargo/bin/brewmbled --config /etc/brewmble/brewmbled.yaml
+# SIGHUP reloads tls.allowed_clients from the configuration file
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 User=brewmble
 

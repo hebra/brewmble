@@ -333,6 +333,13 @@ tls:
   # Path to the daemon private key PEM file
   key: "/etc/brewmble/tls/daemon-key.pem"
 
+  # SHA-256 fingerprints of the client certificates allowed to call the API
+  # (as printed by `brewmble cert issue --kind client`). Optional; if omitted,
+  # any client certificate signed by the cluster CA is accepted.
+  # Reload the daemon (SIGHUP) after editing this list.
+  allowed_clients:
+    - "ab:cd:...:ef"
+
 # Daemon behavior flags
 features:
   # Allow the daemon to reboot the host when requested via the API (default: false)
@@ -354,6 +361,18 @@ package_manager:
 
 All API endpoints require a valid client certificate signed by the cluster CA. The daemon does not use API keys; TLS client-certificate verification is the sole authentication mechanism.
 
+Each request is then authorized against the client certificate:
+
+- **Allow-list**: If `tls.allowed_clients` is set, only certificates whose SHA-256 fingerprint is listed are accepted; others get `403 Forbidden`. Remove a fingerprint and reload the daemon (`systemctl reload brewmbled` or `kill -HUP <pid>`) to revoke that certificate. If the reloaded file is invalid, the daemon logs an error and keeps the previous list.
+- **Roles**: The role in the certificate subject (`OU=brewmble-role:<role>`, set by `brewmble cert issue --kind client --role <role>`) decides which endpoints it may call:
+
+  | Endpoint | `read` | `operator` |
+  |---|---|---|
+  | `GET /health`, `GET /status` | yes | yes |
+  | `POST /packages/full-upgrade`, `POST /node/reboot` | no | yes |
+
+  A certificate without a role (for example one issued by an older CLI) is treated as `read`.
+
 Provision the daemon with three PEM files:
 
 - `ca.pem` — cluster CA certificate
@@ -370,7 +389,7 @@ For more details, see the [main Security section](../README.md#security).
 
 ## API Endpoints
 
-All endpoints are served over HTTPS and require a client certificate signed by the cluster CA.
+All endpoints are served over HTTPS and require a client certificate signed by the cluster CA. `/health` and `/status` need the `read` role; `/packages/full-upgrade` and `/node/reboot` need `operator`. A client that is not on the allow-list or lacks the role gets `403 Forbidden` with a JSON `message`.
 
 ### `GET /health`
 
