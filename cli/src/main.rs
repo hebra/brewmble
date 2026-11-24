@@ -742,12 +742,20 @@ fn run_cert(subcommand: CertCommands) -> Result<(), Box<dyn Error>> {
 }
 
 fn write_private_key(path: &Path, key: &str) -> Result<(), Box<dyn Error>> {
-    std::fs::write(path, key)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    file.write_all(key.as_bytes())?;
     Ok(())
 }
 
@@ -842,6 +850,26 @@ mod tests {
     use clap::Parser;
     use mdns_sd::ServiceInfo;
 
+    #[cfg(unix)]
+    #[test]
+    fn test_write_private_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("brewmble-key-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client-key.pem");
+        std::fs::write(&path, "old-longer-contents").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_key(&path, "key").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "key");
+
+        let fresh = dir.join("fresh-key.pem");
+        write_private_key(&fresh, "key").unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     fn test_cli_parse_discover_default() {
         unsafe {
