@@ -1,0 +1,7 @@
+[advisories]
+# RUSTSEC-2026-0387: timing side channels in crypto-bigint 0.5.5, pulled in by
+# age 0.12 -> p256/hpke (an unconditional dependency; no age release drops it and
+# crypto-bigint has no patched 0.5.x). brewmble only uses age's scrypt
+# passphrase recipient for `export`/`import`, which never runs P-256 arithmetic
+# on secret data. Remove this once age moves to crypto-bigint >= 0.7.6.
+ignore = ["RUSTSEC-2026-0387"]
