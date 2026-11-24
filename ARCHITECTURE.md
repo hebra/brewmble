@@ -60,7 +60,8 @@ Security is handled exclusively via mutual TLS (mTLS); there are no API keys.
 - `GET /health`: Returns liveness information and the detected package manager.
 - `GET /status`: Returns information about the system and available updates.
 - `POST /packages/full-upgrade`: Triggers a system-wide upgrade (or a dry-run). This is a fire-and-forget operation in the background to prevent HTTP timeouts.
-- `POST /node/reboot`: Reboots the host, gated by the `features.allow_reboot` configuration flag.
+- `POST /node/reboot`: Reboots the host, now or after up to an hour (`delay_secs`), gated by the `features.allow_reboot` configuration flag. Only one reboot can be pending; upgrades are refused while it is, and the upgrade lock is checked again before rebooting.
+- `DELETE /node/reboot`: Cancels a pending reboot.
 
 ---
 

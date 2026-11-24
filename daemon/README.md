@@ -24,6 +24,7 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
   - [`GET /status`](#get-status)
   - [`POST /packages/full-upgrade`](#post-packagesfull-upgrade)
   - [`POST /node/reboot`](#post-nodereboot)
+  - [`DELETE /node/reboot`](#delete-nodereboot)
 - [Development](#development)
   - [Running Tests](#running-tests)
 
@@ -369,7 +370,7 @@ Each request is then authorized against the client certificate:
   | Endpoint | `read` | `operator` |
   |---|---|---|
   | `GET /health`, `GET /status` | yes | yes |
-  | `POST /packages/full-upgrade`, `POST /node/reboot` | no | yes |
+  | `POST /packages/full-upgrade`, `POST`/`DELETE /node/reboot` | no | yes |
 
   A certificate without a role (for example one issued by an older CLI) is treated as `read`.
 
@@ -389,7 +390,7 @@ For more details, see the [main Security section](../README.md#security).
 
 ## API Endpoints
 
-All endpoints are served over HTTPS and require a client certificate signed by the cluster CA. `/health` and `/status` need the `read` role; `/packages/full-upgrade` and `/node/reboot` need `operator`. A client that is not on the allow-list or lacks the role gets `403 Forbidden` with a JSON `message`.
+All endpoints are served over HTTPS and require a client certificate signed by the cluster CA. `/health` and `/status` need the `read` role; `/packages/full-upgrade` and `/node/reboot` (both methods) need `operator`. A client that is not on the allow-list or lacks the role gets `403 Forbidden` with a JSON `message`.
 
 ### `GET /health`
 
@@ -471,17 +472,29 @@ Only one upgrade can run at a time; the `is_upgrading` flag in `GET /status` rep
 
 - `200 OK`: Upgrade triggered (or dry-run completed).
 - `412 PRECONDITION_FAILED`: The package manager is not available, or a full upgrade is already running.
+- `423 LOCKED`: A reboot is scheduled or in progress; cancel it first with `DELETE /node/reboot`.
 
 ### `POST /node/reboot`
 
-Reboots the host (via `sudo systemctl reboot`, falling back to `sudo reboot`). Only allowed if `features.allow_reboot` is enabled in the configuration, and rejected while a full upgrade is running. The request body is optional and currently ignored.
+Reboots the host (via `sudo systemctl reboot`, falling back to `sudo reboot`). Only allowed if `features.allow_reboot` is enabled in the configuration, and rejected while a full upgrade is running.
+
+**Request:**
+```json
+{
+  "delay_secs": 300
+}
+```
+
+`delay_secs` is optional (default `0`, at most `3600`). Only one reboot can be scheduled at a time, and full upgrades are refused while it is pending. When the delay ends, the daemon checks again that no upgrade is running before it reboots; if one is, the reboot is skipped.
 
 **Response when allowed:**
 ```json
 {
-  "message": "reboot triggered"
+  "message": "reboot scheduled in 300s"
 }
 ```
+
+(`"reboot triggered"` when there is no delay.)
 
 **Response when disabled:**
 ```json
@@ -492,10 +505,22 @@ Reboots the host (via `sudo systemctl reboot`, falling back to `sudo reboot`). O
 
 **Status codes:**
 
-- `200 OK`: Reboot triggered.
+- `200 OK`: Reboot triggered or scheduled.
+- `400 BAD_REQUEST`: `delay_secs` is greater than `3600`.
 - `403 FORBIDDEN`: Reboot is not enabled (`features.allow_reboot` is `false`).
+- `409 CONFLICT`: A reboot is already scheduled or in progress.
 - `412 PRECONDITION_FAILED`: The package manager is not available.
 - `423 LOCKED`: A full upgrade is currently running.
+
+### `DELETE /node/reboot`
+
+Cancels a scheduled reboot.
+
+**Status codes:**
+
+- `200 OK`: The scheduled reboot was cancelled.
+- `404 NOT_FOUND`: No reboot is scheduled.
+- `409 CONFLICT`: The reboot has already started and can't be cancelled.
 
 ## Development
 
