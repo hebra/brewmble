@@ -1665,6 +1665,7 @@ fn entry_tls(entry: &ResolvedService) -> String {
 }
 
 fn run_version(config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Error>> {
+    let clients = pin::PinnedClients::load()?;
     let mut tw = TabWriter::new(std::io::stdout());
     writeln!(tw, "COMPONENT\tVERSION")?;
     writeln!(tw, "CLI (local)\t{}", env!("CARGO_PKG_VERSION"))?;
@@ -1673,7 +1674,7 @@ fn run_version(config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Er
     if let Some(profile) = config.profiles.get(&active_profile).cloned() {
         let mut pin_updated = false;
         for node in &profile.nodes {
-            let (client, outcome) = match pin::connect(node) {
+            let (client, outcome) = match clients.connect(node) {
                 Ok(connection) => connection,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -1709,7 +1710,7 @@ fn run_version(config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Er
     }
 
     tw.flush()?;
-    Ok(())
+    clients.finish()
 }
 
 fn run_status(
@@ -1718,6 +1719,7 @@ fn run_status(
     config: &Config,
     config_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
+    let clients = pin::PinnedClients::load()?;
     println!("Querying status...");
 
     let multi = MultiProgress::new();
@@ -1820,6 +1822,7 @@ fn run_status(
 
     rayon::scope(|s| {
         while let Ok((target_addr, target_name)) = target_rx.recv() {
+            let clients = &clients;
             let seen_targets = Arc::clone(&seen_targets);
             let node_reports = Arc::clone(&node_reports);
             let learned_pins = &learned_pins;
@@ -1849,7 +1852,7 @@ fn run_status(
                     fingerprint: None,
                 };
                 let node = saved_node.unwrap_or(&discovered_node);
-                let (status, message, details, failed, outdated) = match pin::connect(node) {
+                let (status, message, details, failed, outdated) = match clients.connect(node) {
                     Ok((client, outcome)) => {
                         if let (Some(saved), PinOutcome::Learned(fp)) = (saved_node, outcome) {
                             learned_pins.lock().unwrap().push((saved, fp));
@@ -1946,7 +1949,7 @@ fn run_status(
         native.clear();
     }
 
-    Ok(())
+    clients.finish()
 }
 
 fn query_status(
@@ -2219,12 +2222,13 @@ fn run_node(
         return Ok(());
     }
 
+    let clients = pin::PinnedClients::load()?;
     let mut tw = TabWriter::new(io::stdout());
     writeln!(tw, "NODE\tSTATUS")?;
 
     for node in &target_nodes {
         let name = node.name.as_deref().unwrap_or(&node.address);
-        let (client, outcome) = match pin::connect(node) {
+        let (client, outcome) = match clients.connect(node) {
             Ok(connection) => connection,
             Err(err) => {
                 writeln!(tw, "{}\tPin verification failed: {}", name, err)?;
@@ -2286,5 +2290,5 @@ fn run_node(
 
     tw.flush()?;
 
-    Ok(())
+    clients.finish()
 }

@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -89,17 +90,68 @@ pub fn fetch_fingerprint(url: &str) -> Result<String, Box<dyn Error>> {
     fetch_fingerprint_with_certs(url, &ca_pem, client_cert, crate::get_default_timeout())
 }
 
-pub(crate) fn connect(
-    node: &crate::NodeConfig,
-) -> Result<(reqwest::blocking::Client, PinOutcome), Box<dyn Error>> {
-    connect_with(node, fetch_fingerprint, |expected| {
-        build_client(
-            &ca::ca_root_pem()?,
-            load_client_cert()?,
-            expected,
-            crate::get_default_timeout(),
-        )
-    })
+pub(crate) struct PinnedClients {
+    ca_pem: String,
+    client_cert: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+    timeout: std::time::Duration,
+    attempted: AtomicBool,
+    ready: AtomicBool,
+}
+
+impl PinnedClients {
+    pub(crate) fn load() -> Result<Self, Box<dyn Error>> {
+        let client_cert = load_client_cert().map_err(|err| {
+            format!(
+                "cannot load client credentials — run `brewmble cert issue --kind client`: {err}"
+            )
+        })?;
+        Ok(Self {
+            ca_pem: ca::ca_root_pem()?,
+            client_cert,
+            timeout: crate::get_default_timeout(),
+            attempted: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn connect(
+        &self,
+        node: &crate::NodeConfig,
+    ) -> Result<(reqwest::blocking::Client, PinOutcome), Box<dyn Error>> {
+        self.attempted.store(true, Ordering::Relaxed);
+        let connection = connect_with(
+            node,
+            |url| {
+                fetch_fingerprint_with_certs(
+                    url,
+                    &self.ca_pem,
+                    self.clone_client_cert(),
+                    self.timeout,
+                )
+            },
+            |expected| {
+                build_client(
+                    &self.ca_pem,
+                    self.clone_client_cert(),
+                    expected,
+                    self.timeout,
+                )
+            },
+        )?;
+        self.ready.store(true, Ordering::Relaxed);
+        Ok(connection)
+    }
+
+    fn clone_client_cert(&self) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        (self.client_cert.0.clone(), self.client_cert.1.clone_key())
+    }
+
+    pub(crate) fn finish(&self) -> Result<(), Box<dyn Error>> {
+        if self.attempted.load(Ordering::Relaxed) && !self.ready.load(Ordering::Relaxed) {
+            return Err("no targets passed certificate pin verification".into());
+        }
+        Ok(())
+    }
 }
 
 fn connect_with(
@@ -567,6 +619,37 @@ mod tests {
             assert_eq!(response.is_ok(), matches);
             assert_eq!(server.join().unwrap() > 0, matches);
         }
+    }
+
+    #[test]
+    fn test_client_batch_fails_only_when_every_target_is_skipped() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (ca_pem, server_cert, server_key, client_cert, client_key) = test_certs();
+        let clients = PinnedClients {
+            ca_pem,
+            client_cert: load_client_cert_from_pem(&client_cert, &client_key),
+            timeout: std::time::Duration::from_secs(5),
+            attempted: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+        };
+        assert!(clients.finish().is_ok());
+
+        let mut node = crate::NodeConfig {
+            name: None,
+            address: "http://127.0.0.1".to_string(),
+            fingerprint: None,
+        };
+        assert!(clients.connect(&node).is_err());
+        assert!(matches!(
+            clients.finish(),
+            Err(err) if err.to_string() == "no targets passed certificate pin verification"
+        ));
+
+        let (addr, server) = run_tls_server(&clients.ca_pem, &server_cert, &server_key);
+        node.address = addr.to_string();
+        assert!(clients.connect(&node).is_ok());
+        assert_eq!(server.join().unwrap(), 0);
+        assert!(clients.finish().is_ok());
     }
 
     #[test]
