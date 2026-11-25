@@ -24,7 +24,7 @@ mod fleet;
 mod pin;
 mod progress;
 mod sanitize;
-use fleet::NodeReport;
+use fleet::{NodeFailure, NodeReport};
 use pin::{PinOutcome, check_pin};
 use progress::NativeProgress;
 use sanitize::sanitize_display;
@@ -1202,6 +1202,50 @@ mod tests {
     }
 
     #[test]
+    fn version_labels_failures_without_losing_json_error_details() {
+        use reqwest::StatusCode;
+
+        let failures = [
+            (
+                None,
+                NodeFailure::Transport("connection timed out".to_string()),
+                "Unreachable",
+            ),
+            (
+                Some(StatusCode::PRECONDITION_FAILED),
+                NodeFailure::Http("unsupported package manager".to_string()),
+                "Error (412 Precondition Failed)",
+            ),
+            (
+                Some(StatusCode::OK),
+                NodeFailure::Decode("invalid data".to_string()),
+                "Unknown (Parse Error)",
+            ),
+            (
+                None,
+                NodeFailure::Pin("fingerprint mismatch".to_string()),
+                "Pin verification failed",
+            ),
+        ];
+        for (http_status, error, label) in failures {
+            let report = NodeReport {
+                name: "node".to_string(),
+                address: "node:4712".to_string(),
+                http_status,
+                outcome: Err(error),
+            };
+            assert_eq!(version_label(&report), label);
+            let mut output = Vec::new();
+            fleet::write_json(&mut output, std::slice::from_ref(&report)).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(
+                json[0]["error"],
+                report.outcome.as_ref().err().unwrap().message()
+            );
+        }
+    }
+
+    #[test]
     fn test_run_node_no_action_specified() {
         let err = NodeAction::from_flags(false, false, false, false)
             .err()
@@ -1879,16 +1923,16 @@ fn entry_tls(entry: &ResolvedService) -> String {
         .unwrap_or_default()
 }
 
+#[derive(Serialize)]
+struct VersionResult {
+    daemon_version: Option<String>,
+}
+
 fn run_version(
     config: &mut Config,
     config_path: &Path,
     json: bool,
 ) -> Result<ExitCode, Box<dyn Error>> {
-    #[derive(Serialize)]
-    struct VersionResult {
-        daemon_version: Option<String>,
-    }
-
     let nodes = resolve_profile_nodes(&[], config)?
         .into_iter()
         .cloned()
@@ -1927,15 +1971,24 @@ fn run_version(
         writeln!(tw, "COMPONENT\tVERSION")?;
         writeln!(tw, "CLI (local)\t{}", env!("CARGO_PKG_VERSION"))?;
         for report in &reports {
-            let version = match &report.outcome {
-                Ok(result) => result.daemon_version.as_deref().unwrap_or("Unknown"),
-                Err(error) => error,
-            };
-            writeln!(tw, "{}\t{}", report.name, version)?;
+            writeln!(tw, "{}\t{}", report.name, version_label(report))?;
         }
         tw.flush()?;
     }
     Ok(fleet::exit_code(&reports))
+}
+
+fn version_label(report: &NodeReport<VersionResult>) -> std::borrow::Cow<'_, str> {
+    match &report.outcome {
+        Ok(result) => result.daemon_version.as_deref().unwrap_or("Unknown").into(),
+        Err(NodeFailure::Transport(_)) => "Unreachable".into(),
+        Err(NodeFailure::Decode(_)) => "Unknown (Parse Error)".into(),
+        Err(NodeFailure::Pin(_)) => "Pin verification failed".into(),
+        Err(NodeFailure::Http(_)) => match report.http_status {
+            Some(status) => format!("Error ({status})").into(),
+            None => "Error".into(),
+        },
+    }
 }
 
 fn run_status(
@@ -2147,7 +2200,10 @@ fn run_status(
 }
 
 fn pin_failure<T>(node: &NodeConfig, error: Box<dyn Error>) -> NodeReport<T> {
-    NodeReport::failed(node, format!("Pin verification failed: {error}"))
+    NodeReport::failed(
+        node,
+        NodeFailure::Pin(format!("Pin verification failed: {error}")),
+    )
 }
 
 fn query_status(
@@ -2188,7 +2244,7 @@ fn format_status_report(report: &NodeReport<StatusResponse>) -> String {
             }
         }
         Err(error) => {
-            let _ = writeln!(output, "    {error}");
+            let _ = writeln!(output, "    {}", error.message());
         }
     }
     let _ = writeln!(output);
@@ -2519,6 +2575,7 @@ fn print_node_reports(reports: &[NodeReport<NodeActionResult>]) -> io::Result<()
                 (&response.message, response.updates.as_ref())
             }
             Err(error) => {
+                let error = error.message();
                 if report.http_status.is_some() {
                     writeln!(tw, "\t{}", error.replace('\n', "\n\t"))?;
                 } else {

@@ -9,14 +9,33 @@ pub(crate) struct NodeReport<T> {
     pub name: String,
     pub address: String,
     pub http_status: Option<StatusCode>,
-    pub outcome: Result<T, String>,
+    pub outcome: Result<T, NodeFailure>,
+}
+
+#[derive(Debug)]
+pub(crate) enum NodeFailure {
+    Pin(String),
+    Transport(String),
+    Decode(String),
+    Http(String),
+}
+
+impl NodeFailure {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Pin(message)
+            | Self::Transport(message)
+            | Self::Decode(message)
+            | Self::Http(message) => message,
+        }
+    }
 }
 
 impl<T: DeserializeOwned> NodeReport<T> {
     pub fn request(node: &NodeConfig, request: RequestBuilder) -> Self {
         match request.send() {
             Ok(response) => Self::from_response(node, response),
-            Err(error) => Self::failed(node, format!("Error: {error}")),
+            Err(error) => Self::failed(node, NodeFailure::Transport(format!("Error: {error}"))),
         }
     }
 
@@ -25,19 +44,25 @@ impl<T: DeserializeOwned> NodeReport<T> {
         let outcome = if status.is_success() {
             response
                 .json()
-                .map_err(|error| format!("Could not parse response: {error}"))
+                .map_err(|error| NodeFailure::Decode(format!("Could not parse response: {error}")))
         } else {
-            Err(match response.json::<serde_json::Value>() {
-                Ok(body) => format!("HTTP {status}: {body}"),
-                Err(_) => format!("HTTP {status}"),
-            })
+            Err(NodeFailure::Http(
+                match response.json::<serde_json::Value>() {
+                    Ok(body) => format!("HTTP {status}: {body}"),
+                    Err(_) => format!("HTTP {status}"),
+                },
+            ))
         };
         Self::new(node, Some(status), outcome)
     }
 }
 
 impl<T> NodeReport<T> {
-    fn new(node: &NodeConfig, http_status: Option<StatusCode>, outcome: Result<T, String>) -> Self {
+    fn new(
+        node: &NodeConfig,
+        http_status: Option<StatusCode>,
+        outcome: Result<T, NodeFailure>,
+    ) -> Self {
         Self {
             name: node_name(node).to_string(),
             address: node.address.clone(),
@@ -46,7 +71,7 @@ impl<T> NodeReport<T> {
         }
     }
 
-    pub fn failed(node: &NodeConfig, error: String) -> Self {
+    pub fn failed(node: &NodeConfig, error: NodeFailure) -> Self {
         Self::new(node, None, Err(error))
     }
 
@@ -93,7 +118,7 @@ pub(crate) fn write_json<T: Serialize>(
             success: report.outcome.is_ok(),
             http_status: report.http_status.map(|status| status.as_u16()),
             result: report.outcome.as_ref().ok(),
-            error: report.outcome.as_ref().err().map(String::as_str),
+            error: report.outcome.as_ref().err().map(NodeFailure::message),
         })
         .collect();
     serde_json::to_writer(&mut writer, &reports)?;
@@ -119,7 +144,12 @@ mod tests {
     #[test]
     fn exit_code_tracks_any_failure() {
         let good = || NodeReport::new(&node(None, "one:4712"), Some(StatusCode::OK), Ok(()));
-        let bad = || NodeReport::failed(&node(None, "two:4712"), "timed out".to_owned());
+        let bad = || {
+            NodeReport::failed(
+                &node(None, "two:4712"),
+                NodeFailure::Transport("timed out".to_owned()),
+            )
+        };
         assert_eq!(exit_code::<()>(&[]), ExitCode::SUCCESS);
         assert_eq!(exit_code(&[good(), good()]), ExitCode::SUCCESS);
         assert_eq!(exit_code(&[good(), bad()]), ExitCode::FAILURE);
@@ -134,7 +164,10 @@ mod tests {
                 Some(StatusCode::OK),
                 Ok(json!({"updates": ["example"]})),
             ),
-            NodeReport::failed(&node(None, "two:4712"), "connection failed".to_owned()),
+            NodeReport::failed(
+                &node(None, "two:4712"),
+                NodeFailure::Transport("connection failed".to_owned()),
+            ),
         ];
         let mut output = Vec::new();
         write_json(&mut output, &reports).unwrap();
@@ -202,16 +235,23 @@ mod tests {
         assert_eq!(get().outcome.unwrap().message, "accepted");
         let rejected = get();
         assert_eq!(rejected.http_status, Some(StatusCode::FORBIDDEN));
-        assert!(rejected.outcome.unwrap_err().contains("not permitted"));
+        assert!(matches!(
+            rejected.outcome.unwrap_err(),
+            NodeFailure::Http(message) if message.contains("not permitted")
+        ));
         assert!(
             get()
                 .outcome
                 .unwrap_err()
+                .message()
                 .contains("Could not parse response")
         );
         server.join().unwrap();
         let unavailable = get();
         assert!(unavailable.http_status.is_none());
-        assert!(unavailable.outcome.is_err());
+        assert!(matches!(
+            unavailable.outcome,
+            Err(NodeFailure::Transport(_))
+        ));
     }
 }
