@@ -1358,6 +1358,49 @@ mod tests {
     }
 
     #[test]
+    fn test_dispatch_requires_a_saved_learned_pin() {
+        let dir =
+            std::env::temp_dir().join(format!("brewmble_dispatch_pins_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let invalid_path = dir.join("missing").join("config.yaml");
+        let node = NodeConfig {
+            address: "node1:4712".to_string(),
+            name: None,
+            fingerprint: None,
+        };
+        let mut config = Config::default();
+        config.profiles.get_mut("default").unwrap().nodes = vec![node.clone()];
+        let config = Mutex::new(&mut config);
+        let learned = PinOutcome::Learned("fingerprint".to_string());
+
+        let failed: Result<(), _> =
+            dispatch_with_persisted_pin(&config, &invalid_path, &node, &learned, || {
+                panic!("dispatched without saving the learned pin")
+            });
+        assert!(matches!(failed, Err(NodeRequestError::PinPersistence(_))));
+        assert!(
+            config.lock().unwrap().profiles["default"].nodes[0]
+                .fingerprint
+                .is_none()
+        );
+
+        let dispatched = dispatch_with_persisted_pin(&config, &path, &node, &learned, || {
+            let saved = load_config(&path).unwrap();
+            assert_eq!(
+                saved.profiles["default"].nodes[0].fingerprint.as_deref(),
+                Some("fingerprint")
+            );
+        });
+        assert!(dispatched.is_ok());
+        assert!(
+            dispatch_with_persisted_pin(&config, &invalid_path, &node, &PinOutcome::Matched, || {})
+                .is_ok()
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_cli_parse_node_requires_action() {
         let result = Cli::try_parse_from(&["brewmble", "node", "node1"]);
         // Clap does not know the mutual requirement, so parsing succeeds and run_node errors.
@@ -2646,6 +2689,29 @@ fn request_node(
     }
 }
 
+enum NodeRequestError {
+    PinVerification(String),
+    PinPersistence(String),
+}
+
+fn dispatch_with_persisted_pin<T>(
+    config: &Mutex<&mut Config>,
+    config_path: &Path,
+    node: &NodeConfig,
+    outcome: &PinOutcome,
+    dispatch: impl FnOnce() -> T,
+) -> Result<T, NodeRequestError> {
+    if let PinOutcome::Learned(fingerprint) = outcome {
+        let mut config = config.lock().unwrap();
+        let mut updated = (**config).clone();
+        update_node_fingerprint(&mut updated, &node.address, fingerprint);
+        save_config(config_path, &updated)
+            .map_err(|err| NodeRequestError::PinPersistence(err.to_string()))?;
+        **config = updated;
+    }
+    Ok(dispatch())
+}
+
 fn run_node(
     full_upgrade: bool,
     reboot: Option<RebootAction>,
@@ -2685,26 +2751,35 @@ fn run_node(
     let mut tw = TabWriter::new(io::stdout());
     writeln!(tw, "NODE\tSTATUS")?;
 
+    let config = Mutex::new(config);
     let results = collect_node_results(&target_nodes, |node| {
-        let (client, outcome) = clients.connect(node).map_err(|err| err.to_string())?;
+        let (client, outcome) = clients
+            .connect(node)
+            .map_err(|err| NodeRequestError::PinVerification(err.to_string()))?;
         let url = resolve_url(&node.address);
-        let response = request_node(&client, &url, reboot.as_ref(), dry_run);
-        Ok::<_, String>((outcome, response))
+        let response = dispatch_with_persisted_pin(&config, config_path, node, &outcome, || {
+            request_node(&client, &url, reboot.as_ref(), dry_run)
+        })?;
+        Ok((outcome, response))
     });
 
+    let mut pin_save_error = None;
     for (node, result) in target_nodes.iter().zip(results) {
         let name = node.name.as_deref().unwrap_or(&node.address);
         let (outcome, (status, body, updates)) = match result {
             Ok(result) => result,
-            Err(err) => {
+            Err(NodeRequestError::PinVerification(err)) => {
                 writeln!(tw, "{}\tPin verification failed: {}", name, err)?;
+                continue;
+            }
+            Err(NodeRequestError::PinPersistence(err)) => {
+                writeln!(tw, "{}\tCould not save certificate pin: {}", name, err)?;
+                pin_save_error.get_or_insert(err);
                 continue;
             }
         };
         if let PinOutcome::Learned(fp) = outcome {
             println!("Pinned {} {}", name, fp);
-            update_node_fingerprint(config, &node.address, &fp);
-            save_config(config_path, config)?;
         }
         writeln!(tw, "{}\t{}", name, status)?;
         if !body.is_empty() {
@@ -2719,5 +2794,8 @@ fn run_node(
 
     tw.flush()?;
 
+    if let Some(error) = pin_save_error {
+        return Err(error.into());
+    }
     clients.finish()
 }
