@@ -100,6 +100,8 @@ In both human-readable and JSON modes:
 - **1**: At least one target failed, including when all fail. Connection and certificate pin errors, non-success HTTP responses, and invalid success responses count as failures. Command-level errors (such as a failed mDNS scan, missing credentials, or an unknown node name for `node`) also exit 1 and may have no per-node output.
 - **2**: Invalid arguments detected by the CLI parser.
 
+Both `status` and `version` query the daemon's `/status` endpoint. If the node has no supported package manager, the daemon returns HTTP 412 and the node counts as a failure for both commands.
+
 ### Certificate Management
 
 Initialize the cluster CA and issue certificates for daemons and this CLI:
