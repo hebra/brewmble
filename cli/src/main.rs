@@ -1230,6 +1230,133 @@ mod tests {
         assert!(request.body().is_none());
     }
 
+    fn mock_node(
+        reply: impl FnOnce() -> (&'static str, &'static str) + Send + 'static,
+    ) -> (NodeConfig, std::thread::JoinHandle<(String, String)>) {
+        use std::io::{BufRead, BufReader, Read};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let (status, message) = reply();
+            let response = serde_json::to_string(&RebootResponse {
+                message: message.to_string(),
+            })
+            .unwrap();
+            write!(
+                socket,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+            (
+                request_line.trim_end().to_string(),
+                String::from_utf8(body).unwrap(),
+            )
+        });
+        (
+            NodeConfig {
+                address,
+                name: None,
+                fingerprint: None,
+            },
+            worker,
+        )
+    }
+
+    #[test]
+    fn test_delayed_reboot_dispatch() {
+        let (node, server) = mock_node(|| ("200 OK", "reboot scheduled in 60s"));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let action = RebootAction::Schedule(RebootRequest {
+            delay_secs: Some(60),
+        });
+        let (status, message, _) = request_node(
+            &client,
+            &format!("http://{}", node.address),
+            Some(&action),
+            false,
+        );
+        let (request, body) = server.join().unwrap();
+        assert_eq!(request, "POST /node/reboot HTTP/1.1");
+        assert_eq!(
+            serde_json::from_str::<RebootRequest>(&body)
+                .unwrap()
+                .delay_secs,
+            Some(60)
+        );
+        assert_eq!(status, "200 OK");
+        assert_eq!(message, "reboot scheduled in 60s");
+    }
+
+    #[test]
+    fn test_bulk_cancel_dispatches_before_first_reply_and_preserves_order() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (first, slow) = mock_node(move || {
+            if rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                ("409 Conflict", "the reboot is already in progress")
+            } else {
+                ("500 Internal Server Error", "second request never arrived")
+            }
+        });
+        let (second, fast) = mock_node(move || {
+            let _ = tx.send(());
+            ("200 OK", "reboot cancelled")
+        });
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let results = collect_node_results(&[first, second], |node| {
+            request_node(
+                &client,
+                &format!("http://{}", node.address),
+                Some(&RebootAction::Cancel),
+                false,
+            )
+        });
+        for server in [slow, fast] {
+            let (request, body) = server.join().unwrap();
+            assert_eq!(request, "DELETE /node/reboot HTTP/1.1");
+            assert!(body.is_empty());
+        }
+        assert_eq!(
+            results,
+            [
+                (
+                    "409 Conflict".to_string(),
+                    "the reboot is already in progress".to_string(),
+                    None
+                ),
+                ("200 OK".to_string(), "reboot cancelled".to_string(), None),
+            ]
+        );
+    }
+
     #[test]
     fn test_cli_parse_node_requires_action() {
         let result = Cli::try_parse_from(&["brewmble", "node", "node1"]);
