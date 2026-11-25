@@ -109,6 +109,8 @@ cd daemon && cargo build --release
     ./cli/target/release/brewmble version
     ```
 
+For scripting, use [`--json` and fleet exit codes](cli/README.md#json-output-and-exit-codes).
+
 ## Security
 
 Brewmble uses mutual TLS (mTLS) for all CLI-to-daemon communication. A single cluster CA, managed by the CLI, signs both daemon and client certificates.

@@ -13,16 +13,18 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::process::ExitCode;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tabwriter::TabWriter;
 
 mod ca;
 mod export;
+mod fleet;
 mod pin;
 mod progress;
 mod sanitize;
+use fleet::NodeReport;
 use pin::{PinOutcome, check_pin};
 use progress::NativeProgress;
 use sanitize::sanitize_display;
@@ -164,6 +166,7 @@ fn save_learned_status_pins(
     path: &Path,
     profile_name: &str,
     learned_pins: Vec<(&NodeConfig, String)>,
+    json: bool,
 ) -> Result<(), Box<dyn Error>> {
     if learned_pins.is_empty() {
         return Ok(());
@@ -174,10 +177,13 @@ fn save_learned_status_pins(
     };
     let mut updated = false;
     for (target, fingerprint) in learned_pins {
-        if let Some(node) = profile.nodes.iter_mut().find(|n| n.address == target.address)
+        if let Some(node) = profile
+            .nodes
+            .iter_mut()
+            .find(|n| n.address == target.address)
             && node.fingerprint.is_none()
         {
-            println!("Pinned {} {}", pin::node_name(node), fingerprint);
+            print_learned_pin(node, &fingerprint, json);
             node.fingerprint = Some(fingerprint);
             updated = true;
         }
@@ -186,6 +192,14 @@ fn save_learned_status_pins(
         save_config(path, &latest)?;
     }
     Ok(())
+}
+
+fn print_learned_pin(node: &NodeConfig, fingerprint: &str, json: bool) {
+    if json {
+        eprintln!("Pinned {} {}", pin::node_name(node), fingerprint);
+    } else {
+        println!("Pinned {} {}", pin::node_name(node), fingerprint);
+    }
 }
 
 fn write_config_atomically(path: &Path, content: &str) -> io::Result<()> {
@@ -312,6 +326,10 @@ enum Commands {
         #[arg(short, long)]
         all: bool,
 
+        /// Output per-node results as JSON
+        #[arg(long)]
+        json: bool,
+
         /// Targets (host:port)
         targets: Vec<String>,
     },
@@ -337,6 +355,10 @@ enum Commands {
         /// Re-pin a node after its certificate has changed
         #[arg(long, conflicts_with_all = ["full_upgrade", "reboot", "dry_run", "list"])]
         repin: Option<String>,
+
+        /// Output upgrade or reboot results as JSON
+        #[arg(long, conflicts_with_all = ["list", "repin"])]
+        json: bool,
 
         /// Node name(s) configured in the active profile
         #[arg(num_args = 0..)]
@@ -379,7 +401,11 @@ enum Commands {
         dry_run: bool,
     },
     /// Show version information for CLI and daemons
-    Version,
+    Version {
+        /// Output per-node results as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -459,12 +485,12 @@ enum ProfileCommands {
     Edit,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<ExitCode, Box<dyn Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     if cli.version {
         println!("brewmble {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     let (config_path, config_exists) = resolve_config_path(cli.config);
     if let Some(Commands::Import {
@@ -473,26 +499,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         dry_run,
     }) = &cli.command
     {
-        return export::run_import(&ca::KeyringStore, input, &config_path, *force, *dry_run);
+        export::run_import(&ca::KeyringStore, input, &config_path, *force, *dry_run)?;
+        return Ok(ExitCode::SUCCESS);
     }
     let mut config = match load_config(&config_path) {
         Ok(c) => c,
         Err(err) => {
             eprintln!("error: failed to load config: {err}");
-            std::process::exit(1);
+            return Ok(ExitCode::FAILURE);
         }
     };
 
-    let result = match cli.command {
+    match cli.command {
         Some(Commands::Discover {
             timeout,
             update_config,
-        }) => run_discover(Duration::from_secs(timeout), update_config, &config_path),
-        Some(Commands::Status { all, targets }) => {
-            if targets.is_empty() && !all && !config_exists {
+        }) => run_discover(Duration::from_secs(timeout), update_config, &config_path)?,
+        Some(Commands::Status { all, json, targets }) => {
+            if !json && targets.is_empty() && !all && !config_exists {
                 println!("No config file was found or set.");
             }
-            run_status(all, targets, &config, &config_path)
+            return run_status(all, targets, &config, &config_path, json);
         }
         Some(Commands::Node {
             full_upgrade,
@@ -500,34 +527,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             dry_run,
             list,
             repin,
+            json,
             nodes,
         }) => {
-            if nodes.is_empty() && !config_exists && repin.is_none() {
+            if !json && nodes.is_empty() && !config_exists && repin.is_none() {
                 println!("No config file was found or set.");
             }
             if let Some(name) = repin {
-                return run_repin(&name, &mut config, &config_path);
+                run_repin(&name, &mut config, &config_path)?;
+            } else {
+                let action = NodeAction::from_flags(full_upgrade, reboot, dry_run, list)?;
+                return run_node(action, nodes, &mut config, &config_path, json);
             }
-            run_node(
-                full_upgrade,
-                reboot,
-                dry_run,
-                list,
-                nodes,
-                &mut config,
-                &config_path,
-            )
         }
         Some(Commands::Profile { subcommand }) => {
-            run_profile(subcommand, &mut config, &config_path)
+            run_profile(subcommand, &mut config, &config_path)?
         }
-        Some(Commands::Ca { subcommand }) => run_ca(subcommand),
-        Some(Commands::Cert { subcommand }) => run_cert(subcommand),
+        Some(Commands::Ca { subcommand }) => run_ca(subcommand)?,
+        Some(Commands::Cert { subcommand }) => run_cert(subcommand)?,
         Some(Commands::Export { output, force }) => {
-            export::run_export(&config, &ca::KeyringStore, &output, force, &config_path)
+            export::run_export(&config, &ca::KeyringStore, &output, force, &config_path)?
         }
         Some(Commands::Import { .. }) => unreachable!("imports are handled before loading config"),
-        Some(Commands::Version) => run_version(&mut config, &config_path),
+        Some(Commands::Version { json }) => return run_version(&mut config, &config_path, json),
         None => {
             // This case might be reached if only options are provided but no command.
             // However, clap handles --help and --version automatically.
@@ -535,14 +557,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             use clap::CommandFactory;
             Cli::command().print_help()?;
             println!();
-            return Ok(());
         }
-    };
-
-    if let Err(err) = result {
-        return Err(err);
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_profile(
@@ -913,6 +930,7 @@ mod tests {
             dry_run: _,
             list: _,
             repin: _,
+            json: _,
             nodes: _,
         }) = cli.command
         {
@@ -932,6 +950,7 @@ mod tests {
             dry_run,
             list: _,
             repin: _,
+            json: _,
             nodes,
         }) = cli.command
         {
@@ -953,6 +972,7 @@ mod tests {
             dry_run,
             list: _,
             repin: _,
+            json: _,
             nodes,
         }) = cli.command
         {
@@ -974,6 +994,7 @@ mod tests {
             dry_run,
             list: _,
             repin: _,
+            json: _,
             nodes,
         }) = cli.command
         {
@@ -995,6 +1016,7 @@ mod tests {
             dry_run,
             list: _,
             repin: _,
+            json: _,
             nodes,
         }) = cli.command
         {
@@ -1016,6 +1038,7 @@ mod tests {
             dry_run,
             list,
             repin: _,
+            json: _,
             nodes,
         }) = cli.command
         {
@@ -1038,6 +1061,7 @@ mod tests {
             dry_run,
             list,
             repin: _,
+            json: _,
             nodes,
         }) = cli.command
         {
@@ -1060,6 +1084,7 @@ mod tests {
             dry_run,
             list,
             repin: _,
+            json: _,
             nodes,
         }) = cli.command
         {
@@ -1106,17 +1131,9 @@ mod tests {
 
     #[test]
     fn test_run_node_no_action_specified() {
-        let mut config = Config::default();
-        let err = run_node(
-            false,
-            false,
-            false,
-            false,
-            vec![],
-            &mut config,
-            Path::new(""),
-        )
-        .unwrap_err();
+        let err = NodeAction::from_flags(false, false, false, false)
+            .err()
+            .unwrap();
         assert_eq!(
             err.to_string(),
             "either --full-upgrade (-u), --reboot (-r), or --list (-l) must be specified"
@@ -1126,15 +1143,7 @@ mod tests {
     #[test]
     fn test_run_node_list_empty_profile() {
         let mut config = Config::default();
-        let result = run_node(
-            false,
-            false,
-            false,
-            true,
-            vec![],
-            &mut config,
-            Path::new(""),
-        );
+        let result = run_node(NodeAction::List, vec![], &mut config, Path::new(""), false);
         assert!(result.is_ok());
     }
 
@@ -1154,15 +1163,7 @@ mod tests {
             },
         ];
 
-        let result = run_node(
-            false,
-            false,
-            false,
-            true,
-            vec![],
-            &mut config,
-            Path::new(""),
-        );
+        let result = run_node(NodeAction::List, vec![], &mut config, Path::new(""), false);
         assert!(result.is_ok());
     }
 
@@ -1176,24 +1177,20 @@ mod tests {
         }];
 
         let result = run_node(
-            false,
-            false,
-            false,
-            true,
+            NodeAction::List,
             vec!["node-1".to_string()],
             &mut config,
             Path::new(""),
+            false,
         );
         assert!(result.is_ok());
 
         let err = run_node(
-            false,
-            false,
-            false,
-            true,
+            NodeAction::List,
             vec!["unknown".to_string()],
             &mut config,
             Path::new(""),
+            false,
         )
         .unwrap_err();
         assert_eq!(
@@ -1565,10 +1562,14 @@ mod tests {
             &path,
             "default",
             vec![
-                (&original.profiles["default"].nodes[0], "learned".to_string()),
+                (
+                    &original.profiles["default"].nodes[0],
+                    "learned".to_string(),
+                ),
                 (&original.profiles["default"].nodes[1], "stale".to_string()),
                 (&original.profiles["default"].nodes[2], "stale".to_string()),
             ],
+            false,
         )
         .unwrap();
 
@@ -1806,44 +1807,40 @@ fn entry_tls(entry: &ResolvedService) -> String {
         .unwrap_or_default()
 }
 
-fn run_version(config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Error>> {
-    let clients = pin::PinnedClients::load()?;
-    let mut tw = TabWriter::new(std::io::stdout());
-    writeln!(tw, "COMPONENT\tVERSION")?;
-    writeln!(tw, "CLI (local)\t{}", env!("CARGO_PKG_VERSION"))?;
+fn run_version(
+    config: &mut Config,
+    config_path: &Path,
+    json: bool,
+) -> Result<ExitCode, Box<dyn Error>> {
+    #[derive(Serialize)]
+    struct VersionResult {
+        daemon_version: Option<String>,
+    }
 
-    let active_profile = config.active_profile.clone();
-    if let Some(profile) = config.profiles.get(&active_profile).cloned() {
+    let nodes = resolve_profile_nodes(&[], config)?
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut reports = Vec::new();
+    if !nodes.is_empty() {
+        let clients = pin::PinnedClients::load()?;
         let mut pin_updated = false;
-        for node in &profile.nodes {
+        for node in &nodes {
             let (client, outcome) = match clients.connect(node) {
                 Ok(connection) => connection,
-                Err(e) => {
-                    eprintln!("error: {e}");
+                Err(error) => {
+                    reports.push(pin_failure(node, error));
                     continue;
                 }
             };
             if let PinOutcome::Learned(fp) = outcome {
-                println!("Pinned {} {}", pin::node_name(node), fp);
+                print_learned_pin(node, &fp, json);
                 update_node_fingerprint(config, &node.address, &fp);
                 pin_updated = true;
             }
-
-            let url = resolve_url(&node.address);
-            let status_url = format!("{}{}", url, PATH_STATUS);
-            let request = client.get(&status_url);
-
-            let version = match request.send() {
-                Ok(resp) if resp.status().is_success() => match resp.json::<StatusResponse>() {
-                    Ok(sr) => sr.daemon_version.unwrap_or_else(|| "Unknown".to_string()),
-                    Err(_) => "Unknown (Parse Error)".to_string(),
-                },
-                Ok(resp) => format!("Error ({})", resp.status()),
-                Err(_) => "Unreachable".to_string(),
-            };
-
-            let name = node.name.as_deref().unwrap_or(&node.address);
-            writeln!(tw, "{}\t{}", name, version)?;
+            reports.push(query_status(&client, node).map(|status| VersionResult {
+                daemon_version: status.daemon_version,
+            }));
         }
 
         if pin_updated {
@@ -1851,8 +1848,22 @@ fn run_version(config: &mut Config, config_path: &Path) -> Result<(), Box<dyn Er
         }
     }
 
-    tw.flush()?;
-    clients.finish()
+    if json {
+        fleet::write_json(io::stdout().lock(), &reports)?;
+    } else {
+        let mut tw = TabWriter::new(io::stdout());
+        writeln!(tw, "COMPONENT\tVERSION")?;
+        writeln!(tw, "CLI (local)\t{}", env!("CARGO_PKG_VERSION"))?;
+        for report in &reports {
+            let version = match &report.outcome {
+                Ok(result) => result.daemon_version.as_deref().unwrap_or("Unknown"),
+                Err(error) => error,
+            };
+            writeln!(tw, "{}\t{}", report.name, version)?;
+        }
+        tw.flush()?;
+    }
+    Ok(fleet::exit_code(&reports))
 }
 
 fn run_status(
@@ -1860,25 +1871,36 @@ fn run_status(
     targets: Vec<String>,
     config: &Config,
     config_path: &Path,
-) -> Result<(), Box<dyn Error>> {
-    let clients = pin::PinnedClients::load()?;
-    println!("Querying status...");
-
-    let multi = MultiProgress::new();
-    let native = Arc::new(NativeProgress::new());
-    let native_supported = native.is_supported();
-    let spinner_style = ProgressStyle::default_spinner()
-        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈")
-        .template("{spinner:.green} {msg}")?;
-
-    let (target_tx, target_rx) = flume::unbounded::<(String, Option<String>)>();
-
+    json: bool,
+) -> Result<ExitCode, Box<dyn Error>> {
     let active_profile_name = config.active_profile.clone();
     let profile_nodes = config
         .profiles
         .get(&active_profile_name)
         .map(|p| p.nodes.clone())
         .unwrap_or_default();
+    if !discover_all && targets.is_empty() && profile_nodes.is_empty() {
+        if json {
+            fleet::write_json::<StatusResponse>(io::stdout().lock(), &[])?;
+        } else {
+            println!("Querying status...");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let clients = pin::PinnedClients::load()?;
+    if !json {
+        println!("Querying status...");
+    }
+
+    let multi = MultiProgress::new();
+    let native = (!json).then(NativeProgress::new);
+    let native_supported = native.as_ref().is_some_and(NativeProgress::is_supported);
+    let spinner_style = ProgressStyle::default_spinner()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈")
+        .template("{spinner:.green} {msg}")?;
+
+    let (target_tx, target_rx) = flume::unbounded::<(String, Option<String>)>();
+
     let saved_targets: HashMap<_, _> = profile_nodes
         .iter()
         .rev()
@@ -1916,8 +1938,10 @@ fn run_status(
 
     // 2. Start discovery in background if requested
     if discover_all {
-        native.set_indeterminate();
-        let pb = if native_supported {
+        if let Some(native) = &native {
+            native.set_indeterminate();
+        }
+        let pb = if native_supported || json {
             let pb = ProgressBar::new_spinner();
             pb.set_draw_target(ProgressDrawTarget::hidden());
             pb
@@ -1940,11 +1964,11 @@ fn run_status(
 
     drop(target_tx); // Close tx so rx finishes when discovery is done
 
-    let seen_targets = Arc::new(Mutex::new(HashSet::new()));
-    let node_reports = Arc::new(Mutex::new(Vec::<(String, bool, bool)>::new()));
+    let seen_targets = Mutex::new(HashSet::new());
+    let node_reports = Mutex::new(Vec::new());
     let learned_pins = Mutex::new(Vec::new());
 
-    let pb = if native_supported {
+    let pb = if native_supported || json {
         let pb = ProgressBar::new(0);
         pb.set_draw_target(ProgressDrawTarget::hidden());
         pb
@@ -1960,31 +1984,31 @@ fn run_status(
     );
     pb.set_message("Querying status...");
 
-    let any_failed = Arc::new(AtomicBool::new(false));
-
     rayon::scope(|s| {
         while let Ok((target_addr, target_name)) = target_rx.recv() {
             let clients = &clients;
-            let seen_targets = Arc::clone(&seen_targets);
-            let node_reports = Arc::clone(&node_reports);
+            let seen_targets = &seen_targets;
+            let node_reports = &node_reports;
             let learned_pins = &learned_pins;
             let saved_node = reqwest::Url::parse(&resolve_url(&target_addr))
                 .ok()
                 .and_then(|url| saved_targets.get(&url).copied());
             let pb = pb.clone();
             let multi = multi.clone();
-            let native = Arc::clone(&native);
-            let any_failed = Arc::clone(&any_failed);
+            let native = &native;
 
             pb.inc_length(1);
-            native.set_progress(pb.position(), pb.length());
+            if let Some(native) = native {
+                native.set_progress(pb.position(), pb.length());
+            }
 
             s.spawn(move |_| {
                 let address = saved_node.map_or(target_addr.as_str(), |node| &node.address);
                 if !seen_targets.lock().unwrap().insert(address.to_owned()) {
-                    pb.inc_length(0); // Adjust length if skipped
                     pb.inc(1);
-                    native.set_progress(pb.position(), pb.length());
+                    if let Some(native) = native {
+                        native.set_progress(pb.position(), pb.length());
+                    }
                     return;
                 }
 
@@ -1994,47 +2018,24 @@ fn run_status(
                     fingerprint: None,
                 };
                 let node = saved_node.unwrap_or(&discovered_node);
-                let (status, message, details, failed, outdated) = match clients.connect(node) {
+                let report = match clients.connect(node) {
                     Ok((client, outcome)) => {
                         if let (Some(saved), PinOutcome::Learned(fp)) = (saved_node, outcome) {
                             learned_pins.lock().unwrap().push((saved, fp));
                         }
-                        query_status(&client, &node.address)
+                        query_status(&client, node)
                     }
-                    Err(err) => (
-                        format!("Pin verification failed: {err}"),
-                        String::new(),
-                        String::new(),
-                        true,
-                        false,
-                    ),
+                    Err(error) => pin_failure(node, error),
                 };
 
-                if failed {
-                    any_failed.store(true, Ordering::Relaxed);
+                if !json {
+                    let _ = multi.println(format_status_report(&report));
                 }
-
-                let mut output = String::new();
-                let name = target_name.as_deref().unwrap_or(&target_addr);
-                let _ = writeln!(output, "Node: {}", name);
-                let _ = writeln!(output, "Address: {}", target_addr);
-                if !message.is_empty() {
-                    let _ = writeln!(output, "{}", message);
-                }
-                let _ = writeln!(output, "Details:");
-                let _ = writeln!(output, "    Status: {}", status);
-                if !details.is_empty() {
-                    let _ = writeln!(output, "    {}", details.trim().replace('\n', "\n    "));
-                }
-                let _ = writeln!(output);
-                let _ = multi.println(output);
-
-                node_reports
-                    .lock()
-                    .unwrap()
-                    .push((name.to_string(), failed, outdated));
+                node_reports.lock().unwrap().push(report);
                 pb.inc(1);
-                native.set_progress(pb.position(), pb.length());
+                if let Some(native) = native {
+                    native.set_progress(pb.position(), pb.length());
+                }
             });
         }
     });
@@ -2045,44 +2046,20 @@ fn run_status(
         config_path,
         &active_profile_name,
         learned_pins.into_inner().unwrap(),
+        json,
     )?;
 
-    let reports = node_reports.lock().unwrap();
-    if !reports.is_empty() {
-        println!("Summary:");
-        let outdated_nodes: Vec<_> = reports
-            .iter()
-            .filter(|(_, _, outdated)| *outdated)
-            .map(|(name, _, _)| name.as_str())
-            .collect();
-
-        if outdated_nodes.is_empty() {
-            println!("- All nodes are up to date.");
-        } else {
-            println!(
-                "- {} node(s) are outdated: {}",
-                outdated_nodes.len(),
-                outdated_nodes.join(", ")
-            );
-        }
-
-        let failed_nodes: Vec<_> = reports
-            .iter()
-            .filter(|(_, failed, _)| *failed)
-            .map(|(name, _, _)| name.as_str())
-            .collect();
-
-        if !failed_nodes.is_empty() {
-            println!(
-                "- {} node(s) failed to respond: {}",
-                failed_nodes.len(),
-                failed_nodes.join(", ")
-            );
-        }
+    let mut reports = node_reports.into_inner().unwrap();
+    let exit_code = fleet::exit_code(&reports);
+    if json {
+        reports.sort_by(|a, b| a.address.cmp(&b.address));
+        fleet::write_json(io::stdout().lock(), &reports)?;
+    } else if !reports.is_empty() {
+        print_status_summary(&reports);
     }
 
-    if native_supported {
-        if any_failed.load(Ordering::Relaxed) {
+    if let Some(native) = native.filter(NativeProgress::is_supported) {
+        if exit_code == ExitCode::FAILURE {
             native.finish_error();
         } else {
             native.finish_success();
@@ -2091,74 +2068,93 @@ fn run_status(
         native.clear();
     }
 
-    clients.finish()
+    clients.finish()?;
+    Ok(exit_code)
+}
+
+fn pin_failure<T>(node: &NodeConfig, error: Box<dyn Error>) -> NodeReport<T> {
+    NodeReport::failed(node, format!("Pin verification failed: {error}"))
 }
 
 fn query_status(
     client: &reqwest::blocking::Client,
-    target: &str,
-) -> (String, String, String, bool, bool) {
-    let url = resolve_url(target);
-    let status_url = format!("{}{}", url, PATH_STATUS);
+    node: &NodeConfig,
+) -> NodeReport<StatusResponse> {
+    let url = resolve_url(&node.address);
+    NodeReport::request(node, client.get(format!("{url}{PATH_STATUS}")))
+}
 
-    match client.get(&status_url).send() {
-        Ok(resp) => {
-            let status = resp.status().to_string();
-            if resp.status().is_success() {
-                match resp.json::<StatusResponse>() {
-                    Ok(sr) => {
-                        let message = sr.message;
-                        let mut details = String::new();
-                        if let Some(version) = sr.daemon_version {
-                            details.push_str(&format!("Daemon version: {}\n", version));
-                        }
-                        details.push_str(&format!("Upgrading: {}\n", sr.is_upgrading));
-                        details.push_str(&format!("Allow reboot: {}\n", sr.allow_reboot));
-                        details.push_str(&format!("Auto clean: {}\n", sr.auto_clean));
-                        details.push_str(&format!("Auto remove: {}\n", sr.auto_remove));
-                        if !sr.updates.is_empty() {
-                            details.push_str("Updates:\n");
-                            for update in &sr.updates {
-                                details.push_str(&format!("  - {}\n", update));
-                            }
-                        } else {
-                            details.push_str("No updates available.\n");
-                        }
-                        let outdated = !sr.updates.is_empty();
-                        (status, message, details, false, outdated)
-                    }
-                    Err(_) => (
-                        status,
-                        "Could not parse StatusResponse".to_string(),
-                        "".to_string(),
-                        false,
-                        false,
-                    ),
-                }
+fn format_status_report(report: &NodeReport<StatusResponse>) -> String {
+    let mut output = format!("Node: {}\nAddress: {}\n", report.name, report.address);
+    if let Ok(status) = &report.outcome
+        && !status.message.is_empty()
+    {
+        let _ = writeln!(output, "{}", status.message);
+    }
+    let _ = writeln!(output, "Details:");
+    if let Some(http_status) = report.http_status {
+        let _ = writeln!(output, "    Status: {http_status}");
+    }
+    match &report.outcome {
+        Ok(status) => {
+            if let Some(version) = &status.daemon_version {
+                let _ = writeln!(output, "    Daemon version: {version}");
+            }
+            let _ = writeln!(output, "    Upgrading: {}", status.is_upgrading);
+            let _ = writeln!(output, "    Allow reboot: {}", status.allow_reboot);
+            let _ = writeln!(output, "    Auto clean: {}", status.auto_clean);
+            let _ = writeln!(output, "    Auto remove: {}", status.auto_remove);
+            if status.updates.is_empty() {
+                let _ = writeln!(output, "    No updates available.");
             } else {
-                match resp.json::<serde_json::Value>() {
-                    Ok(json) => {
-                        let details = serde_json::to_string_pretty(&json)
-                            .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string());
-                        (status, "".to_string(), details, false, false)
-                    }
-                    Err(_) => (
-                        status,
-                        "Could not parse response as JSON".to_string(),
-                        "".to_string(),
-                        false,
-                        false,
-                    ),
+                let _ = writeln!(output, "    Updates:");
+                for update in &status.updates {
+                    let _ = writeln!(output, "      - {update}");
                 }
             }
         }
-        Err(err) => (
-            format!("Error: {}", err),
-            "".to_string(),
-            "".to_string(),
-            true,
-            false,
-        ),
+        Err(error) => {
+            let _ = writeln!(output, "    {error}");
+        }
+    }
+    let _ = writeln!(output);
+    output
+}
+
+fn print_status_summary(reports: &[NodeReport<StatusResponse>]) {
+    println!("Summary:");
+    let outdated_nodes: Vec<_> = reports
+        .iter()
+        .filter(|report| {
+            report
+                .outcome
+                .as_ref()
+                .is_ok_and(|status| !status.updates.is_empty())
+        })
+        .map(|report| report.name.as_str())
+        .collect();
+    let failed_nodes: Vec<_> = reports
+        .iter()
+        .filter(|report| report.outcome.is_err())
+        .map(|report| report.name.as_str())
+        .collect();
+
+    if !outdated_nodes.is_empty() {
+        println!(
+            "- {} node(s) are outdated: {}",
+            outdated_nodes.len(),
+            outdated_nodes.join(", ")
+        );
+    } else if failed_nodes.is_empty() {
+        println!("- All nodes are up to date.");
+    }
+
+    if !failed_nodes.is_empty() {
+        println!(
+            "- {} node(s) failed: {}",
+            failed_nodes.len(),
+            failed_nodes.join(", ")
+        );
     }
 }
 
@@ -2327,110 +2323,144 @@ fn run_repin(name: &str, config: &mut Config, config_path: &Path) -> Result<(), 
     }
 }
 
+enum NodeAction {
+    Upgrade { dry_run: bool },
+    Reboot,
+    List,
+}
+
+impl NodeAction {
+    fn from_flags(
+        full_upgrade: bool,
+        reboot: bool,
+        dry_run: bool,
+        list: bool,
+    ) -> Result<Self, Box<dyn Error>> {
+        if dry_run && !full_upgrade {
+            return Err("--dry-run can only be used with --full-upgrade".into());
+        }
+        if list {
+            Ok(Self::List)
+        } else if reboot {
+            Ok(Self::Reboot)
+        } else if full_upgrade {
+            Ok(Self::Upgrade { dry_run })
+        } else {
+            Err(
+                "either --full-upgrade (-u), --reboot (-r), or --list (-l) must be specified"
+                    .into(),
+            )
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum NodeActionResult {
+    Upgrade(UpgradeResponse),
+    Reboot(RebootResponse),
+}
+
 fn run_node(
-    full_upgrade: bool,
-    reboot: bool,
-    dry_run: bool,
-    list: bool,
+    action: NodeAction,
     nodes: Vec<String>,
     config: &mut Config,
     config_path: &Path,
-) -> Result<(), Box<dyn Error>> {
-    if !full_upgrade && !reboot && !list {
-        return Err(
-            "either --full-upgrade (-u), --reboot (-r), or --list (-l) must be specified".into(),
-        );
-    }
-
-    if dry_run && !full_upgrade {
-        return Err("--dry-run can only be used with --full-upgrade".into());
-    }
-
+    json: bool,
+) -> Result<ExitCode, Box<dyn Error>> {
     let target_nodes: Vec<NodeConfig> = resolve_profile_nodes(&nodes, config)?
         .into_iter()
         .cloned()
         .collect();
 
     if target_nodes.is_empty() {
-        println!("No nodes found.");
-        return Ok(());
+        if json {
+            fleet::write_json::<NodeActionResult>(io::stdout().lock(), &[])?;
+        } else {
+            println!("No nodes found.");
+        }
+        return Ok(ExitCode::SUCCESS);
     }
 
-    if list {
+    if matches!(action, NodeAction::List) {
         for node in &target_nodes {
-            let name = node.name.as_deref().unwrap_or(&node.address);
-            println!("{}", name);
+            println!("{}", pin::node_name(node));
         }
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     let clients = pin::PinnedClients::load()?;
-    let mut tw = TabWriter::new(io::stdout());
-    writeln!(tw, "NODE\tSTATUS")?;
-
+    let mut reports = Vec::new();
     for node in &target_nodes {
-        let name = node.name.as_deref().unwrap_or(&node.address);
         let (client, outcome) = match clients.connect(node) {
             Ok(connection) => connection,
-            Err(err) => {
-                writeln!(tw, "{}\tPin verification failed: {}", name, err)?;
+            Err(error) => {
+                reports.push(pin_failure(node, error));
                 continue;
             }
         };
         if let PinOutcome::Learned(fp) = outcome {
-            println!("Pinned {} {}", name, fp);
+            print_learned_pin(node, &fp, json);
             update_node_fingerprint(config, &node.address, &fp);
             save_config(config_path, config)?;
         }
+
         let url = resolve_url(&node.address);
-
-        let (status, body, updates) = if reboot {
-            let reboot_url = format!("{}{}", url, PATH_REBOOT);
-            let request = client
-                .post(&reboot_url)
-                .json(&brewmble_rest::RebootRequest::default());
-
-            match request.send() {
-                Ok(resp) => {
-                    let status = resp.status().to_string();
-                    let rr: RebootResponse = resp.json().unwrap_or_else(|_| RebootResponse {
-                        message: "Unknown response".to_string(),
-                    });
-                    (status, rr.message, None)
-                }
-                Err(err) => (format!("Error: {}", err), "".to_string(), None),
+        let report = match action {
+            NodeAction::Reboot => {
+                let request = client
+                    .post(format!("{url}{PATH_REBOOT}"))
+                    .json(&brewmble_rest::RebootRequest::default());
+                NodeReport::request(node, request).map(NodeActionResult::Reboot)
             }
-        } else {
-            let upgrade_url = format!("{}{}", url, PATH_UPGRADE);
-            let request = client
-                .post(&upgrade_url)
-                .json(&brewmble_rest::UpgradeRequest { dry_run });
-
-            match request.send() {
-                Ok(resp) => {
-                    let status = resp.status().to_string();
-                    let ur: UpgradeResponse = resp.json().unwrap_or_else(|_| UpgradeResponse {
-                        message: "Unknown response".to_string(),
-                        updates: None,
-                    });
-                    (status, ur.message, ur.updates)
-                }
-                Err(err) => (format!("Error: {}", err), "".to_string(), None),
+            NodeAction::Upgrade { dry_run } => {
+                let request = client
+                    .post(format!("{url}{PATH_UPGRADE}"))
+                    .json(&brewmble_rest::UpgradeRequest { dry_run });
+                NodeReport::request(node, request).map(NodeActionResult::Upgrade)
             }
+            NodeAction::List => unreachable!(),
         };
-
-        writeln!(tw, "{}\t{}", name, status)?;
-        if !body.is_empty() {
-            writeln!(tw, "\t{}", body.replace('\n', "\n\t"))?;
-        }
-        if let Some(upds) = updates {
-            if !upds.is_empty() {
-                writeln!(tw, "\tUpdates ({}): {}", upds.len(), upds.join(", "))?;
-            }
-        }
+        reports.push(report);
     }
 
-    tw.flush()?;
+    if json {
+        fleet::write_json(io::stdout().lock(), &reports)?;
+    } else {
+        print_node_reports(&reports)?;
+    }
+    clients.finish()?;
+    Ok(fleet::exit_code(&reports))
+}
 
-    clients.finish()
+fn print_node_reports(reports: &[NodeReport<NodeActionResult>]) -> io::Result<()> {
+    let mut tw = TabWriter::new(io::stdout());
+    writeln!(tw, "NODE\tSTATUS")?;
+    for report in reports {
+        let name = &report.name;
+        if let Some(status) = report.http_status {
+            writeln!(tw, "{name}\t{status}")?;
+        }
+        let (message, updates) = match &report.outcome {
+            Ok(NodeActionResult::Reboot(response)) => (&response.message, None),
+            Ok(NodeActionResult::Upgrade(response)) => {
+                (&response.message, response.updates.as_ref())
+            }
+            Err(error) => {
+                if report.http_status.is_some() {
+                    writeln!(tw, "\t{}", error.replace('\n', "\n\t"))?;
+                } else {
+                    writeln!(tw, "{name}\t{error}")?;
+                }
+                continue;
+            }
+        };
+        if !message.is_empty() {
+            writeln!(tw, "\t{}", message.replace('\n', "\n\t"))?;
+        }
+        if let Some(updates) = updates.filter(|updates| !updates.is_empty()) {
+            writeln!(tw, "\tUpdates ({}): {}", updates.len(), updates.join(", "))?;
+        }
+    }
+    tw.flush()
 }

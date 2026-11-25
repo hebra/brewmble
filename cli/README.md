@@ -9,6 +9,7 @@ The Brewmble CLI (`brewmble`) is a command-line interface for managing Brewmble 
   - [Discovery](#discovery)
   - [Status](#status)
   - [Node Management](#node-management)
+  - [JSON Output and Exit Codes](#json-output-and-exit-codes)
   - [Certificate Management](#certificate-management)
   - [Profile Management](#profile-management)
   - [Export and Import](#export-and-import)
@@ -81,6 +82,23 @@ brewmble node --full-upgrade <node> [<node> ...]
 brewmble node --reboot <node>
 # or: brewmble node -r <node>
 ```
+
+### JSON Output and Exit Codes
+
+Use `--json` with `status`, `node --full-upgrade` (including `--dry-run`), `node --reboot`, or `version`:
+
+```bash
+brewmble status --all --json
+brewmble node --full-upgrade --dry-run --json
+```
+
+Standard output contains a single JSON array with one object per target, including failures. Each object has `name` (the address if unnamed), `address`, `success`, and either `result` or an `error` string. `http_status` is present when the daemon sent an HTTP response. The success result contains the status, upgrade, or reboot response fields; for `version` it contains `daemon_version` (null if an older daemon omitted it). Use `brewmble --version` for the local CLI version. An empty fleet produces `[]`. JSON mode suppresses progress output and sends certificate pin notices to stderr.
+
+In both human-readable and JSON modes:
+
+- **0**: Every targeted node succeeded, or there were no targets. Available updates are not a failure.
+- **1**: At least one target failed, including when all fail. Connection and certificate pin errors, non-success HTTP responses, and invalid success responses count as failures. Command-level errors (such as missing credentials or an unknown node name for `node`) also exit 1 and may have no per-node output.
+- **2**: Invalid arguments detected by the CLI parser.
 
 ### Certificate Management
 
