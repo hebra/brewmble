@@ -1,6 +1,6 @@
 use brewmble_rest::{
-    PATH_REBOOT, PATH_STATUS, PATH_UPGRADE, RebootRequest, RebootResponse, SERVICE_DOMAIN,
-    SERVICE_TYPE, StatusResponse, TXT_TLS, UpgradeResponse,
+    MAX_REBOOT_DELAY_SECS, PATH_REBOOT, PATH_STATUS, PATH_UPGRADE, RebootRequest, RebootResponse,
+    SERVICE_DOMAIN, SERVICE_TYPE, StatusResponse, TXT_TLS, UpgradeResponse,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use flume::RecvTimeoutError;
@@ -327,7 +327,12 @@ enum Commands {
         reboot: bool,
 
         /// Delay before rebooting, in seconds (maximum 3600)
-        #[arg(long, requires = "reboot", conflicts_with = "cancel_reboot")]
+        #[arg(
+            long,
+            requires = "reboot",
+            conflicts_with = "cancel_reboot",
+            value_parser = clap::value_parser!(u64).range(0..=MAX_REBOOT_DELAY_SECS)
+        )]
         delay_secs: Option<u64>,
 
         /// Cancel a scheduled reboot
@@ -1145,6 +1150,17 @@ mod tests {
         assert!(
             Cli::try_parse_from(["brewmble", "node", "--reboot", "--delay-secs", "soon"]).is_err()
         );
+    }
+
+    #[test]
+    fn test_cli_parse_node_delay_bounds() {
+        let parse = |delay: &str| {
+            Cli::try_parse_from(["brewmble", "node", "--reboot", "--delay-secs", delay])
+        };
+        assert!(parse("0").is_ok());
+        assert!(parse("-1").is_err());
+        assert!(parse(&MAX_REBOOT_DELAY_SECS.to_string()).is_ok());
+        assert!(parse(&(MAX_REBOOT_DELAY_SECS + 1).to_string()).is_err());
     }
 
     #[test]

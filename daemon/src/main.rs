@@ -7,9 +7,9 @@ use axum::{
     routing::{get, post},
 };
 use brewmble_rest::{
-    HealthResponse, PATH_HEALTH, PATH_REBOOT, PATH_STATUS, PATH_UPGRADE, RebootRequest,
-    RebootResponse, SERVICE_FULL_TYPE, StatusResponse, TXT_TLS, TXT_TLS_VALUE, UpgradeRequest,
-    UpgradeResponse,
+    HealthResponse, MAX_REBOOT_DELAY_SECS, PATH_HEALTH, PATH_REBOOT, PATH_STATUS, PATH_UPGRADE,
+    RebootRequest, RebootResponse, SERVICE_FULL_TYPE, StatusResponse, TXT_TLS, TXT_TLS_VALUE,
+    UpgradeRequest, UpgradeResponse,
 };
 use clap::{Parser, Subcommand};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
@@ -176,9 +176,6 @@ struct AppState {
     upgrade_handle: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
     reboot: Arc<std::sync::Mutex<RebootState>>,
 }
-
-/// Longest delay a client may request before a scheduled reboot.
-const MAX_REBOOT_DELAY_SECS: u64 = 3600;
 
 /// At most one reboot is scheduled at a time. While one is pending or running,
 /// new upgrades and reboots are refused.

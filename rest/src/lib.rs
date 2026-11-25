@@ -10,6 +10,7 @@ pub const PATH_STATUS: &str = "/status";
 pub const PATH_HEALTH: &str = "/health";
 pub const PATH_UPGRADE: &str = "/packages/full-upgrade";
 pub const PATH_REBOOT: &str = "/node/reboot";
+pub const MAX_REBOOT_DELAY_SECS: u64 = 3600;
 
 /// Prefix of the subject OU attribute that carries a client certificate's role.
 pub const CLIENT_ROLE_OU_PREFIX: &str = "brewmble-role:";
