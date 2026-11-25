@@ -330,7 +330,7 @@ enum Commands {
         #[arg(
             long,
             requires = "reboot",
-            conflicts_with = "cancel_reboot",
+            conflicts_with_all = ["cancel_reboot", "full_upgrade"],
             value_parser = clap::value_parser!(u64).range(0..=MAX_REBOOT_DELAY_SECS)
         )]
         delay_secs: Option<u64>,
@@ -1161,6 +1161,21 @@ mod tests {
         assert!(parse("-1").is_err());
         assert!(parse(&MAX_REBOOT_DELAY_SECS.to_string()).is_ok());
         assert!(parse(&(MAX_REBOOT_DELAY_SECS + 1).to_string()).is_err());
+    }
+
+    #[test]
+    fn test_cli_parse_node_delayed_reboot_conflicts_with_upgrade() {
+        let err = Cli::try_parse_from([
+            "brewmble",
+            "node",
+            "--full-upgrade",
+            "--reboot",
+            "--delay-secs",
+            "60",
+        ])
+        .err()
+        .unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
