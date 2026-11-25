@@ -519,7 +519,8 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
             if !json && targets.is_empty() && !all && !config_exists {
                 println!("No config file was found or set.");
             }
-            return run_status(all, targets, &config, &config_path, json);
+            let discovery = all.then_some(|| discover_targets_with_timeout(get_default_timeout()));
+            return run_status(discovery, targets, &config, &config_path, json);
         }
         Some(Commands::Node {
             full_upgrade,
@@ -1127,6 +1128,26 @@ mod tests {
         let result = Cli::try_parse_from(&["brewmble", "node", "node1"]);
         // Clap does not know the mutual requirement, so parsing succeeds and run_node errors.
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn status_distinguishes_discovery_failure_from_an_empty_scan() {
+        let config = Config::default();
+        for json in [false, true] {
+            let result = run_status(
+                Some(|| Err("browse: simulated mDNS failure".to_string())),
+                vec![],
+                &config,
+                Path::new(""),
+                json,
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "mDNS discovery failed: browse: simulated mDNS failure"
+            );
+            let result = run_status(Some(|| Ok(vec![])), vec![], &config, Path::new(""), json);
+            assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        }
     }
 
     #[test]
@@ -1867,7 +1888,7 @@ fn run_version(
 }
 
 fn run_status(
-    discover_all: bool,
+    discover: Option<impl FnOnce() -> Result<Vec<(String, String)>, String> + Send + 'static>,
     targets: Vec<String>,
     config: &Config,
     config_path: &Path,
@@ -1879,15 +1900,6 @@ fn run_status(
         .get(&active_profile_name)
         .map(|p| p.nodes.clone())
         .unwrap_or_default();
-    if !discover_all && targets.is_empty() && profile_nodes.is_empty() {
-        if json {
-            fleet::write_json::<StatusResponse>(io::stdout().lock(), &[])?;
-        } else {
-            println!("Querying status...");
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-    let clients = pin::PinnedClients::load()?;
     if !json {
         println!("Querying status...");
     }
@@ -1922,7 +1934,7 @@ fn run_status(
         initial_targets.insert(addr);
     }
 
-    if initial_targets.is_empty() && !discover_all {
+    if initial_targets.is_empty() && discover.is_none() {
         for node in &profile_nodes {
             initial_targets.insert(node.address.clone());
         }
@@ -1937,7 +1949,8 @@ fn run_status(
     }
 
     // 2. Start discovery in background if requested
-    if discover_all {
+    let discover_was_requested = discover.is_some();
+    let discovery_worker = discover.map(|discover| {
         if let Some(native) = &native {
             native.set_indeterminate();
         }
@@ -1952,15 +1965,14 @@ fn run_status(
         pb.set_message("Discovering nodes...");
         let tx = target_tx.clone();
         std::thread::spawn(move || {
-            let timeout = get_default_timeout();
-            if let Ok(targets) = discover_targets_with_timeout(timeout) {
-                for (addr, name) in targets {
-                    let _ = tx.send((addr, Some(name)));
-                }
-            }
+            let result = discover();
             pb.finish_and_clear();
-        });
-    }
+            for (addr, name) in result.map_err(|error| format!("mDNS discovery failed: {error}"))? {
+                let _ = tx.send((addr, Some(name)));
+            }
+            Ok::<(), String>(())
+        })
+    });
 
     drop(target_tx); // Close tx so rx finishes when discovery is done
 
@@ -1984,9 +1996,16 @@ fn run_status(
     );
     pb.set_message("Querying status...");
 
+    let mut targets = target_rx.iter().peekable();
+    let clients = targets
+        .peek()
+        .map(|_| pin::PinnedClients::load())
+        .transpose()?;
     rayon::scope(|s| {
-        while let Ok((target_addr, target_name)) = target_rx.recv() {
-            let clients = &clients;
+        let Some(clients) = &clients else {
+            return;
+        };
+        for (target_addr, target_name) in targets {
             let seen_targets = &seen_targets;
             let node_reports = &node_reports;
             let learned_pins = &learned_pins;
@@ -2041,6 +2060,11 @@ fn run_status(
     });
 
     pb.finish_and_clear();
+    if let Some(worker) = discovery_worker {
+        worker
+            .join()
+            .map_err(|_| "mDNS discovery worker panicked")??;
+    }
 
     save_learned_status_pins(
         config_path,
@@ -2058,7 +2082,9 @@ fn run_status(
         print_status_summary(&reports);
     }
 
-    if let Some(native) = native.filter(NativeProgress::is_supported) {
+    if let Some(native) = native.filter(NativeProgress::is_supported)
+        && (!reports.is_empty() || discover_was_requested)
+    {
         if exit_code == ExitCode::FAILURE {
             native.finish_error();
         } else {
@@ -2068,7 +2094,9 @@ fn run_status(
         native.clear();
     }
 
-    clients.finish()?;
+    if let Some(clients) = clients {
+        clients.finish()?;
+    }
     Ok(exit_code)
 }
 
@@ -2158,9 +2186,7 @@ fn print_status_summary(reports: &[NodeReport<StatusResponse>]) {
     }
 }
 
-fn discover_targets_with_timeout(
-    timeout: Duration,
-) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+fn discover_targets_with_timeout(timeout: Duration) -> Result<Vec<(String, String)>, String> {
     let mut targets = Vec::new();
     let mdns = ServiceDaemon::new().map_err(|err| format!("create resolver: {err}"))?;
     let service_name = format!("{}.{}", SERVICE_TYPE.trim_end_matches('.'), SERVICE_DOMAIN);
@@ -2191,7 +2217,7 @@ fn discover_targets_with_timeout(
                 }
             }
             Err(RecvTimeoutError::Timeout) => break,
-            Err(err) => return Err(format!("mDNS error: {err}").into()),
+            Err(err) => return Err(format!("mDNS error: {err}")),
         }
     }
     let _ = mdns.shutdown();

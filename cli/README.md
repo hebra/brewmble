@@ -97,7 +97,7 @@ Standard output contains a single JSON array with one object per target, includi
 In both human-readable and JSON modes:
 
 - **0**: Every targeted node succeeded, or there were no targets. Available updates are not a failure.
-- **1**: At least one target failed, including when all fail. Connection and certificate pin errors, non-success HTTP responses, and invalid success responses count as failures. Command-level errors (such as missing credentials or an unknown node name for `node`) also exit 1 and may have no per-node output.
+- **1**: At least one target failed, including when all fail. Connection and certificate pin errors, non-success HTTP responses, and invalid success responses count as failures. Command-level errors (such as a failed mDNS scan, missing credentials, or an unknown node name for `node`) also exit 1 and may have no per-node output.
 - **2**: Invalid arguments detected by the CLI parser.
 
 ### Certificate Management
