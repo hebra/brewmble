@@ -9,6 +9,7 @@ pub const TXT_TLS_VALUE: &str = "mtls";
 pub const PATH_STATUS: &str = "/status";
 pub const PATH_HEALTH: &str = "/health";
 pub const PATH_UPGRADE: &str = "/packages/full-upgrade";
+pub const PATH_UPGRADE_JOB: &str = "/packages/full-upgrade/{job_id}";
 pub const PATH_REBOOT: &str = "/node/reboot";
 
 /// Prefix of the subject OU attribute that carries a client certificate's role.
@@ -20,7 +21,7 @@ pub const CLIENT_ROLE_OU_PREFIX: &str = "brewmble-role:";
 pub enum ClientRole {
     /// May call `GET /health` and `GET /status`.
     Read,
-    /// May also call `POST /packages/full-upgrade` and `POST /node/reboot`.
+    /// May also trigger and track upgrades, and manage reboots.
     Operator,
 }
 
@@ -99,6 +100,24 @@ pub struct UpgradeResponse {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updates: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeJobStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UpgradeJobResponse {
+    pub job_id: String,
+    pub status: UpgradeJobStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]
@@ -197,14 +216,52 @@ mod tests {
         let resp = UpgradeResponse {
             message: "Upgrade started".to_string(),
             updates: Some(vec!["pkg1".to_string()]),
+            job_id: Some("abc".to_string()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"message\":\"Upgrade started\""));
         assert!(json.contains("\"updates\":[\"pkg1\"]"));
+        assert!(json.contains("\"job_id\":\"abc\""));
 
         let decoded: UpgradeResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.message, resp.message);
         assert_eq!(decoded.updates, resp.updates);
+        assert_eq!(decoded.job_id, resp.job_id);
+    }
+
+    #[test]
+    fn test_upgrade_response_without_job_id() {
+        let decoded: UpgradeResponse = serde_json::from_str(r#"{"message":"triggered"}"#).unwrap();
+        assert_eq!(decoded.job_id, None);
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::json!({"message": "triggered"})
+        );
+    }
+
+    #[test]
+    fn test_upgrade_job_status_serialization() {
+        for (status, wire, error) in [
+            (UpgradeJobStatus::Running, "running", None),
+            (UpgradeJobStatus::Succeeded, "succeeded", None),
+            (UpgradeJobStatus::Failed, "failed", Some("upgrade failed")),
+        ] {
+            let response = UpgradeJobResponse {
+                job_id: "abc".to_string(),
+                status,
+                error: error.map(str::to_string),
+            };
+            let mut expected = serde_json::json!({"job_id": "abc", "status": wire});
+            if let Some(error) = error {
+                expected["error"] = serde_json::json!(error);
+            }
+            let actual = serde_json::to_value(response).unwrap();
+            assert_eq!(actual, expected);
+            let decoded: UpgradeJobResponse = serde_json::from_value(actual).unwrap();
+            assert_eq!(decoded.job_id, "abc");
+            assert_eq!(decoded.status, status);
+            assert_eq!(decoded.error.as_deref(), error);
+        }
     }
 
     #[test]

@@ -95,9 +95,12 @@ cd daemon && cargo build --release
    # List configured nodes in active profile
    ./cli/target/release/brewmble node --list
 
-   # Trigger upgrade
+   # Trigger an upgrade and print its job ID
     ./cli/target/release/brewmble node --full-upgrade <node>
     # ("packages" is an alias for "node")
+
+    # Wait for the upgrade to finish (exits nonzero if it fails)
+    ./cli/target/release/brewmble node --full-upgrade --wait <node>
 
     # Preview an upgrade without executing it
     ./cli/target/release/brewmble node --full-upgrade --dry-run <node>
@@ -109,6 +112,11 @@ cd daemon && cargo build --release
     ./cli/target/release/brewmble version
     ```
 
+Without `--wait`, the CLI returns once the daemon accepts the upgrade. Use the
+job ID to check `running`, `succeeded`, or `failed` (with an error) via
+[`GET /packages/full-upgrade/{job_id}`](daemon/README.md#get-packagesfull-upgradejob_id).
+Dry runs do not create jobs and cannot be combined with `--wait`.
+
 ## Security
 
 Brewmble uses mutual TLS (mTLS) for all CLI-to-daemon communication. A single cluster CA, managed by the CLI, signs both daemon and client certificates.
@@ -118,7 +126,7 @@ Brewmble uses mutual TLS (mTLS) for all CLI-to-daemon communication. A single cl
 - **CA management**: `brewmble ca init` creates a self-signed ECDSA P-256 cluster CA in the OS keyring.
 - **Daemon certificates**: `brewmble cert issue --kind daemon --cn <hostname> --out-dir <dir>` produces `ca.pem`, `daemon.pem`, and `daemon-key.pem`.
 - **Client certificate**: `brewmble cert issue --kind client` stores the CLI client certificate in the keyring. Add `--role read` for a certificate limited to `/health` and `/status`, and `--out-dir <dir>` to write the certificate to files (for another host or a monitoring tool) instead of replacing the CLI's own.
-- **Roles**: Each client certificate carries a role in its subject (`OU=brewmble-role:read` or `OU=brewmble-role:operator`, the default). `read` may call `GET /health` and `GET /status`; `operator` may also call `POST /packages/full-upgrade` and `POST /node/reboot`. Certificates without a role, such as those issued by older CLI versions, are treated as `read`; re-issue them with `brewmble cert issue --kind client --force`.
+- **Roles**: Each client certificate carries a role in its subject (`OU=brewmble-role:read` or `OU=brewmble-role:operator`, the default). `read` may call `GET /health` and `GET /status`; `operator` may also trigger and track upgrades and manage reboots. Certificates without a role, such as those issued by older CLI versions, are treated as `read`; re-issue them with `brewmble cert issue --kind client --force`.
 - **Allow-list and revocation**: List the SHA-256 fingerprints of permitted client certificates under `tls.allowed_clients` in `brewmbled.yaml`. The daemon rejects any other certificate with `403 Forbidden`, even one signed by the cluster CA. To revoke a certificate, remove its fingerprint and reload the daemon (`systemctl reload brewmbled`, or send it `SIGHUP`); the change also applies to open connections. If `tls.allowed_clients` is not set, every certificate signed by the cluster CA is accepted, and `brewmbled config validate` warns about it.
 - **Verification**: The daemon accepts client certificates issued by the cluster CA, subject to the allow-list and role checks above. The CLI checks the daemon's certificate against the cluster CA, verifies that it matches the target hostname or IP address, and checks the leaf fingerprint on the connection carrying the request. A pin failure prevents requests to that target. Use the DNS name in the daemon certificate, or use an IP address only if the certificate includes that IP as a subject alternative name.
 

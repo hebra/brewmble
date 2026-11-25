@@ -1,19 +1,20 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path as RoutePath, State},
     http::StatusCode,
     middleware::from_fn_with_state,
     response::IntoResponse,
     routing::{get, post},
 };
 use brewmble_rest::{
-    HealthResponse, PATH_HEALTH, PATH_REBOOT, PATH_STATUS, PATH_UPGRADE, RebootRequest,
-    RebootResponse, SERVICE_FULL_TYPE, StatusResponse, TXT_TLS, TXT_TLS_VALUE, UpgradeRequest,
-    UpgradeResponse,
+    HealthResponse, PATH_HEALTH, PATH_REBOOT, PATH_STATUS, PATH_UPGRADE, PATH_UPGRADE_JOB,
+    RebootRequest, RebootResponse, SERVICE_FULL_TYPE, StatusResponse, TXT_TLS, TXT_TLS_VALUE,
+    UpgradeJobResponse, UpgradeJobStatus, UpgradeRequest, UpgradeResponse,
 };
 use clap::{Parser, Subcommand};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rustls::pki_types::CertificateDer;
+use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -26,6 +27,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 mod client_auth;
 pub mod config;
@@ -174,6 +176,7 @@ struct AppState {
     pm_available: bool,
     pm_version: String,
     upgrade_handle: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    upgrade_jobs: UpgradeJobs,
     reboot: Arc<std::sync::Mutex<RebootState>>,
 }
 
@@ -191,17 +194,50 @@ enum RebootState {
     Rebooting,
 }
 
-struct UpgradingGuard(Arc<AtomicBool>);
+const MAX_UPGRADE_JOBS: usize = 100;
+
+type UpgradeJobs = Arc<std::sync::Mutex<VecDeque<UpgradeJobResponse>>>;
+
+struct UpgradingGuard {
+    flag: Arc<AtomicBool>,
+    jobs: UpgradeJobs,
+    result: Option<Result<(), String>>,
+}
 
 impl UpgradingGuard {
-    fn new(flag: Arc<AtomicBool>) -> Self {
-        Self(flag)
+    fn start(state: &AppState, job_id: String) -> Self {
+        let mut jobs = state.upgrade_jobs.lock().unwrap();
+        if jobs.len() == MAX_UPGRADE_JOBS {
+            jobs.pop_front();
+        }
+        jobs.push_back(UpgradeJobResponse {
+            job_id,
+            status: UpgradeJobStatus::Running,
+            error: None,
+        });
+        Self {
+            flag: state.is_upgrading.clone(),
+            jobs: state.upgrade_jobs.clone(),
+            result: None,
+        }
     }
 }
 
 impl Drop for UpgradingGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        let mut jobs = self.jobs.lock().unwrap();
+        let job = jobs.back_mut().expect("active upgrade job");
+        match self.result.take() {
+            Some(Ok(())) => job.status = UpgradeJobStatus::Succeeded,
+            result => {
+                job.status = UpgradeJobStatus::Failed;
+                job.error = Some(match result {
+                    Some(Err(error)) => error,
+                    _ => "upgrade task ended unexpectedly".to_string(),
+                });
+            }
+        }
+        self.flag.store(false, Ordering::SeqCst);
     }
 }
 
@@ -345,6 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pm_available,
         pm_version,
         upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+        upgrade_jobs: UpgradeJobs::default(),
         reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
     };
     let shutdown_state = state.clone();
@@ -381,17 +418,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("https server error: {err}");
     }
 
-    if let Ok(mut guard) = shutdown_state.upgrade_handle.lock() {
-        if let Some(handle) = guard.take() {
-            let abort_handle = handle.abort_handle();
-            let timeout = tokio::time::Duration::from_secs(30);
-            match tokio::time::timeout(timeout, handle).await {
-                Ok(Ok(())) => info!("upgrade task finished cleanly"),
-                Ok(Err(e)) => error!("upgrade task panicked or was cancelled: {e}"),
-                Err(_) => {
-                    abort_handle.abort();
-                    error!("upgrade task did not finish in time; aborted");
-                }
+    let upgrade_handle = shutdown_state.upgrade_handle.lock().unwrap().take();
+    if let Some(handle) = upgrade_handle {
+        let abort_handle = handle.abort_handle();
+        let timeout = tokio::time::Duration::from_secs(30);
+        match tokio::time::timeout(timeout, handle).await {
+            Ok(Ok(())) => info!("upgrade task finished cleanly"),
+            Ok(Err(e)) => error!("upgrade task panicked or was cancelled: {e}"),
+            Err(_) => {
+                abort_handle.abort();
+                error!("upgrade task did not finish in time; aborted");
             }
         }
     }
@@ -485,6 +521,7 @@ async fn full_upgrade_handler(
                     state.package_manager.name()
                 ),
                 updates: None,
+                job_id: None,
             }),
         );
     }
@@ -497,6 +534,7 @@ async fn full_upgrade_handler(
                     Json(UpgradeResponse {
                         message: "dry-run completed".to_string(),
                         updates: Some(updates),
+                        job_id: None,
                     }),
                 );
             }
@@ -506,6 +544,7 @@ async fn full_upgrade_handler(
                     Json(UpgradeResponse {
                         message: format!("dry-run failed: {}", err),
                         updates: None,
+                        job_id: None,
                     }),
                 );
             }
@@ -522,6 +561,7 @@ async fn full_upgrade_handler(
                 Json(UpgradeResponse {
                     message: "a reboot is scheduled; cancel it before upgrading".to_string(),
                     updates: None,
+                    job_id: None,
                 }),
             );
         }
@@ -535,32 +575,44 @@ async fn full_upgrade_handler(
                 Json(UpgradeResponse {
                     message: "a full upgrade is currently running".to_string(),
                     updates: None,
+                    job_id: None,
                 }),
             );
         }
     }
 
-    let handle = tokio::spawn(async move {
-        let _guard = UpgradingGuard::new(state.is_upgrading.clone());
+    let job_id = Uuid::new_v4().to_string();
+    let guard = UpgradingGuard::start(&state, job_id.clone());
+    let pm = state.package_manager.clone();
+    let mut upgrade_handle = state.upgrade_handle.lock().unwrap();
+    *upgrade_handle = Some(tokio::spawn(async move {
+        let mut guard = guard;
         info!("starting full upgrade");
-        let result = state.package_manager.full_upgrade().await;
-
-        if let Err(e) = result {
+        guard.result = Some(pm.full_upgrade().await.map_err(|e| {
             error!("failed to execute full upgrade: {e}");
-        }
-    });
-
-    if let Ok(mut guard) = state.upgrade_handle.lock() {
-        *guard = Some(handle);
-    }
+            e.to_string()
+        }));
+    }));
 
     (
         StatusCode::OK,
         Json(UpgradeResponse {
             message: "full upgrade triggered".to_string(),
             updates: None,
+            job_id: Some(job_id),
         }),
     )
+}
+
+async fn upgrade_job_handler(
+    State(state): State<AppState>,
+    RoutePath(job_id): RoutePath<String>,
+) -> impl IntoResponse {
+    let jobs = state.upgrade_jobs.lock().unwrap();
+    match jobs.iter().find(|job| job.job_id == job_id) {
+        Some(job) => Json(job.clone()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 #[async_trait::async_trait]
@@ -827,6 +879,7 @@ fn build_router(state: AppState, access: client_auth::ClientAccess) -> Router {
         ));
     let operator_routes = Router::new()
         .route(PATH_UPGRADE, post(full_upgrade_handler))
+        .route(PATH_UPGRADE_JOB, get(upgrade_job_handler))
         .route(
             PATH_REBOOT,
             post(reboot_handler).delete(cancel_reboot_handler),
@@ -974,6 +1027,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
@@ -1011,6 +1065,7 @@ mod tests {
             pm_available: false,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
@@ -1047,6 +1102,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
@@ -1084,6 +1140,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
@@ -1121,6 +1178,7 @@ mod tests {
                 pm_available: true,
                 pm_version: "test".to_string(),
                 upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+                upgrade_jobs: UpgradeJobs::default(),
                 reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             };
             let app = Router::new()
@@ -1183,10 +1241,13 @@ mod tests {
         }
     }
 
-    struct PanickingMockPackageManager;
+    struct JobTestPackageManager {
+        release: Arc<tokio::sync::Notify>,
+        result: Option<Result<(), &'static str>>,
+    }
 
     #[async_trait::async_trait]
-    impl PackageManager for PanickingMockPackageManager {
+    impl PackageManager for JobTestPackageManager {
         fn name(&self) -> &str {
             "panic-mock"
         }
@@ -1207,7 +1268,10 @@ mod tests {
             Ok(vec![])
         }
         async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            panic!("simulated upgrade panic");
+            self.release.notified().await;
+            self.result
+                .expect("simulated upgrade panic")
+                .map_err(Into::into)
         }
         fn auto_clean(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
@@ -1219,15 +1283,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_upgrade_guard_resets_on_panic() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        release.notify_one();
         let state = AppState {
             is_upgrading: Arc::new(AtomicBool::new(false)),
             allow_reboot: false,
             auto_clean: false,
             auto_remove: false,
-            package_manager: Arc::new(Box::new(PanickingMockPackageManager)),
+            package_manager: Arc::new(Box::new(JobTestPackageManager {
+                release,
+                result: None,
+            })),
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
@@ -1259,6 +1329,135 @@ mod tests {
         }
 
         assert!(!state.is_upgrading.load(Ordering::SeqCst));
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let upgrade: UpgradeResponse = serde_json::from_slice(&body).unwrap();
+        let job = state.upgrade_jobs.lock().unwrap().back().cloned().unwrap();
+        assert_eq!(Some(job.job_id), upgrade.job_id);
+        assert_eq!(job.status, UpgradeJobStatus::Failed);
+        assert_eq!(
+            job.error.as_deref(),
+            Some("upgrade task ended unexpectedly")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_job_lifecycle() {
+        let mut state = router_test_state();
+        let mut previous_id = None;
+        for result in [Ok(()), Err("package manager failed")] {
+            let release = Arc::new(tokio::sync::Notify::new());
+            state.package_manager = Arc::new(Box::new(JobTestPackageManager {
+                release: release.clone(),
+                result: Some(result),
+            }));
+            let app = build_router(state.clone(), client_auth::ClientAccess::default());
+            let request = |method: &str, path: &str, body| {
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .extension(client_auth::ClientIdentity {
+                        fingerprint: "aa".to_string(),
+                        role: Some(brewmble_rest::ClientRole::Operator),
+                    })
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            };
+            for (dry_run, expected_status) in [(true, StatusCode::OK), (false, StatusCode::OK)] {
+                let response = app
+                    .clone()
+                    .oneshot(request(
+                        "POST",
+                        PATH_UPGRADE,
+                        format!(r#"{{"dry_run":{dry_run}}}"#),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected_status);
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body: UpgradeResponse = serde_json::from_slice(&body).unwrap();
+                if dry_run {
+                    assert!(body.updates.is_some());
+                    assert!(body.job_id.is_none());
+                    assert!(!state.is_upgrading.load(Ordering::SeqCst));
+                    continue;
+                }
+
+                let job_id = body.job_id.unwrap();
+                assert_ne!(previous_id.as_ref(), Some(&job_id));
+                let path = format!("{PATH_UPGRADE}/{job_id}");
+                let read_job = || async {
+                    let response = app
+                        .clone()
+                        .oneshot(request("GET", &path, String::new()))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                    serde_json::from_slice::<UpgradeJobResponse>(&body).unwrap()
+                };
+                let job = read_job().await;
+                assert_eq!(job.job_id, job_id);
+                assert_eq!(job.status, UpgradeJobStatus::Running);
+                assert!(job.error.is_none());
+                assert!(state.is_upgrading.load(Ordering::SeqCst));
+
+                let rejected = app
+                    .clone()
+                    .oneshot(request(
+                        "POST",
+                        PATH_UPGRADE,
+                        r#"{"dry_run":false}"#.to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(rejected.status(), StatusCode::PRECONDITION_FAILED);
+                let body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+                assert!(
+                    serde_json::from_slice::<UpgradeResponse>(&body)
+                        .unwrap()
+                        .job_id
+                        .is_none()
+                );
+
+                let handle = state.upgrade_handle.lock().unwrap().take().unwrap();
+                release.notify_one();
+                tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!state.is_upgrading.load(Ordering::SeqCst));
+                let job = read_job().await;
+                assert_eq!(
+                    job.status,
+                    if result.is_ok() {
+                        UpgradeJobStatus::Succeeded
+                    } else {
+                        UpgradeJobStatus::Failed
+                    },
+                );
+                assert_eq!(job.error.as_deref(), result.err());
+                previous_id = Some(job_id);
+            }
+        }
+        assert_eq!(state.upgrade_jobs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_upgrade_jobs_evict_oldest() {
+        let state = router_test_state();
+        for n in 0..=MAX_UPGRADE_JOBS {
+            state.is_upgrading.store(true, Ordering::SeqCst);
+            let mut guard = UpgradingGuard::start(&state, n.to_string());
+            guard.result = Some(Ok(()));
+        }
+        let jobs = state.upgrade_jobs.lock().unwrap();
+        assert_eq!(jobs.len(), MAX_UPGRADE_JOBS);
+        assert_eq!(jobs[0].job_id, "1");
+        assert_eq!(
+            jobs[MAX_UPGRADE_JOBS - 1].job_id,
+            MAX_UPGRADE_JOBS.to_string()
+        );
     }
 
     #[tokio::test]
@@ -1275,6 +1474,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
@@ -1312,6 +1512,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
@@ -1349,6 +1550,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
@@ -1553,6 +1755,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         }
     }
@@ -1677,6 +1880,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let app = Router::new()
@@ -1816,6 +2020,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
 
@@ -1942,6 +2147,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         }
     }
@@ -2005,6 +2211,17 @@ mod tests {
                     StatusCode::FORBIDDEN
                 );
             }
+        }
+        let unknown_job = format!("{PATH_UPGRADE}/unknown");
+        for (identity, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(id(Some(ClientRole::Read))), StatusCode::FORBIDDEN),
+            (Some(id(Some(ClientRole::Operator))), StatusCode::NOT_FOUND),
+        ] {
+            assert_eq!(
+                route_status(&app, "GET", &unknown_job, identity).await,
+                expected
+            );
         }
         // Operators reach the handlers: reboot is disabled and the upgrade body is invalid
         // (dry_run is required), so neither does anything.
@@ -2118,6 +2335,7 @@ mod tests {
             pm_available: true,
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
+            upgrade_jobs: UpgradeJobs::default(),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         };
         let access = client_auth::ClientAccess::default();

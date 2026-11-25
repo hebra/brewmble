@@ -59,7 +59,8 @@ Security is handled exclusively via mutual TLS (mTLS); there are no API keys.
 ### Endpoints
 - `GET /health`: Returns liveness information and the detected package manager.
 - `GET /status`: Returns information about the system and available updates.
-- `POST /packages/full-upgrade`: Triggers a system-wide upgrade (or a dry-run). This is a fire-and-forget operation in the background to prevent HTTP timeouts.
+- `POST /packages/full-upgrade`: Triggers a system-wide upgrade in the background and returns a job ID immediately, or returns the results of a dry run without creating a job.
+- `GET /packages/full-upgrade/{job_id}`: Returns the tracked upgrade's status and error details if it failed.
 - `POST /node/reboot`: Reboots the host, now or after up to an hour (`delay_secs`), gated by the `features.allow_reboot` configuration flag. Only one reboot can be pending; upgrades are refused while it is, and the upgrade lock is checked again before rebooting.
 - `DELETE /node/reboot`: Cancels a pending reboot.
 
@@ -82,8 +83,8 @@ Security is handled exclusively via mutual TLS (mTLS); there are no API keys.
 4. If `dry_run` is `true`, the daemon simulates the upgrade and returns the list of packages that would be changed.
 5. If `dry_run` is `false`, the daemon sets an `is_upgrading` flag (AtomicBool) to prevent concurrent upgrades.
 6. Daemon spawns a background task to perform the upgrade (e.g., `apt-get dist-upgrade -y` or `brew upgrade`), optionally followed by `autoclean`/`autoremove` cleanup steps.
-7. Daemon immediately returns `200 OK` (with a "triggered" message) to the CLI.
-8. The CLI informs the user that the upgrade has started.
+7. Daemon immediately returns `200 OK` with a "triggered" message and a job ID.
+8. The CLI prints the job ID. With `--wait`, it polls the job until it succeeds or fails and exits nonzero on failure.
 
 ---
 

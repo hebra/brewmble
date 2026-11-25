@@ -27,7 +27,7 @@ This file provides guidance to agents when working with code in this repository.
 - Daemon auto-hunts for free port starting from 4712 if server.port is not configured
 - Daemon binds to `server.bind_address` (default 0.0.0.0) for both port probing and the HTTPS listener
 - API authentication is performed via mutual TLS (mTLS); the X-API-Key header has been removed
-- Client authorization: the daemon checks each request's client certificate against the optional `tls.allowed_clients` SHA-256 fingerprint list (reloaded on SIGHUP) and the role in its subject `OU=brewmble-role:read|operator` (see daemon/src/client_auth.rs); `read` covers /health and /status, `operator` also upgrade and reboot, and certificates without a role are `read`
+- Client authorization: the daemon checks each request's client certificate against the optional `tls.allowed_clients` SHA-256 fingerprint list (reloaded on SIGHUP) and the role in its subject `OU=brewmble-role:read|operator` (see daemon/src/client_auth.rs); `read` covers /health and /status, `operator` also covers upgrade triggers, upgrade job status, and reboots, and certificates without a role are `read`
 - Cluster CA and client certificates are managed by the CLI (`brewmble ca` and `brewmble cert` subcommands) and stored in the OS keyring
 - On macOS, keychain access uses the modern `SecItem*` API via `security-framework::item` (not the keyring crate's legacy `SecKeychain*` path, which is broken on macOS 27+); `brewmble ca migrate` re-stores legacy entries
 - Daemon requires paths to the cluster CA cert, daemon cert, and daemon key via the `tls:` section in the configuration file
@@ -48,7 +48,7 @@ This file provides guidance to agents when working with code in this repository.
 - mDNS instance name format: "brewmbled-{hostname}" where hostname is first part before dot
 - Daemon uses AtomicBool for is_upgrading state to prevent concurrent upgrades
 - Reboots go through `AppState.reboot` (`RebootState`: Idle/Pending/Rebooting): one pending reboot at a time, `delay_secs` capped at `MAX_REBOOT_DELAY_SECS`, upgrades refused unless Idle, and `run_scheduled_reboot` re-checks the upgrade lock after the delay; `DELETE /node/reboot` cancels
-- Full upgrade spawns tokio task and returns immediately (fire-and-forget pattern)
+- Full upgrades run in a Tokio task and return a job ID immediately; the daemon keeps the last 100 jobs in memory with `running`, `succeeded`, or `failed` status. The CLI's `--wait` polls `GET /packages/full-upgrade/{job_id}` and exits nonzero on failure. Dry runs do not create jobs.
 - CLI `status` command emits ConEmu OSC 9;4 native progress sequences by default and hides the text progress bar; set BREWMBLE_NATIVE_PROGRESS=0 to disable
 - Aim for at least 90% test coverage for all new code and major refactors
 

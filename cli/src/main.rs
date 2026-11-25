@@ -1,6 +1,6 @@
 use brewmble_rest::{
     PATH_REBOOT, PATH_STATUS, PATH_UPGRADE, RebootResponse, SERVICE_DOMAIN, SERVICE_TYPE,
-    StatusResponse, TXT_TLS, UpgradeResponse,
+    StatusResponse, TXT_TLS, UpgradeJobResponse, UpgradeJobStatus, UpgradeResponse,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use flume::RecvTimeoutError;
@@ -330,6 +330,10 @@ enum Commands {
         #[arg(long, conflicts_with = "reboot", requires = "full_upgrade")]
         dry_run: bool,
 
+        /// Wait for the full upgrade to finish and report its result
+        #[arg(long, requires = "full_upgrade", conflicts_with_all = ["dry_run", "reboot"])]
+        wait: bool,
+
         /// List node names configured in the active profile
         #[arg(short = 'l', long, conflicts_with_all = ["full_upgrade", "reboot", "dry_run", "repin"])]
         list: bool,
@@ -498,6 +502,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             full_upgrade,
             reboot,
             dry_run,
+            wait,
             list,
             repin,
             nodes,
@@ -508,15 +513,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             if let Some(name) = repin {
                 return run_repin(&name, &mut config, &config_path);
             }
-            run_node(
-                full_upgrade,
-                reboot,
-                dry_run,
-                list,
-                nodes,
-                &mut config,
-                &config_path,
-            )
+            let upgrade = full_upgrade.then_some(if dry_run {
+                UpgradeMode::DryRun
+            } else if wait {
+                UpgradeMode::Wait
+            } else {
+                UpgradeMode::Trigger
+            });
+            run_node(upgrade, reboot, list, nodes, &mut config, &config_path)
         }
         Some(Commands::Profile { subcommand }) => {
             run_profile(subcommand, &mut config, &config_path)
@@ -911,6 +915,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run: _,
+            wait: _,
             list: _,
             repin: _,
             nodes: _,
@@ -930,6 +935,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
+            wait: _,
             list: _,
             repin: _,
             nodes,
@@ -945,12 +951,106 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_node_wait() {
+        assert!(matches!(
+            Cli::try_parse_from(["brewmble", "node", "--full-upgrade", "--wait", "node1"])
+                .unwrap()
+                .command,
+            Some(Commands::Node { wait: true, .. })
+        ));
+
+        for args in [
+            &["--wait"][..],
+            &["--wait", "--reboot"],
+            &["--wait", "--full-upgrade", "--reboot"],
+            &["--wait", "--full-upgrade", "--dry-run"],
+            &["--wait", "--full-upgrade", "--list"],
+        ] {
+            assert!(
+                Cli::try_parse_from(["brewmble", "node"].into_iter().chain(args.iter().copied()))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_wait_for_upgrade_polls_job_until_terminal() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        for (code, terminal, expected_error) in [
+            ("200 OK", r#"{"job_id":"abc","status":"succeeded"}"#, None),
+            (
+                "200 OK",
+                r#"{"job_id":"abc","status":"failed","error":"package manager failed"}"#,
+                Some("failed: package manager failed"),
+            ),
+            (
+                "200 OK",
+                r#"{"job_id":"abc","status":"failed"}"#,
+                Some("failed: no error details provided"),
+            ),
+            (
+                "200 OK",
+                r#"{"job_id":"other","status":"succeeded"}"#,
+                Some("different upgrade job ID"),
+            ),
+            ("404 Not Found", "", Some("404 Not Found")),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                for (code, body) in [
+                    ("200 OK", r#"{"job_id":"abc","status":"running"}"#),
+                    (code, terminal),
+                ] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert_eq!(line, format!("GET {PATH_UPGRADE}/abc HTTP/1.1\r\n"));
+                    loop {
+                        line.clear();
+                        assert!(reader.read_line(&mut line).unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    write!(
+                        stream,
+                        "HTTP/1.1 {code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            });
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .no_proxy()
+                .build()
+                .unwrap();
+            let result = wait_for_upgrade(&client, &url, "abc", Duration::ZERO);
+            if let Some(expected) = expected_error {
+                let actual = result.unwrap_err().to_string();
+                assert!(actual.contains(expected), "{actual}");
+            } else {
+                result.unwrap();
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
     fn test_cli_parse_node_no_dry_run() {
         let cli = Cli::parse_from(&["brewmble", "node", "--full-upgrade", "node1"]);
         if let Some(Commands::Node {
             full_upgrade,
             reboot,
             dry_run,
+            wait: _,
             list: _,
             repin: _,
             nodes,
@@ -972,6 +1072,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
+            wait: _,
             list: _,
             repin: _,
             nodes,
@@ -993,6 +1094,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
+            wait: _,
             list: _,
             repin: _,
             nodes,
@@ -1014,6 +1116,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
+            wait: _,
             list,
             repin: _,
             nodes,
@@ -1036,6 +1139,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
+            wait: _,
             list,
             repin: _,
             nodes,
@@ -1058,6 +1162,7 @@ mod tests {
             full_upgrade,
             reboot,
             dry_run,
+            wait: _,
             list,
             repin: _,
             nodes,
@@ -1107,16 +1212,7 @@ mod tests {
     #[test]
     fn test_run_node_no_action_specified() {
         let mut config = Config::default();
-        let err = run_node(
-            false,
-            false,
-            false,
-            false,
-            vec![],
-            &mut config,
-            Path::new(""),
-        )
-        .unwrap_err();
+        let err = run_node(None, false, false, vec![], &mut config, Path::new("")).unwrap_err();
         assert_eq!(
             err.to_string(),
             "either --full-upgrade (-u), --reboot (-r), or --list (-l) must be specified"
@@ -1126,15 +1222,7 @@ mod tests {
     #[test]
     fn test_run_node_list_empty_profile() {
         let mut config = Config::default();
-        let result = run_node(
-            false,
-            false,
-            false,
-            true,
-            vec![],
-            &mut config,
-            Path::new(""),
-        );
+        let result = run_node(None, false, true, vec![], &mut config, Path::new(""));
         assert!(result.is_ok());
     }
 
@@ -1154,15 +1242,7 @@ mod tests {
             },
         ];
 
-        let result = run_node(
-            false,
-            false,
-            false,
-            true,
-            vec![],
-            &mut config,
-            Path::new(""),
-        );
+        let result = run_node(None, false, true, vec![], &mut config, Path::new(""));
         assert!(result.is_ok());
     }
 
@@ -1176,8 +1256,7 @@ mod tests {
         }];
 
         let result = run_node(
-            false,
-            false,
+            None,
             false,
             true,
             vec!["node-1".to_string()],
@@ -1187,8 +1266,7 @@ mod tests {
         assert!(result.is_ok());
 
         let err = run_node(
-            false,
-            false,
+            None,
             false,
             true,
             vec!["unknown".to_string()],
@@ -2327,24 +2405,29 @@ fn run_repin(name: &str, config: &mut Config, config_path: &Path) -> Result<(), 
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpgradeMode {
+    Trigger,
+    DryRun,
+    Wait,
+}
+
 fn run_node(
-    full_upgrade: bool,
+    upgrade: Option<UpgradeMode>,
     reboot: bool,
-    dry_run: bool,
     list: bool,
     nodes: Vec<String>,
     config: &mut Config,
     config_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    if !full_upgrade && !reboot && !list {
+    if upgrade.is_none() && !reboot && !list {
         return Err(
             "either --full-upgrade (-u), --reboot (-r), or --list (-l) must be specified".into(),
         );
     }
 
-    if dry_run && !full_upgrade {
-        return Err("--dry-run can only be used with --full-upgrade".into());
-    }
+    let dry_run = upgrade == Some(UpgradeMode::DryRun);
+    let wait = upgrade == Some(UpgradeMode::Wait);
 
     let target_nodes: Vec<NodeConfig> = resolve_profile_nodes(&nodes, config)?
         .into_iter()
@@ -2367,6 +2450,8 @@ fn run_node(
     let clients = pin::PinnedClients::load()?;
     let mut tw = TabWriter::new(io::stdout());
     writeln!(tw, "NODE\tSTATUS")?;
+    let mut wait_failed = false;
+    let mut pending_jobs = Vec::new();
 
     for node in &target_nodes {
         let name = node.name.as_deref().unwrap_or(&node.address);
@@ -2374,6 +2459,7 @@ fn run_node(
             Ok(connection) => connection,
             Err(err) => {
                 writeln!(tw, "{}\tPin verification failed: {}", name, err)?;
+                wait_failed |= wait;
                 continue;
             }
         };
@@ -2408,14 +2494,31 @@ fn run_node(
 
             match request.send() {
                 Ok(resp) => {
-                    let status = resp.status().to_string();
+                    let status = resp.status();
                     let ur: UpgradeResponse = resp.json().unwrap_or_else(|_| UpgradeResponse {
                         message: "Unknown response".to_string(),
                         updates: None,
+                        job_id: None,
                     });
-                    (status, ur.message, ur.updates)
+                    if let Some(job_id) = ur.job_id.as_ref() {
+                        if wait && status.is_success() {
+                            pending_jobs.push((name, client.clone(), url, job_id.clone()));
+                        }
+                    } else if wait && status.is_success() {
+                        writeln!(tw, "{}\tDaemon did not return an upgrade job ID", name)?;
+                        wait_failed = true;
+                    }
+                    wait_failed |= wait && !status.is_success();
+                    let message = match ur.job_id {
+                        Some(id) => format!("{} (job ID: {})", ur.message, sanitize_display(&id)),
+                        None => ur.message,
+                    };
+                    (status.to_string(), message, ur.updates)
                 }
-                Err(err) => (format!("Error: {}", err), "".to_string(), None),
+                Err(err) => {
+                    wait_failed |= wait;
+                    (format!("Error: {}", err), "".to_string(), None)
+                }
             }
         };
 
@@ -2432,5 +2535,63 @@ fn run_node(
 
     tw.flush()?;
 
-    clients.finish()
+    for (name, client, url, job_id) in pending_jobs {
+        match wait_for_upgrade(&client, &url, &job_id, Duration::from_secs(1)) {
+            Ok(()) => writeln!(
+                tw,
+                "{name}\tUpgrade job {} succeeded",
+                sanitize_display(&job_id)
+            )?,
+            Err(err) => {
+                writeln!(
+                    tw,
+                    "{name}\tUpgrade job {}: {}",
+                    sanitize_display(&job_id),
+                    sanitize_display(&err.to_string())
+                )?;
+                wait_failed = true;
+            }
+        }
+        tw.flush()?;
+    }
+
+    clients.finish()?;
+    if wait_failed {
+        return Err("could not complete all requested upgrades successfully".into());
+    }
+    Ok(())
+}
+
+fn wait_for_upgrade(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    job_id: &str,
+    interval: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let mut endpoint = reqwest::Url::parse(&format!("{url}{PATH_UPGRADE}"))?;
+    endpoint
+        .path_segments_mut()
+        .map_err(|_| "invalid upgrade job URL")?
+        .push(job_id);
+    loop {
+        let job: UpgradeJobResponse = client
+            .get(endpoint.clone())
+            .send()?
+            .error_for_status()?
+            .json()?;
+        if job.job_id != job_id {
+            return Err("daemon returned a different upgrade job ID".into());
+        }
+        match job.status {
+            UpgradeJobStatus::Running => std::thread::sleep(interval),
+            UpgradeJobStatus::Succeeded => return Ok(()),
+            UpgradeJobStatus::Failed => {
+                return Err(format!(
+                    "failed: {}",
+                    job.error.as_deref().unwrap_or("no error details provided")
+                )
+                .into());
+            }
+        }
+    }
 }

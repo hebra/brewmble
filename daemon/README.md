@@ -23,6 +23,7 @@ The Brewmble Daemon (`brewmbled`) is a background service that runs on managed n
   - [`GET /health`](#get-health)
   - [`GET /status`](#get-status)
   - [`POST /packages/full-upgrade`](#post-packagesfull-upgrade)
+  - [`GET /packages/full-upgrade/{job_id}`](#get-packagesfull-upgradejob_id)
   - [`POST /node/reboot`](#post-nodereboot)
   - [`DELETE /node/reboot`](#delete-nodereboot)
 - [Development](#development)
@@ -370,7 +371,7 @@ Each request is then authorized against the client certificate:
   | Endpoint | `read` | `operator` |
   |---|---|---|
   | `GET /health`, `GET /status` | yes | yes |
-  | `POST /packages/full-upgrade`, `POST`/`DELETE /node/reboot` | no | yes |
+  | `POST /packages/full-upgrade`, `GET /packages/full-upgrade/{job_id}`, `POST`/`DELETE /node/reboot` | no | yes |
 
   A certificate without a role (for example one issued by an older CLI) is treated as `read`.
 
@@ -390,7 +391,7 @@ For more details, see the [main Security section](../README.md#security).
 
 ## API Endpoints
 
-All endpoints are served over HTTPS and require a client certificate signed by the cluster CA. `/health` and `/status` need the `read` role; `/packages/full-upgrade` and `/node/reboot` (both methods) need `operator`. A client that is not on the allow-list or lacks the role gets `403 Forbidden` with a JSON `message`.
+All endpoints are served over HTTPS and require a client certificate signed by the cluster CA. `/health` and `/status` need the `read` role; triggering or tracking an upgrade and managing reboots need `operator`. A client that is not on the allow-list or lacks the role gets `403 Forbidden` with a JSON `message`.
 
 ### `GET /health`
 
@@ -462,17 +463,34 @@ With `dry_run: true`, the daemon simulates the upgrade and returns the list of p
 **Response (non-dry-run):**
 ```json
 {
-  "message": "full upgrade triggered"
+  "message": "full upgrade triggered",
+  "job_id": "10453f59-14f7-497d-9552-41de52ac039f"
 }
 ```
 
-Only one upgrade can run at a time; the `is_upgrading` flag in `GET /status` reports whether an upgrade is in progress.
+Only one upgrade can run at a time; the `is_upgrading` flag in `GET /status` reports whether an upgrade is in progress. Dry runs do not create a job.
 
 **Status codes:**
 
 - `200 OK`: Upgrade triggered (or dry-run completed).
 - `412 PRECONDITION_FAILED`: The package manager is not available, or a full upgrade is already running.
 - `423 LOCKED`: A reboot is scheduled or in progress; cancel it first with `DELETE /node/reboot`.
+
+### `GET /packages/full-upgrade/{job_id}`
+
+Returns `200 OK` with the ID and status of an upgrade on this daemon. The status
+is `running`, `succeeded`, or `failed`. The `error` field is present only on failure:
+
+```json
+{
+  "job_id": "10453f59-14f7-497d-9552-41de52ac039f",
+  "status": "failed",
+  "error": "full upgrade failed with status: exit status: 100"
+}
+```
+
+The daemon keeps the last 100 jobs in memory. Unknown IDs, evicted jobs, and jobs
+from before a daemon restart return `404 Not Found`.
 
 ### `POST /node/reboot`
 
