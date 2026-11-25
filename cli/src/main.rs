@@ -1,6 +1,6 @@
 use brewmble_rest::{
-    PATH_REBOOT, PATH_STATUS, PATH_UPGRADE, RebootResponse, SERVICE_DOMAIN, SERVICE_TYPE,
-    StatusResponse, TXT_TLS, UpgradeResponse,
+    PATH_REBOOT, PATH_STATUS, PATH_UPGRADE, RebootRequest, RebootResponse, SERVICE_DOMAIN,
+    SERVICE_TYPE, StatusResponse, TXT_TLS, UpgradeResponse,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use flume::RecvTimeoutError;
@@ -326,6 +326,14 @@ enum Commands {
         #[arg(short = 'r', long)]
         reboot: bool,
 
+        /// Delay before rebooting, in seconds (maximum 3600)
+        #[arg(long, requires = "reboot", conflicts_with = "cancel_reboot")]
+        delay_secs: Option<u64>,
+
+        /// Cancel a scheduled reboot
+        #[arg(long, conflicts_with_all = ["full_upgrade", "reboot", "dry_run", "list", "repin"])]
+        cancel_reboot: bool,
+
         /// Show what would be upgraded without executing
         #[arg(long, conflicts_with = "reboot", requires = "full_upgrade")]
         dry_run: bool,
@@ -497,6 +505,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(Commands::Node {
             full_upgrade,
             reboot,
+            delay_secs,
+            cancel_reboot,
             dry_run,
             list,
             repin,
@@ -508,6 +518,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             if let Some(name) = repin {
                 return run_repin(&name, &mut config, &config_path);
             }
+            let reboot = if cancel_reboot {
+                Some(RebootAction::Cancel)
+            } else if reboot {
+                Some(RebootAction::Schedule(RebootRequest { delay_secs }))
+            } else {
+                None
+            };
             run_node(
                 full_upgrade,
                 reboot,
@@ -914,6 +931,7 @@ mod tests {
             list: _,
             repin: _,
             nodes: _,
+            ..
         }) = cli.command
         {
             assert!(full_upgrade);
@@ -933,6 +951,7 @@ mod tests {
             list: _,
             repin: _,
             nodes,
+            ..
         }) = cli.command
         {
             assert!(full_upgrade);
@@ -954,6 +973,7 @@ mod tests {
             list: _,
             repin: _,
             nodes,
+            ..
         }) = cli.command
         {
             assert!(full_upgrade);
@@ -975,6 +995,7 @@ mod tests {
             list: _,
             repin: _,
             nodes,
+            ..
         }) = cli.command
         {
             assert!(!full_upgrade);
@@ -996,6 +1017,7 @@ mod tests {
             list: _,
             repin: _,
             nodes,
+            ..
         }) = cli.command
         {
             assert!(full_upgrade);
@@ -1017,6 +1039,7 @@ mod tests {
             list,
             repin: _,
             nodes,
+            ..
         }) = cli.command
         {
             assert!(!full_upgrade);
@@ -1039,6 +1062,7 @@ mod tests {
             list,
             repin: _,
             nodes,
+            ..
         }) = cli.command
         {
             assert!(!full_upgrade);
@@ -1061,6 +1085,7 @@ mod tests {
             list,
             repin: _,
             nodes,
+            ..
         }) = cli.command
         {
             assert!(!full_upgrade);
@@ -1098,6 +1123,87 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_node_delayed_reboot() {
+        let cli = Cli::parse_from([
+            "brewmble",
+            "node",
+            "--reboot",
+            "--delay-secs",
+            "60",
+            "node1",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Node {
+                reboot: true,
+                delay_secs: Some(60),
+                nodes,
+                ..
+            }) if nodes == ["node1"]
+        ));
+        assert!(Cli::try_parse_from(["brewmble", "node", "--delay-secs", "60"]).is_err());
+        assert!(
+            Cli::try_parse_from(["brewmble", "node", "--reboot", "--delay-secs", "soon"]).is_err()
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_node_cancel_reboot() {
+        let cli = Cli::parse_from(["brewmble", "node", "--cancel-reboot", "node1", "node2"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Node {
+                cancel_reboot: true,
+                nodes,
+                ..
+            }) if nodes == ["node1", "node2"]
+        ));
+        for args in [
+            &["--reboot"][..],
+            &["--full-upgrade"],
+            &["--full-upgrade", "--dry-run"],
+            &["--list"],
+            &["--repin", "node1"],
+            &["--delay-secs", "60"],
+        ] {
+            assert!(
+                Cli::try_parse_from(
+                    ["brewmble", "node", "--cancel-reboot"]
+                        .into_iter()
+                        .chain(args.iter().copied())
+                )
+                .is_err(),
+                "unexpectedly accepted {args:?} with --cancel-reboot"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reboot_requests() {
+        let client = reqwest::blocking::Client::new();
+        let base_url = "https://node1:4712";
+        for delay_secs in [None, Some(60)] {
+            let request = RebootAction::Schedule(RebootRequest { delay_secs })
+                .request(&client, base_url)
+                .build()
+                .unwrap();
+            assert_eq!(request.method(), reqwest::Method::POST);
+            assert_eq!(request.url().path(), PATH_REBOOT);
+            let body: RebootRequest =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            assert_eq!(body.delay_secs, delay_secs);
+        }
+
+        let request = RebootAction::Cancel
+            .request(&client, base_url)
+            .build()
+            .unwrap();
+        assert_eq!(request.method(), reqwest::Method::DELETE);
+        assert_eq!(request.url().path(), PATH_REBOOT);
+        assert!(request.body().is_none());
+    }
+
+    #[test]
     fn test_cli_parse_node_requires_action() {
         let result = Cli::try_parse_from(&["brewmble", "node", "node1"]);
         // Clap does not know the mutual requirement, so parsing succeeds and run_node errors.
@@ -1109,7 +1215,7 @@ mod tests {
         let mut config = Config::default();
         let err = run_node(
             false,
-            false,
+            None,
             false,
             false,
             vec![],
@@ -1119,22 +1225,14 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "either --full-upgrade (-u), --reboot (-r), or --list (-l) must be specified"
+            "either --full-upgrade (-u), --reboot (-r), --cancel-reboot, or --list (-l) must be specified"
         );
     }
 
     #[test]
     fn test_run_node_list_empty_profile() {
         let mut config = Config::default();
-        let result = run_node(
-            false,
-            false,
-            false,
-            true,
-            vec![],
-            &mut config,
-            Path::new(""),
-        );
+        let result = run_node(false, None, false, true, vec![], &mut config, Path::new(""));
         assert!(result.is_ok());
     }
 
@@ -1154,15 +1252,7 @@ mod tests {
             },
         ];
 
-        let result = run_node(
-            false,
-            false,
-            false,
-            true,
-            vec![],
-            &mut config,
-            Path::new(""),
-        );
+        let result = run_node(false, None, false, true, vec![], &mut config, Path::new(""));
         assert!(result.is_ok());
     }
 
@@ -1177,7 +1267,7 @@ mod tests {
 
         let result = run_node(
             false,
-            false,
+            None,
             false,
             true,
             vec!["node-1".to_string()],
@@ -1188,7 +1278,7 @@ mod tests {
 
         let err = run_node(
             false,
-            false,
+            None,
             false,
             true,
             vec!["unknown".to_string()],
@@ -2327,19 +2417,36 @@ fn run_repin(name: &str, config: &mut Config, config_path: &Path) -> Result<(), 
     }
 }
 
+enum RebootAction {
+    Schedule(RebootRequest),
+    Cancel,
+}
+
+impl RebootAction {
+    fn request(
+        &self,
+        client: &reqwest::blocking::Client,
+        base_url: &str,
+    ) -> reqwest::blocking::RequestBuilder {
+        let url = format!("{base_url}{PATH_REBOOT}");
+        match self {
+            Self::Schedule(payload) => client.post(url).json(payload),
+            Self::Cancel => client.delete(url),
+        }
+    }
+}
+
 fn run_node(
     full_upgrade: bool,
-    reboot: bool,
+    reboot: Option<RebootAction>,
     dry_run: bool,
     list: bool,
     nodes: Vec<String>,
     config: &mut Config,
     config_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    if !full_upgrade && !reboot && !list {
-        return Err(
-            "either --full-upgrade (-u), --reboot (-r), or --list (-l) must be specified".into(),
-        );
+    if !full_upgrade && reboot.is_none() && !list {
+        return Err("either --full-upgrade (-u), --reboot (-r), --cancel-reboot, or --list (-l) must be specified".into());
     }
 
     if dry_run && !full_upgrade {
@@ -2384,13 +2491,8 @@ fn run_node(
         }
         let url = resolve_url(&node.address);
 
-        let (status, body, updates) = if reboot {
-            let reboot_url = format!("{}{}", url, PATH_REBOOT);
-            let request = client
-                .post(&reboot_url)
-                .json(&brewmble_rest::RebootRequest::default());
-
-            match request.send() {
+        let (status, body, updates) = if let Some(action) = &reboot {
+            match action.request(&client, &url).send() {
                 Ok(resp) => {
                     let status = resp.status().to_string();
                     let rr: RebootResponse = resp.json().unwrap_or_else(|_| RebootResponse {

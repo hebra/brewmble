@@ -60,7 +60,7 @@ Targets are resolved against the active profile by name or address, and the outp
 
 ### Node Management
 
-Trigger a full system upgrade, reboot target nodes, or list nodes configured in the active profile. The `node` command is also available under the alias `packages`:
+Trigger a full system upgrade, schedule or cancel reboots, or list nodes configured in the active profile. The `node` command is also available under the alias `packages`:
 
 ```bash
 # List all nodes configured in the active profile
@@ -80,7 +80,15 @@ brewmble node --full-upgrade <node> [<node> ...]
 # Reboot a node (only if the daemon has allow_reboot enabled)
 brewmble node --reboot <node>
 # or: brewmble node -r <node>
+
+# Reboot a node after 60 seconds
+brewmble node --reboot --delay-secs 60 <node>
+
+# Cancel a pending reboot before it starts
+brewmble node --cancel-reboot <node>
 ```
+
+The daemon accepts delays up to 3600 seconds. Omitting the delay reboots immediately. Both reboot and cancel accept multiple node names; with no names, they target all nodes in the active profile.
 
 ### Certificate Management
 
