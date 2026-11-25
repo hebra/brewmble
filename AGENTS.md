@@ -48,7 +48,7 @@ This file provides guidance to agents when working with code in this repository.
 - mDNS instance name format: "brewmbled-{hostname}" where hostname is first part before dot
 - Daemon uses AtomicBool for is_upgrading state to prevent concurrent upgrades
 - Reboots go through `AppState.reboot` (`RebootState`: Idle/Pending/Rebooting): one pending reboot at a time, `delay_secs` capped at `MAX_REBOOT_DELAY_SECS`, upgrades refused unless Idle, and `run_scheduled_reboot` re-checks the upgrade lock after the delay; `DELETE /node/reboot` cancels
-- Full upgrades run in a Tokio task and return a job ID immediately; the daemon keeps the last 100 jobs in memory with `running`, `succeeded`, or `failed` status. The CLI's `--wait` polls `GET /packages/full-upgrade/{job_id}` and exits nonzero on failure. Dry runs do not create jobs.
+- Full upgrades run in a Tokio task and return a job ID immediately; the daemon keeps the last 100 jobs in memory with `running`, `succeeded`, or `failed` status. The CLI's `--wait` polls unfinished jobs round-robin via `GET /packages/full-upgrade/{job_id}` and exits nonzero on failure, no targets, or unknown outcomes. `--wait-timeout` bounds polling (default 1h); timed-out jobs are unknown, not failed. Dry runs do not create jobs.
 - CLI `status` command emits ConEmu OSC 9;4 native progress sequences by default and hides the text progress bar; set BREWMBLE_NATIVE_PROGRESS=0 to disable
 - Aim for at least 90% test coverage for all new code and major refactors
 

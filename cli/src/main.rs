@@ -7,7 +7,7 @@ use flume::RecvTimeoutError;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
@@ -269,13 +269,17 @@ fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
 pub(crate) fn get_default_timeout() -> Duration {
     std::env::var("BREWMBLE_TIMEOUT")
         .ok()
-        .and_then(|v| {
-            v.parse::<u64>()
-                .map(Duration::from_secs)
-                .ok()
-                .or_else(|| humantime::parse_duration(&v).ok())
-        })
+        .and_then(|v| parse_timeout(&v).ok())
         .unwrap_or(Duration::from_secs(60))
+}
+
+const DEFAULT_UPGRADE_WAIT_TIMEOUT: Duration = Duration::from_secs(3600);
+
+fn parse_timeout(value: &str) -> Result<Duration, humantime::DurationError> {
+    value
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .or_else(|_| humantime::parse_duration(value))
 }
 
 #[derive(Parser)]
@@ -333,6 +337,10 @@ enum Commands {
         /// Wait for the full upgrade to finish and report its result
         #[arg(long, requires = "full_upgrade", conflicts_with_all = ["dry_run", "reboot"])]
         wait: bool,
+
+        /// Maximum time to poll for upgrades: seconds or a duration such as 30m (default: 1h)
+        #[arg(long, requires = "wait", value_parser = parse_timeout)]
+        wait_timeout: Option<Duration>,
 
         /// List node names configured in the active profile
         #[arg(short = 'l', long, conflicts_with_all = ["full_upgrade", "reboot", "dry_run", "repin"])]
@@ -503,6 +511,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             reboot,
             dry_run,
             wait,
+            wait_timeout,
             list,
             repin,
             nodes,
@@ -516,7 +525,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let upgrade = full_upgrade.then_some(if dry_run {
                 UpgradeMode::DryRun
             } else if wait {
-                UpgradeMode::Wait
+                UpgradeMode::Wait(wait_timeout.unwrap_or(DEFAULT_UPGRADE_WAIT_TIMEOUT))
             } else {
                 UpgradeMode::Trigger
             });
@@ -916,6 +925,7 @@ mod tests {
             reboot,
             dry_run: _,
             wait: _,
+            wait_timeout: _,
             list: _,
             repin: _,
             nodes: _,
@@ -936,6 +946,7 @@ mod tests {
             reboot,
             dry_run,
             wait: _,
+            wait_timeout: _,
             list: _,
             repin: _,
             nodes,
@@ -965,19 +976,79 @@ mod tests {
             &["--wait", "--full-upgrade", "--reboot"],
             &["--wait", "--full-upgrade", "--dry-run"],
             &["--wait", "--full-upgrade", "--list"],
+            &["--full-upgrade", "--wait-timeout", "30s"],
+            &["--full-upgrade", "--wait", "--wait-timeout", "invalid"],
         ] {
             assert!(
                 Cli::try_parse_from(["brewmble", "node"].into_iter().chain(args.iter().copied()))
                     .is_err()
             );
         }
+
+        for value in ["90", "1m 30s"] {
+            assert!(matches!(
+                Cli::try_parse_from([
+                    "brewmble", "node", "--full-upgrade", "--wait", "--wait-timeout", value,
+                ])
+                .unwrap()
+                .command,
+                Some(Commands::Node { wait: true, wait_timeout: Some(timeout), .. })
+                    if timeout == Duration::from_secs(90)
+            ));
+        }
+    }
+
+    fn serve_upgrade_jobs(
+        responses: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (job_id, code, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, format!("GET {PATH_UPGRADE}/{job_id} HTTP/1.1\r\n"));
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (url, server)
+    }
+
+    fn pending_upgrade(url: &str, name: &'static str, job_id: &str) -> PendingUpgrade<'static> {
+        PendingUpgrade {
+            name,
+            client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .no_proxy()
+                .build()
+                .unwrap(),
+            url: url.to_string(),
+            job_id: job_id.to_string(),
+        }
     }
 
     #[test]
     fn test_wait_for_upgrade_polls_job_until_terminal() {
-        use std::io::{BufRead, BufReader};
-        use std::net::TcpListener;
-
         for (code, terminal, expected_error) in [
             ("200 OK", r#"{"job_id":"abc","status":"succeeded"}"#, None),
             (
@@ -997,50 +1068,66 @@ mod tests {
             ),
             ("404 Not Found", "", Some("404 Not Found")),
         ] {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let server = std::thread::spawn(move || {
-                for (code, body) in [
-                    ("200 OK", r#"{"job_id":"abc","status":"running"}"#),
-                    (code, terminal),
-                ] {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(3)))
-                        .unwrap();
-                    let mut reader = BufReader::new(&stream);
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    assert_eq!(line, format!("GET {PATH_UPGRADE}/abc HTTP/1.1\r\n"));
-                    loop {
-                        line.clear();
-                        assert!(reader.read_line(&mut line).unwrap() > 0);
-                        if line == "\r\n" {
-                            break;
-                        }
-                    }
-                    write!(
-                        stream,
-                        "HTTP/1.1 {code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .unwrap();
-                }
-            });
-            let client = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(3))
-                .no_proxy()
-                .build()
-                .unwrap();
-            let result = wait_for_upgrade(&client, &url, "abc", Duration::ZERO);
-            if let Some(expected) = expected_error {
-                let actual = result.unwrap_err().to_string();
-                assert!(actual.contains(expected), "{actual}");
-            } else {
-                result.unwrap();
-            }
+            let (url, server) = serve_upgrade_jobs(vec![
+                ("abc", "200 OK", r#"{"job_id":"abc","status":"running"}"#),
+                ("abc", code, terminal),
+            ]);
+            let mut output = Vec::new();
+            let unsuccessful = wait_for_upgrades(
+                &mut output,
+                VecDeque::from([pending_upgrade(&url, "first", "abc")]),
+                Duration::from_secs(3),
+                Duration::ZERO,
+            )
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(unsuccessful, expected_error.is_some(), "{output}");
+            assert!(
+                output.contains(expected_error.unwrap_or("succeeded")),
+                "{output}"
+            );
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_wait_for_upgrades_polls_all_jobs_before_retrying_running_jobs() {
+        let (url, server) = serve_upgrade_jobs(vec![
+            ("abc", "200 OK", r#"{"job_id":"abc","status":"running"}"#),
+            (
+                "xyz",
+                "200 OK",
+                r#"{"job_id":"xyz","status":"failed","error":"package manager failed"}"#,
+            ),
+            ("abc", "200 OK", r#"{"job_id":"abc","status":"succeeded"}"#),
+        ]);
+        let mut output = Vec::new();
+        let jobs = VecDeque::from([
+            pending_upgrade(&url, "first", "abc"),
+            pending_upgrade(&url, "second", "xyz"),
+        ]);
+        assert!(
+            wait_for_upgrades(&mut output, jobs, Duration::from_secs(3), Duration::ZERO).unwrap()
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "second\tUpgrade job xyz: failed: package manager failed\nfirst\tUpgrade job abc: succeeded\n"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_wait_for_upgrades_reports_all_unfinished_jobs_as_unknown() {
+        let mut output = Vec::new();
+        let jobs = VecDeque::from([
+            pending_upgrade("unused", "first", "abc"),
+            pending_upgrade("unused", "second", "xyz"),
+        ]);
+        assert!(wait_for_upgrades(&mut output, jobs, Duration::ZERO, Duration::ZERO).unwrap());
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "first\tUpgrade job abc: unknown (wait timeout exceeded)\nsecond\tUpgrade job xyz: unknown (wait timeout exceeded)\n"
+        );
     }
 
     #[test]
@@ -1051,6 +1138,7 @@ mod tests {
             reboot,
             dry_run,
             wait: _,
+            wait_timeout: _,
             list: _,
             repin: _,
             nodes,
@@ -1073,6 +1161,7 @@ mod tests {
             reboot,
             dry_run,
             wait: _,
+            wait_timeout: _,
             list: _,
             repin: _,
             nodes,
@@ -1095,6 +1184,7 @@ mod tests {
             reboot,
             dry_run,
             wait: _,
+            wait_timeout: _,
             list: _,
             repin: _,
             nodes,
@@ -1117,6 +1207,7 @@ mod tests {
             reboot,
             dry_run,
             wait: _,
+            wait_timeout: _,
             list,
             repin: _,
             nodes,
@@ -1140,6 +1231,7 @@ mod tests {
             reboot,
             dry_run,
             wait: _,
+            wait_timeout: _,
             list,
             repin: _,
             nodes,
@@ -1163,6 +1255,7 @@ mod tests {
             reboot,
             dry_run,
             wait: _,
+            wait_timeout: _,
             list,
             repin: _,
             nodes,
@@ -1224,6 +1317,21 @@ mod tests {
         let mut config = Config::default();
         let result = run_node(None, false, true, vec![], &mut config, Path::new(""));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_node_wait_errors_with_no_targets() {
+        let mut config = Config::default();
+        let error = run_node(
+            Some(UpgradeMode::Wait(DEFAULT_UPGRADE_WAIT_TIMEOUT)),
+            false,
+            false,
+            vec![],
+            &mut config,
+            Path::new(""),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "No nodes found to upgrade.");
     }
 
     #[test]
@@ -2409,7 +2517,7 @@ fn run_repin(name: &str, config: &mut Config, config_path: &Path) -> Result<(), 
 enum UpgradeMode {
     Trigger,
     DryRun,
-    Wait,
+    Wait(Duration),
 }
 
 fn run_node(
@@ -2427,7 +2535,11 @@ fn run_node(
     }
 
     let dry_run = upgrade == Some(UpgradeMode::DryRun);
-    let wait = upgrade == Some(UpgradeMode::Wait);
+    let wait_timeout = match upgrade {
+        Some(UpgradeMode::Wait(timeout)) => Some(timeout),
+        _ => None,
+    };
+    let wait = wait_timeout.is_some();
 
     let target_nodes: Vec<NodeConfig> = resolve_profile_nodes(&nodes, config)?
         .into_iter()
@@ -2435,6 +2547,9 @@ fn run_node(
         .collect();
 
     if target_nodes.is_empty() {
+        if wait {
+            return Err("No nodes found to upgrade.".into());
+        }
         println!("No nodes found.");
         return Ok(());
     }
@@ -2451,7 +2566,7 @@ fn run_node(
     let mut tw = TabWriter::new(io::stdout());
     writeln!(tw, "NODE\tSTATUS")?;
     let mut wait_failed = false;
-    let mut pending_jobs = Vec::new();
+    let mut pending_jobs = VecDeque::new();
 
     for node in &target_nodes {
         let name = node.name.as_deref().unwrap_or(&node.address);
@@ -2502,7 +2617,12 @@ fn run_node(
                     });
                     if let Some(job_id) = ur.job_id.as_ref() {
                         if wait && status.is_success() {
-                            pending_jobs.push((name, client.clone(), url, job_id.clone()));
+                            pending_jobs.push_back(PendingUpgrade {
+                                name,
+                                client,
+                                url,
+                                job_id: job_id.clone(),
+                            });
                         }
                     } else if wait && status.is_success() {
                         writeln!(tw, "{}\tDaemon did not return an upgrade job ID", name)?;
@@ -2535,24 +2655,8 @@ fn run_node(
 
     tw.flush()?;
 
-    for (name, client, url, job_id) in pending_jobs {
-        match wait_for_upgrade(&client, &url, &job_id, Duration::from_secs(1)) {
-            Ok(()) => writeln!(
-                tw,
-                "{name}\tUpgrade job {} succeeded",
-                sanitize_display(&job_id)
-            )?,
-            Err(err) => {
-                writeln!(
-                    tw,
-                    "{name}\tUpgrade job {}: {}",
-                    sanitize_display(&job_id),
-                    sanitize_display(&err.to_string())
-                )?;
-                wait_failed = true;
-            }
-        }
-        tw.flush()?;
+    if let Some(timeout) = wait_timeout {
+        wait_failed |= wait_for_upgrades(&mut tw, pending_jobs, timeout, Duration::from_secs(1))?;
     }
 
     clients.finish()?;
@@ -2562,36 +2666,96 @@ fn run_node(
     Ok(())
 }
 
-fn wait_for_upgrade(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    job_id: &str,
-    interval: Duration,
-) -> Result<(), Box<dyn Error>> {
-    let mut endpoint = reqwest::Url::parse(&format!("{url}{PATH_UPGRADE}"))?;
-    endpoint
-        .path_segments_mut()
-        .map_err(|_| "invalid upgrade job URL")?
-        .push(job_id);
-    loop {
-        let job: UpgradeJobResponse = client
-            .get(endpoint.clone())
+struct PendingUpgrade<'a> {
+    name: &'a str,
+    client: reqwest::blocking::Client,
+    url: String,
+    job_id: String,
+}
+
+impl PendingUpgrade<'_> {
+    fn poll(&self, timeout: Duration) -> Result<UpgradeJobResponse, Box<dyn Error>> {
+        let mut endpoint = reqwest::Url::parse(&format!("{}{PATH_UPGRADE}", self.url))?;
+        endpoint
+            .path_segments_mut()
+            .map_err(|_| "invalid upgrade job URL")?
+            .push(&self.job_id);
+        let job: UpgradeJobResponse = self
+            .client
+            .get(endpoint)
+            .timeout(timeout)
             .send()?
             .error_for_status()?
             .json()?;
-        if job.job_id != job_id {
+        if job.job_id != self.job_id {
             return Err("daemon returned a different upgrade job ID".into());
         }
-        match job.status {
-            UpgradeJobStatus::Running => std::thread::sleep(interval),
-            UpgradeJobStatus::Succeeded => return Ok(()),
-            UpgradeJobStatus::Failed => {
-                return Err(format!(
-                    "failed: {}",
-                    job.error.as_deref().unwrap_or("no error details provided")
-                )
-                .into());
+        Ok(job)
+    }
+
+    fn report(&self, output: &mut impl Write, status: &str) -> io::Result<()> {
+        writeln!(
+            output,
+            "{}\tUpgrade job {}: {status}",
+            self.name,
+            sanitize_display(&self.job_id)
+        )?;
+        output.flush()
+    }
+}
+
+fn wait_for_upgrades(
+    output: &mut impl Write,
+    mut pending: VecDeque<PendingUpgrade<'_>>,
+    timeout: Duration,
+    interval: Duration,
+) -> io::Result<bool> {
+    let started = Instant::now();
+    let request_timeout = get_default_timeout();
+    let mut unsuccessful = false;
+
+    'polling: while !pending.is_empty() {
+        for _ in 0..pending.len() {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break 'polling;
             }
+            let upgrade = pending.pop_front().unwrap();
+            let status = match upgrade.poll(remaining.min(request_timeout)) {
+                Ok(job) => match job.status {
+                    UpgradeJobStatus::Running => {
+                        pending.push_back(upgrade);
+                        continue;
+                    }
+                    UpgradeJobStatus::Succeeded => "succeeded".to_string(),
+                    UpgradeJobStatus::Failed => {
+                        unsuccessful = true;
+                        format!(
+                            "failed: {}",
+                            sanitize_display(
+                                job.error.as_deref().unwrap_or("no error details provided")
+                            )
+                        )
+                    }
+                },
+                Err(err) => {
+                    unsuccessful = true;
+                    if started.elapsed() >= timeout {
+                        pending.push_front(upgrade);
+                        break 'polling;
+                    }
+                    format!("unknown: {}", sanitize_display(&err.to_string()))
+                }
+            };
+            upgrade.report(output, &status)?;
+        }
+        if !pending.is_empty() {
+            std::thread::sleep(interval.min(timeout.saturating_sub(started.elapsed())));
         }
     }
+
+    for upgrade in &pending {
+        upgrade.report(output, "unknown (wait timeout exceeded)")?;
+    }
+    Ok(unsuccessful || !pending.is_empty())
 }

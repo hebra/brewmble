@@ -115,7 +115,13 @@ cd daemon && cargo build --release
 Without `--wait`, the CLI returns once the daemon accepts the upgrade. Use the
 job ID to check `running`, `succeeded`, or `failed` (with an error) via
 [`GET /packages/full-upgrade/{job_id}`](daemon/README.md#get-packagesfull-upgradejob_id).
-Dry runs do not create jobs and cannot be combined with `--wait`.
+With `--wait`, the CLI checks each unfinished job in turn. It polls for up to
+one hour after submitting upgrades, or for the duration set by
+`--wait-timeout` (for example, `--wait-timeout 30m` or `--wait-timeout 1800`).
+If time runs out, unfinished jobs are reported as unknown and the CLI exits
+nonzero; it does not cancel running upgrades. `--wait` also exits nonzero if
+there are no target nodes. Dry runs do not create jobs and cannot be combined
+with `--wait`.
 
 ## Security
 
