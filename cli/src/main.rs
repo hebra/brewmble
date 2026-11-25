@@ -202,6 +202,22 @@ fn print_learned_pin(node: &NodeConfig, fingerprint: &str, json: bool) {
     }
 }
 
+fn finish_status_discovery(
+    worker: Option<std::thread::JoinHandle<Result<(), String>>>,
+    config_path: &Path,
+    profile_name: &str,
+    learned_pins: Vec<(&NodeConfig, String)>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    save_learned_status_pins(config_path, profile_name, learned_pins, json)?;
+    if let Some(worker) = worker {
+        worker
+            .join()
+            .map_err(|_| "mDNS discovery worker panicked")??;
+    }
+    Ok(())
+}
+
 fn write_config_atomically(path: &Path, content: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -1151,6 +1167,41 @@ mod tests {
     }
 
     #[test]
+    fn status_persists_learned_pins_even_when_discovery_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "brewmble_discovery_failure_pins_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let mut config = Config::default();
+        let profile = config.profiles.get_mut("default").unwrap();
+        profile.nodes.push(NodeConfig {
+            name: None,
+            address: "explicit:4712".to_string(),
+            fingerprint: None,
+        });
+        save_config(&path, &config).unwrap();
+
+        let worker = std::thread::spawn(|| Err("mDNS discovery failed".to_string()));
+        let node = &config.profiles["default"].nodes[0];
+        let result = finish_status_discovery(
+            Some(worker),
+            &path,
+            "default",
+            vec![(node, "learned".to_string())],
+            true,
+        );
+        let saved = load_config(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(result.unwrap_err().to_string(), "mDNS discovery failed");
+        assert_eq!(
+            saved.profiles["default"].nodes[0].fingerprint.as_deref(),
+            Some("learned")
+        );
+    }
+
+    #[test]
     fn test_run_node_no_action_specified() {
         let err = NodeAction::from_flags(false, false, false, false)
             .err()
@@ -2060,13 +2111,8 @@ fn run_status(
     });
 
     pb.finish_and_clear();
-    if let Some(worker) = discovery_worker {
-        worker
-            .join()
-            .map_err(|_| "mDNS discovery worker panicked")??;
-    }
-
-    save_learned_status_pins(
+    finish_status_discovery(
+        discovery_worker,
         config_path,
         &active_profile_name,
         learned_pins.into_inner().unwrap(),
