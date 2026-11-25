@@ -2436,6 +2436,62 @@ impl RebootAction {
     }
 }
 
+fn collect_node_results<T: Send>(
+    nodes: &[NodeConfig],
+    request: impl Fn(&NodeConfig) -> T + Sync,
+) -> Vec<T> {
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = nodes
+            .iter()
+            .map(|node| {
+                let request = &request;
+                scope.spawn(move || request(node))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect()
+    })
+}
+
+fn request_node(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    reboot: Option<&RebootAction>,
+    dry_run: bool,
+) -> (String, String, Option<Vec<String>>) {
+    if let Some(action) = reboot {
+        match action.request(client, url).send() {
+            Ok(resp) => {
+                let status = resp.status().to_string();
+                let rr: RebootResponse = resp.json().unwrap_or_else(|_| RebootResponse {
+                    message: "Unknown response".to_string(),
+                });
+                (status, rr.message, None)
+            }
+            Err(err) => (format!("Error: {}", err), "".to_string(), None),
+        }
+    } else {
+        let upgrade_url = format!("{}{}", url, PATH_UPGRADE);
+        let request = client
+            .post(&upgrade_url)
+            .json(&brewmble_rest::UpgradeRequest { dry_run });
+
+        match request.send() {
+            Ok(resp) => {
+                let status = resp.status().to_string();
+                let ur: UpgradeResponse = resp.json().unwrap_or_else(|_| UpgradeResponse {
+                    message: "Unknown response".to_string(),
+                    updates: None,
+                });
+                (status, ur.message, ur.updates)
+            }
+            Err(err) => (format!("Error: {}", err), "".to_string(), None),
+        }
+    }
+}
+
 fn run_node(
     full_upgrade: bool,
     reboot: Option<RebootAction>,
@@ -2475,10 +2531,17 @@ fn run_node(
     let mut tw = TabWriter::new(io::stdout());
     writeln!(tw, "NODE\tSTATUS")?;
 
-    for node in &target_nodes {
+    let results = collect_node_results(&target_nodes, |node| {
+        let (client, outcome) = clients.connect(node).map_err(|err| err.to_string())?;
+        let url = resolve_url(&node.address);
+        let response = request_node(&client, &url, reboot.as_ref(), dry_run);
+        Ok::<_, String>((outcome, response))
+    });
+
+    for (node, result) in target_nodes.iter().zip(results) {
         let name = node.name.as_deref().unwrap_or(&node.address);
-        let (client, outcome) = match clients.connect(node) {
-            Ok(connection) => connection,
+        let (outcome, (status, body, updates)) = match result {
+            Ok(result) => result,
             Err(err) => {
                 writeln!(tw, "{}\tPin verification failed: {}", name, err)?;
                 continue;
@@ -2489,38 +2552,6 @@ fn run_node(
             update_node_fingerprint(config, &node.address, &fp);
             save_config(config_path, config)?;
         }
-        let url = resolve_url(&node.address);
-
-        let (status, body, updates) = if let Some(action) = &reboot {
-            match action.request(&client, &url).send() {
-                Ok(resp) => {
-                    let status = resp.status().to_string();
-                    let rr: RebootResponse = resp.json().unwrap_or_else(|_| RebootResponse {
-                        message: "Unknown response".to_string(),
-                    });
-                    (status, rr.message, None)
-                }
-                Err(err) => (format!("Error: {}", err), "".to_string(), None),
-            }
-        } else {
-            let upgrade_url = format!("{}{}", url, PATH_UPGRADE);
-            let request = client
-                .post(&upgrade_url)
-                .json(&brewmble_rest::UpgradeRequest { dry_run });
-
-            match request.send() {
-                Ok(resp) => {
-                    let status = resp.status().to_string();
-                    let ur: UpgradeResponse = resp.json().unwrap_or_else(|_| UpgradeResponse {
-                        message: "Unknown response".to_string(),
-                        updates: None,
-                    });
-                    (status, ur.message, ur.updates)
-                }
-                Err(err) => (format!("Error: {}", err), "".to_string(), None),
-            }
-        };
-
         writeln!(tw, "{}\t{}", name, status)?;
         if !body.is_empty() {
             writeln!(tw, "\t{}", body.replace('\n', "\n\t"))?;
