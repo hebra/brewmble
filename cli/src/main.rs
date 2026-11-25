@@ -932,10 +932,6 @@ mod tests {
         if let Some(Commands::Node {
             full_upgrade,
             reboot,
-            dry_run: _,
-            list: _,
-            repin: _,
-            nodes: _,
             ..
         }) = cli.command
         {
