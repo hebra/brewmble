@@ -20,6 +20,7 @@ This file provides guidance to agents when working with code in this repository.
 - BREWMBLE_NATIVE_PROGRESS env var controls native terminal progress bars (unset or 1 to enable, 0 to disable); enabled by default
 - Daemon caches 'apt-get update' and 'brew update' results based on their respective update intervals (default 360 mins configured via package_manager.update_interval_mins) - see get_updates()
 - Long-running package-manager subprocesses are wrapped in `tokio::task::spawn_blocking` and share an `Arc<dyn CommandRunner>` for testability
+- The 300 s `TimeoutLayer` returns 408 but cannot cancel running commands (`sudo apt-get` children can't be killed by the unprivileged daemon); apt update checks run as a spawned task shared by concurrent `/status` and dry-run requests (`Apt.in_flight`)
 - `brewmbled config validate` checks TLS file presence, certificate/key pair-match, expiry, and required ExtendedKeyUsage (ServerAuth)
 - CLI uses blocking HTTPS client (reqwest with blocking feature and rustls) while daemon uses async Axum framework over HTTPS
 - Rust edition: uses 2024 across all crates

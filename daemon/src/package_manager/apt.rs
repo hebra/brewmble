@@ -7,16 +7,25 @@ use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(any(target_os = "linux", test))]
 use std::time::{Duration, Instant};
+#[cfg(any(target_os = "linux", test))]
+use tokio::sync::watch;
 use tracing::{error, info, warn};
+
+#[cfg(any(target_os = "linux", test))]
+type UpdateCheckResult = Result<Vec<String>, String>;
 
 pub struct Apt {
     pub runner: Arc<dyn CommandRunner>,
     pub auto_clean: bool,
     pub auto_remove: bool,
     #[cfg(any(target_os = "linux", test))]
-    pub last_update: Mutex<Option<Instant>>,
+    pub last_update: Arc<Mutex<Option<Instant>>>,
     #[cfg(any(target_os = "linux", test))]
     pub cache_ttl: Duration,
+    /// The update check currently running, shared by every caller that
+    /// arrives before it finishes.
+    #[cfg(any(target_os = "linux", test))]
+    in_flight: Mutex<Option<watch::Receiver<Option<UpdateCheckResult>>>>,
 }
 
 impl Apt {
@@ -26,9 +35,25 @@ impl Apt {
             auto_clean,
             auto_remove,
             #[cfg(any(target_os = "linux", test))]
-            last_update: Mutex::new(None),
+            last_update: Arc::new(Mutex::new(None)),
             #[cfg(any(target_os = "linux", test))]
             cache_ttl: Duration::from_secs(update_interval_mins * 60),
+            #[cfg(any(target_os = "linux", test))]
+            in_flight: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_runner(
+        runner: Arc<dyn CommandRunner>,
+        auto_clean: bool,
+        auto_remove: bool,
+        cache_ttl: Duration,
+    ) -> Self {
+        Self {
+            runner,
+            cache_ttl,
+            ..Self::new(auto_clean, auto_remove, 0)
         }
     }
 
@@ -37,11 +62,92 @@ impl Apt {
         program: &'static str,
         args: &'static [&'static str],
     ) -> io::Result<Output> {
-        let runner = self.runner.clone();
-        tokio::task::spawn_blocking(move || runner.run(program, args))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        run_blocking(self.runner.clone(), program, args).await
     }
+}
+
+async fn run_blocking(
+    runner: Arc<dyn CommandRunner>,
+    program: &'static str,
+    args: &'static [&'static str],
+) -> io::Result<Output> {
+    tokio::task::spawn_blocking(move || runner.run(program, args))
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+}
+
+/// Refreshes the apt cache if its TTL has expired, then lists available
+/// upgrades. Runs as its own task so it finishes even if every request
+/// waiting on it is dropped (e.g. by the HTTP timeout); `sudo apt-get`
+/// can't be killed from the unprivileged daemon anyway.
+#[cfg(any(target_os = "linux", test))]
+async fn check_updates(
+    runner: Arc<dyn CommandRunner>,
+    last_update: Arc<Mutex<Option<Instant>>>,
+    cache_ttl: Duration,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let should_update = {
+        let last_update = last_update.lock().unwrap_or_else(|p| p.into_inner());
+        match *last_update {
+            Some(last) if cache_ttl.as_secs() > 0 => last.elapsed() >= cache_ttl,
+            _ => true,
+        }
+    };
+
+    if should_update {
+        info!("updating apt cache...");
+        let output = run_blocking(runner.clone(), "sudo", &["apt-get", "update"]).await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let err_msg = if stderr.contains("Permission denied") || stderr.contains("Are you root")
+            {
+                format!(
+                    "Permission denied when updating apt cache. Are you running as root? stderr: {}",
+                    stderr
+                )
+            } else {
+                format!(
+                    "Failed to update apt cache: {}. stderr: {}",
+                    output.status, stderr
+                )
+            };
+            error!("{}", err_msg);
+            return Err(err_msg.into());
+        }
+        // Update the last update time
+        let mut last_update = last_update.lock().unwrap_or_else(|p| p.into_inner());
+        *last_update = Some(Instant::now());
+    } else {
+        info!(
+            "apt cache is still valid (TTL: {} mins), skipping update",
+            cache_ttl.as_secs() / 60
+        );
+    }
+
+    info!("determining available updates...");
+    // Use simulated dist-upgrade to find which packages would be upgraded.
+    // This requires sudo because apt needs to lock the cache even for simulated upgrades
+    // if run as a non-root user.
+    let output = run_blocking(runner, "sudo", &["apt-get", "-s", "dist-upgrade"]).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let err_msg = format!(
+            "Failed to determine available updates: {}. stderr: {}",
+            output.status, stderr
+        );
+        error!("{}", err_msg);
+        return Err(err_msg.into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let updates: Vec<String> = stdout
+        .lines()
+        .filter(|line| line.starts_with("Inst "))
+        .filter_map(|line| line.split_whitespace().nth(1).map(|s| s.to_string()))
+        .collect();
+
+    info!("found {} available updates", updates.len());
+    Ok(updates)
 }
 
 impl Default for Apt {
@@ -88,71 +194,38 @@ impl PackageManager for Apt {
 
     #[cfg(any(target_os = "linux", test))]
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let should_update = {
-            let last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
-            match *last_update {
-                Some(last) if self.cache_ttl.as_secs() > 0 => last.elapsed() >= self.cache_ttl,
-                _ => true,
+        let mut rx = {
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            match in_flight.as_ref() {
+                Some(rx) if rx.borrow().is_none() && rx.has_changed().is_ok() => {
+                    info!("joining apt update check already in progress");
+                    rx.clone()
+                }
+                _ => {
+                    let (tx, rx) = watch::channel(None);
+                    let check = check_updates(
+                        self.runner.clone(),
+                        self.last_update.clone(),
+                        self.cache_ttl,
+                    );
+                    tokio::spawn(async move {
+                        let _ = tx.send(Some(check.await.map_err(|e| e.to_string())));
+                    });
+                    *in_flight = Some(rx.clone());
+                    rx
+                }
             }
         };
 
-        if should_update {
-            info!("updating apt cache...");
-            let output = self.run_async("sudo", &["apt-get", "update"]).await?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let err_msg = if stderr.contains("Permission denied")
-                    || stderr.contains("Are you root")
-                {
-                    format!(
-                        "Permission denied when updating apt cache. Are you running as root? stderr: {}",
-                        stderr
-                    )
-                } else {
-                    format!(
-                        "Failed to update apt cache: {}. stderr: {}",
-                        output.status, stderr
-                    )
-                };
-                error!("{}", err_msg);
-                return Err(err_msg.into());
-            }
-            // Update the last update time
-            let mut last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
-            *last_update = Some(Instant::now());
-        } else {
-            info!(
-                "apt cache is still valid (TTL: {} mins), skipping update",
-                self.cache_ttl.as_secs() / 60
-            );
+        let result = rx
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| "apt update check ended without a result")?;
+        match result.as_ref() {
+            Some(Ok(updates)) => Ok(updates.clone()),
+            Some(Err(e)) => Err(e.clone().into()),
+            None => unreachable!("wait_for only returns once a result is set"),
         }
-
-        info!("determining available updates...");
-        // Use simulated dist-upgrade to find which packages would be upgraded.
-        // This requires sudo because apt needs to lock the cache even for simulated upgrades
-        // if run as a non-root user.
-        let output = self
-            .run_async("sudo", &["apt-get", "-s", "dist-upgrade"])
-            .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let err_msg = format!(
-                "Failed to determine available updates: {}. stderr: {}",
-                output.status, stderr
-            );
-            error!("{}", err_msg);
-            return Err(err_msg.into());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let updates: Vec<String> = stdout
-            .lines()
-            .filter(|line| line.starts_with("Inst "))
-            .filter_map(|line| line.split_whitespace().nth(1).map(|s| s.to_string()))
-            .collect();
-
-        info!("found {} available updates", updates.len());
-        Ok(updates)
     }
 
     #[cfg(all(not(target_os = "linux"), not(test)))]
@@ -290,13 +363,12 @@ mod tests {
             stdout: "apt 2.0.2 (amd64)\n".to_string(),
             stderr: "".to_string(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(
+            Arc::new(runner),
+            false,
+            false,
+            Duration::from_secs(360 * 60),
+        );
         assert_eq!(apt.version(), "apt 2.0.2 (amd64)");
     }
 
@@ -307,13 +379,12 @@ mod tests {
             stdout: "".to_string(),
             stderr: "".to_string(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(
+            Arc::new(runner),
+            false,
+            false,
+            Duration::from_secs(360 * 60),
+        );
         assert!(apt.is_available());
     }
 
@@ -324,13 +395,12 @@ mod tests {
             stdout: "".to_string(),
             stderr: "".to_string(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(
+            Arc::new(runner),
+            false,
+            false,
+            Duration::from_secs(360 * 60),
+        );
         let result = apt.dry_run_upgrade().await;
         assert!(result.is_ok());
     }
@@ -342,13 +412,12 @@ mod tests {
             stdout: "".to_string(),
             stderr: "".to_string(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(
+            Arc::new(runner),
+            false,
+            false,
+            Duration::from_secs(360 * 60),
+        );
         assert!(apt.full_upgrade().await.is_ok());
     }
 
@@ -359,13 +428,12 @@ mod tests {
             stdout: "".to_string(),
             stderr: "dpkg error".to_string(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(
+            Arc::new(runner),
+            false,
+            false,
+            Duration::from_secs(360 * 60),
+        );
         let result = apt.full_upgrade().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("dpkg error"));
@@ -379,13 +447,12 @@ mod tests {
             stdout: "Inst pkg1 (1.0)\nInst pkg2 (2.0)\n".to_string(),
             stderr: "".to_string(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(
+            Arc::new(runner),
+            false,
+            false,
+            Duration::from_secs(360 * 60),
+        );
         let result = apt.get_updates().await;
         assert!(result.is_ok());
         let updates = result.unwrap();
@@ -404,13 +471,12 @@ mod tests {
                 "E: Could not open lock file /var/lib/apt/lists/lock - open (13: Permission denied)"
                     .to_string(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(
+            Arc::new(runner),
+            false,
+            false,
+            Duration::from_secs(360 * 60),
+        );
         let result = apt.get_updates().await;
         assert!(result.is_err());
         assert!(
@@ -429,13 +495,12 @@ mod tests {
             stdout: "".to_string(),
             stderr: "network error".to_string(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(
+            Arc::new(runner),
+            false,
+            false,
+            Duration::from_secs(360 * 60),
+        );
         let result = apt.get_updates().await;
         assert!(result.is_err());
         assert!(
@@ -469,13 +534,7 @@ mod tests {
         let runner = TrackingRunner {
             calls: calls.clone(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(60), // 1 minute
-        };
+        let apt = Apt::with_runner(Arc::new(runner), false, false, Duration::from_secs(60));
 
         // First call - should run update
         let _ = apt.get_updates().await.unwrap();
@@ -499,13 +558,7 @@ mod tests {
         let runner2 = TrackingRunner {
             calls: calls.clone(),
         };
-        let apt2 = Apt {
-            runner: Arc::new(runner2),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(0),
-        };
+        let apt2 = Apt::with_runner(Arc::new(runner2), false, false, Duration::from_secs(0));
         calls.lock().unwrap().clear();
         let _ = apt2.get_updates().await.unwrap();
         {
@@ -550,13 +603,7 @@ mod tests {
         let runner = TrackingRunner {
             calls: calls.clone(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: true,
-            auto_remove: true,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(Arc::new(runner), true, true, Duration::from_secs(360 * 60));
 
         assert!(apt.full_upgrade().await.is_ok());
 
@@ -589,13 +636,12 @@ mod tests {
         let runner = TrackingRunner {
             calls: calls.clone(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: false,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(
+            Arc::new(runner),
+            false,
+            false,
+            Duration::from_secs(360 * 60),
+        );
 
         assert!(apt.full_upgrade().await.is_ok());
 
@@ -636,13 +682,7 @@ mod tests {
         let runner = FailingCleanupRunner {
             calls: calls.clone(),
         };
-        let apt = Apt {
-            runner: Arc::new(runner),
-            auto_clean: true,
-            auto_remove: false,
-            last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(360 * 60),
-        };
+        let apt = Apt::with_runner(Arc::new(runner), true, false, Duration::from_secs(360 * 60));
 
         assert!(apt.full_upgrade().await.is_ok());
 
@@ -665,6 +705,158 @@ mod tests {
             !FULL_UPGRADE_SUDO_ARGS
                 .iter()
                 .any(|a| a.contains("DEBIAN_FRONTEND"))
+        );
+    }
+
+    /// Records calls and blocks every command until the gate opens.
+    struct GatedRunner {
+        calls: Arc<Mutex<Vec<String>>>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        update_succeeds: bool,
+    }
+
+    impl GatedRunner {
+        fn new(update_succeeds: bool) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                gate: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+                update_succeeds,
+            }
+        }
+
+        fn open(gate: &(Mutex<bool>, std::sync::Condvar)) {
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+        }
+    }
+
+    impl CommandRunner for GatedRunner {
+        fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", program, args.join(" ")));
+            let (open, cvar) = &*self.gate;
+            let _open = cvar
+                .wait_while(open.lock().unwrap(), |open| !*open)
+                .unwrap();
+            let ok = self.update_succeeds || !args.contains(&"update");
+            Ok(Output {
+                status: ExitStatus::from_raw(if ok { 0 } else { 1 << 8 }),
+                stdout: b"Inst pkg1 [0.9] (1.0)\n".to_vec(),
+                stderr: b"".to_vec(),
+            })
+        }
+    }
+
+    async fn wait_for_calls(calls: &Mutex<Vec<String>>, n: usize) {
+        while calls.lock().unwrap().len() < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_apt_concurrent_get_updates_share_one_check() {
+        let runner = GatedRunner::new(true);
+        let calls = runner.calls.clone();
+        let gate = runner.gate.clone();
+        let apt = Apt::with_runner(Arc::new(runner), false, false, Duration::from_secs(60));
+
+        let (status, dry_run, ()) = tokio::join!(apt.get_updates(), apt.dry_run_upgrade(), async {
+            wait_for_calls(&calls, 1).await;
+            GatedRunner::open(&gate);
+        });
+
+        assert_eq!(status.unwrap(), vec!["pkg1"]);
+        assert_eq!(dry_run.unwrap(), vec!["pkg1"]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["sudo apt-get update", "sudo apt-get -s dist-upgrade"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_apt_timed_out_check_keeps_running_and_is_joined() {
+        let runner = GatedRunner::new(true);
+        let calls = runner.calls.clone();
+        let gate = runner.gate.clone();
+        let apt = Apt::with_runner(Arc::new(runner), false, false, Duration::from_secs(60));
+
+        // Simulates the HTTP TimeoutLayer dropping the request future.
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), apt.get_updates()).await;
+        assert!(timed_out.is_err());
+
+        let (retry, ()) = tokio::join!(apt.get_updates(), async {
+            wait_for_calls(&calls, 1).await;
+            GatedRunner::open(&gate);
+        });
+
+        assert_eq!(retry.unwrap(), vec!["pkg1"]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["sudo apt-get update", "sudo apt-get -s dist-upgrade"]
+        );
+        assert!(apt.last_update.lock().unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_apt_abandoned_check_still_records_successful_update() {
+        let runner = GatedRunner::new(true);
+        let calls = runner.calls.clone();
+        let gate = runner.gate.clone();
+        let apt = Apt::with_runner(Arc::new(runner), false, false, Duration::from_secs(60));
+
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), apt.get_updates()).await;
+        assert!(timed_out.is_err());
+        GatedRunner::open(&gate);
+        wait_for_calls(&calls, 2).await;
+        while apt
+            .in_flight
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(apt.last_update.lock().unwrap().is_some());
+
+        // The next request starts a fresh check but reuses the cached update.
+        calls.lock().unwrap().clear();
+        assert_eq!(apt.get_updates().await.unwrap(), vec!["pkg1"]);
+        assert_eq!(*calls.lock().unwrap(), vec!["sudo apt-get -s dist-upgrade"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_apt_failed_update_shares_error_and_leaves_cache_stale() {
+        let runner = GatedRunner::new(false);
+        let calls = runner.calls.clone();
+        let gate = runner.gate.clone();
+        let apt = Apt::with_runner(Arc::new(runner), false, false, Duration::from_secs(60));
+
+        let (first, second, ()) = tokio::join!(apt.get_updates(), apt.get_updates(), async {
+            wait_for_calls(&calls, 1).await;
+            GatedRunner::open(&gate);
+        });
+
+        for result in [first, second] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Failed to update apt cache")
+            );
+        }
+        assert_eq!(*calls.lock().unwrap(), vec!["sudo apt-get update"]);
+        assert!(apt.last_update.lock().unwrap().is_none());
+
+        // A failed check isn't reused; the next request retries the update.
+        assert!(apt.get_updates().await.is_err());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["sudo apt-get update", "sudo apt-get update"]
         );
     }
 }
