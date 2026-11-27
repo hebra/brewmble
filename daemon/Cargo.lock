@@ -276,6 +276,7 @@ dependencies = [
  "brewmble-rest",
  "clap",
  "gethostname",
+ "libc",
  "mdns-sd",
  "rcgen",
  "reqwest",
