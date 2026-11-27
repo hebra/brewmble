@@ -47,7 +47,14 @@ impl LegacyStore for PlatformLegacyStore {
 #[cfg(target_os = "macos")]
 fn read_legacy(account: &str) -> Result<Option<String>, Box<dyn Error>> {
     let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", KEYRING_SERVICE, "-a", account, "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            KEYRING_SERVICE,
+            "-a",
+            account,
+            "-w",
+        ])
         .output()?;
     if !output.status.success() {
         return Ok(None);
@@ -70,13 +77,22 @@ fn read_legacy(account: &str) -> Result<Option<String>, Box<dyn Error>> {
 
 #[cfg(target_os = "macos")]
 fn is_hex_encoding(s: &str) -> bool {
-    !s.is_empty() && s.len().is_multiple_of(2) && s.len() >= 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    !s.is_empty()
+        && s.len().is_multiple_of(2)
+        && s.len() >= 40
+        && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(target_os = "macos")]
 fn delete_legacy(account: &str) -> Result<(), Box<dyn Error>> {
     std::process::Command::new("security")
-        .args(["delete-generic-password", "-s", KEYRING_SERVICE, "-a", account])
+        .args([
+            "delete-generic-password",
+            "-s",
+            KEYRING_SERVICE,
+            "-a",
+            account,
+        ])
         .output()?;
     Ok(())
 }
@@ -102,6 +118,7 @@ pub(crate) const CREDENTIAL_ACCOUNTS: [&str; 4] = [
 pub enum MigrationStatus {
     AlreadyPresent,
     Migrated,
+    MigratedLegacyRetained(String),
     NotFound,
     Conflict,
     Failed(String),
@@ -112,6 +129,9 @@ impl std::fmt::Display for MigrationStatus {
         match self {
             MigrationStatus::AlreadyPresent => write!(f, "already present"),
             MigrationStatus::Migrated => write!(f, "migrated"),
+            MigrationStatus::MigratedLegacyRetained(e) => {
+                write!(f, "migrated (warning: legacy entry not deleted: {e})")
+            }
             MigrationStatus::NotFound => write!(f, "not found in legacy store"),
             MigrationStatus::Conflict => write!(f, "conflict (different value in new store)"),
             MigrationStatus::Failed(e) => write!(f, "failed: {e}"),
@@ -138,7 +158,9 @@ impl MigrationReport {
             .all(|e| {
                 matches!(
                     e.status,
-                    MigrationStatus::AlreadyPresent | MigrationStatus::Migrated
+                    MigrationStatus::AlreadyPresent
+                        | MigrationStatus::Migrated
+                        | MigrationStatus::MigratedLegacyRetained(_)
                 )
             })
     }
@@ -183,12 +205,12 @@ fn migrate_account(
             if dry_run {
                 return MigrationStatus::Migrated;
             }
-            if let Err(e) = legacy.delete(account) {
-                return MigrationStatus::Failed(format!("legacy delete: {e}"));
+            if let Err(e) = store.set(account, &value) {
+                return MigrationStatus::Failed(e.to_string());
             }
-            match store.set(account, &value) {
+            match legacy.delete(account) {
                 Ok(()) => MigrationStatus::Migrated,
-                Err(e) => MigrationStatus::Failed(e.to_string()),
+                Err(e) => MigrationStatus::MigratedLegacyRetained(e.to_string()),
             }
         }
     }
@@ -607,6 +629,84 @@ mod tests {
         assert!(report.ca_ready());
         for entry in &report.entries {
             assert_eq!(entry.status, MigrationStatus::Migrated);
+        }
+        for account in CREDENTIAL_ACCOUNTS {
+            assert_eq!(
+                store.get(account).unwrap(),
+                Some(format!("value-{account}"))
+            );
+            assert_eq!(legacy.read(account).unwrap(), None);
+        }
+    }
+
+    struct FailingSetStore;
+
+    impl CredentialStore for FailingSetStore {
+        fn get(&self, _account: &str) -> Result<Option<String>, Box<dyn Error>> {
+            Ok(None)
+        }
+        fn set(&self, _account: &str, _value: &str) -> Result<(), Box<dyn Error>> {
+            Err("keyring unavailable".into())
+        }
+        fn delete(&self, _account: &str) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_migrate_set_failure_keeps_legacy_value() {
+        let legacy = MemoryLegacyStore::default();
+        for account in CREDENTIAL_ACCOUNTS {
+            legacy.insert(account, &format!("value-{account}"));
+        }
+        let report = migrate_ca_with_stores(&FailingSetStore, &legacy, false).unwrap();
+        assert!(!report.ca_ready());
+        for entry in &report.entries {
+            assert_eq!(
+                entry.status,
+                MigrationStatus::Failed("keyring unavailable".to_string())
+            );
+        }
+        for account in CREDENTIAL_ACCOUNTS {
+            assert_eq!(
+                legacy.read(account).unwrap(),
+                Some(format!("value-{account}"))
+            );
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct UndeletableLegacyStore {
+        inner: MemoryLegacyStore,
+    }
+
+    impl LegacyStore for UndeletableLegacyStore {
+        fn read(&self, account: &str) -> Result<Option<String>, Box<dyn Error>> {
+            self.inner.read(account)
+        }
+        fn delete(&self, _account: &str) -> Result<(), Box<dyn Error>> {
+            Err("access denied".into())
+        }
+    }
+
+    #[test]
+    fn test_migrate_delete_failure_reports_migrated_with_warning() {
+        let store = MemoryStore::default();
+        let legacy = UndeletableLegacyStore::default();
+        for account in CREDENTIAL_ACCOUNTS {
+            legacy.inner.insert(account, &format!("value-{account}"));
+        }
+        let report = migrate_ca_with_stores(&store, &legacy, false).unwrap();
+        assert!(report.ca_ready());
+        for entry in &report.entries {
+            assert_eq!(
+                entry.status,
+                MigrationStatus::MigratedLegacyRetained("access denied".to_string())
+            );
+            assert_eq!(
+                entry.status.to_string(),
+                "migrated (warning: legacy entry not deleted: access denied)"
+            );
         }
         for account in CREDENTIAL_ACCOUNTS {
             assert_eq!(
