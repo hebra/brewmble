@@ -261,14 +261,14 @@ dependencies = [
 
 [[package]]
 name = "brewmble-rest"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "brewmbled"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "axum",
