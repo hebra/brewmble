@@ -60,6 +60,14 @@ fn read_legacy(account: &str) -> Result<Option<String>, Box<dyn Error>> {
         return Ok(None);
     }
     let raw = String::from_utf8(output.stdout)?;
+    Ok(Some(decode_legacy_value(&raw)))
+}
+
+/// `security -w` prints a password as hex when it contains non-printable bytes,
+/// such as the newlines in PEM. Every legacy brewmble value is PEM, so the hex is
+/// decoded only when it yields PEM; any other value is returned as stored.
+#[cfg(any(target_os = "macos", test))]
+fn decode_legacy_value(raw: &str) -> String {
     let trimmed = raw.trim();
     if is_hex_encoding(trimmed) {
         let bytes: Result<Vec<u8>, _> = (0..trimmed.len())
@@ -68,14 +76,15 @@ fn read_legacy(account: &str) -> Result<Option<String>, Box<dyn Error>> {
             .collect();
         if let Ok(bytes) = bytes
             && let Ok(text) = String::from_utf8(bytes)
+            && text.starts_with("-----BEGIN ")
         {
-            return Ok(Some(text));
+            return text;
         }
     }
-    Ok(Some(trimmed.to_string()))
+    trimmed.to_string()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn is_hex_encoding(s: &str) -> bool {
     !s.is_empty()
         && s.len().is_multiple_of(2)
@@ -771,5 +780,33 @@ mod tests {
             .unwrap();
         assert_eq!(entry.status, MigrationStatus::Migrated);
         assert!(store.get(ACCOUNT_CA_CERT).unwrap().is_none());
+    }
+
+    fn to_hex(s: &str) -> String {
+        s.bytes().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn test_decode_legacy_value_decodes_hex_pem() {
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        assert_eq!(decode_legacy_value(&format!("{}\n", to_hex(pem))), pem);
+        assert_eq!(decode_legacy_value(&to_hex(pem).to_ascii_uppercase()), pem);
+    }
+
+    #[test]
+    fn test_decode_legacy_value_keeps_hex_looking_non_pem() {
+        let value = to_hex("a".repeat(20).as_str());
+        assert!(is_hex_encoding(&value));
+        assert_eq!(decode_legacy_value(&value), value);
+
+        let digest = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(decode_legacy_value(digest), digest);
+    }
+
+    #[test]
+    fn test_decode_legacy_value_returns_plain_values_trimmed() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIGH\n-----END PRIVATE KEY-----";
+        assert_eq!(decode_legacy_value(&format!("{pem}\n")), pem);
+        assert_eq!(decode_legacy_value("abc"), "abc");
     }
 }
