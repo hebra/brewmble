@@ -489,6 +489,39 @@ async fn full_upgrade_handler(
         );
     }
 
+    {
+        // Hold the reboot state while claiming the upgrade lock, so a pending reboot
+        // always wins against an upgrade that arrives as its delay expires. A dry-run
+        // passes the same checks but does not claim the lock.
+        let reboot = lock_reboot(&state.reboot);
+        if *reboot != RebootState::Idle {
+            return (
+                StatusCode::LOCKED,
+                Json(UpgradeResponse {
+                    message: "a reboot is scheduled; cancel it before upgrading".to_string(),
+                    updates: None,
+                }),
+            );
+        }
+        let upgrade_running = if payload.dry_run {
+            state.is_upgrading.load(Ordering::SeqCst)
+        } else {
+            state
+                .is_upgrading
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        };
+        if upgrade_running {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(UpgradeResponse {
+                    message: "a full upgrade is currently running".to_string(),
+                    updates: None,
+                }),
+            );
+        }
+    }
+
     if payload.dry_run {
         match state.package_manager.dry_run_upgrade().await {
             Ok(updates) => {
@@ -509,34 +542,6 @@ async fn full_upgrade_handler(
                     }),
                 );
             }
-        }
-    }
-
-    {
-        // Hold the reboot state while claiming the upgrade lock, so a pending reboot
-        // always wins against an upgrade that arrives as its delay expires.
-        let reboot = lock_reboot(&state.reboot);
-        if *reboot != RebootState::Idle {
-            return (
-                StatusCode::LOCKED,
-                Json(UpgradeResponse {
-                    message: "a reboot is scheduled; cancel it before upgrading".to_string(),
-                    updates: None,
-                }),
-            );
-        }
-        if state
-            .is_upgrading
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return (
-                StatusCode::PRECONDITION_FAILED,
-                Json(UpgradeResponse {
-                    message: "a full upgrade is currently running".to_string(),
-                    updates: None,
-                }),
-            );
         }
     }
 
@@ -1646,6 +1651,36 @@ mod tests {
         .await;
         assert_eq!(runner.calls().len(), 1);
         assert_eq!(*state.reboot.lock().unwrap(), RebootState::Rebooting);
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_respects_upgrade_and_reboot_locks() {
+        let dry_run = r#"{"dry_run":true}"#;
+
+        let state = reboot_test_state(true);
+        let app = reboot_app(state.clone());
+        assert_eq!(
+            send(&app, "POST", PATH_UPGRADE, dry_run).await,
+            StatusCode::OK
+        );
+        assert!(!state.is_upgrading.load(Ordering::SeqCst));
+
+        state.is_upgrading.store(true, Ordering::SeqCst);
+        assert_eq!(
+            send(&app, "POST", PATH_UPGRADE, dry_run).await,
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert!(state.is_upgrading.load(Ordering::SeqCst));
+        state.is_upgrading.store(false, Ordering::SeqCst);
+
+        for reboot in [RebootState::Pending(7), RebootState::Rebooting] {
+            *state.reboot.lock().unwrap() = reboot;
+            assert_eq!(
+                send(&app, "POST", PATH_UPGRADE, dry_run).await,
+                StatusCode::LOCKED
+            );
+            assert!(!state.is_upgrading.load(Ordering::SeqCst));
+        }
     }
 
     #[tokio::test]
