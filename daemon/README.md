@@ -259,6 +259,14 @@ The `brewmbled` daemon runs as the `brewmble` user but needs to perform package 
    release that used `apt full-upgrade` must update this rule before triggering
    their next upgrade.
 
+   The daemon does not set `DEBIAN_FRONTEND=noninteractive`: sudo's `env_reset`
+   would drop it, and allowing it through a `/usr/bin/env DEBIAN_FRONTEND=...`
+   sudoers entry is unsafe because sudo matches the joined argument string, so
+   the daemon user could make `env` run another program as root. It is not
+   needed: `apt-get` runs without a terminal and with stdin closed, so debconf
+   falls back to its text frontend, reads end-of-input and uses each question's
+   default. Do not add `SETENV` or `env_keep` for it.
+
 3. **Set correct permissions**:
    The file must be owned by `root:root` and have strict permissions:
    ```bash
