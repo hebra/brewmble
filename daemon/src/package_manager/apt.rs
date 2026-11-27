@@ -89,69 +89,7 @@ impl PackageManager for Apt {
 
     #[cfg(any(target_os = "linux", test))]
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let should_update = {
-            let last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
-            match *last_update {
-                Some(last) if self.cache_ttl.as_secs() > 0 => last.elapsed() >= self.cache_ttl,
-                _ => true,
-            }
-        };
-
-        if should_update {
-            info!("updating apt cache...");
-            let output = self.run_async("sudo", &["apt-get", "update"]).await?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let err_msg = if stderr.contains("Permission denied")
-                    || stderr.contains("Are you root")
-                {
-                    format!(
-                        "Permission denied when updating apt cache. Are you running as root? stderr: {}",
-                        stderr
-                    )
-                } else {
-                    format!(
-                        "Failed to update apt cache: {}. stderr: {}",
-                        output.status, stderr
-                    )
-                };
-                error!("{}", err_msg);
-                return Err(err_msg.into());
-            }
-            // Update the last update time
-            let mut last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
-            *last_update = Some(Instant::now());
-        } else {
-            info!(
-                "apt cache is still valid (TTL: {} mins), skipping update",
-                self.cache_ttl.as_secs() / 60
-            );
-        }
-
-        info!("determining available updates...");
-        // Use simulated dist-upgrade to find which packages would be upgraded.
-        // This requires sudo because apt needs to lock the cache even for simulated upgrades
-        // if run as a non-root user.
-        let output = self
-            .run_async("sudo", &["apt-get", "-s", "dist-upgrade"])
-            .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let err_msg = format!(
-                "Failed to determine available updates: {}. stderr: {}",
-                output.status, stderr
-            );
-            error!("{}", err_msg);
-            return Err(err_msg.into());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let updates: Vec<String> = stdout
-            .lines()
-            .filter(|line| line.starts_with("Inst "))
-            .filter_map(|line| line.split_whitespace().nth(1).map(|s| s.to_string()))
-            .collect();
-
+        let updates = parse_simulated_upgrades(&self.simulate_dist_upgrade().await?);
         info!("found {} available updates", updates.len());
         Ok(updates)
     }
@@ -165,7 +103,9 @@ impl PackageManager for Apt {
     async fn dry_run_upgrade(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        self.get_updates().await
+        Ok(parse_simulated_installs(
+            &self.simulate_dist_upgrade().await?,
+        ))
     }
 
     #[cfg(all(not(target_os = "linux"), not(test)))]
@@ -254,6 +194,69 @@ impl PackageManager for Apt {
 }
 
 impl Apt {
+    #[cfg(any(target_os = "linux", test))]
+    async fn simulate_dist_upgrade(
+        &self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let should_update = {
+            let last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
+            match *last_update {
+                Some(last) if self.cache_ttl.as_secs() > 0 => last.elapsed() >= self.cache_ttl,
+                _ => true,
+            }
+        };
+
+        if should_update {
+            info!("updating apt cache...");
+            let output = self.run_async("sudo", &["apt-get", "update"]).await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let err_msg = if stderr.contains("Permission denied")
+                    || stderr.contains("Are you root")
+                {
+                    format!(
+                        "Permission denied when updating apt cache. Are you running as root? stderr: {}",
+                        stderr
+                    )
+                } else {
+                    format!(
+                        "Failed to update apt cache: {}. stderr: {}",
+                        output.status, stderr
+                    )
+                };
+                error!("{}", err_msg);
+                return Err(err_msg.into());
+            }
+            // Update the last update time
+            let mut last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
+            *last_update = Some(Instant::now());
+        } else {
+            info!(
+                "apt cache is still valid (TTL: {} mins), skipping update",
+                self.cache_ttl.as_secs() / 60
+            );
+        }
+
+        info!("determining available updates...");
+        // Use simulated dist-upgrade to find which packages would be upgraded.
+        // This requires sudo because apt needs to lock the cache even for simulated upgrades
+        // if run as a non-root user.
+        let output = self
+            .run_async("sudo", &["apt-get", "-s", "dist-upgrade"])
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let err_msg = format!(
+                "Failed to determine available updates: {}. stderr: {}",
+                output.status, stderr
+            );
+            error!("{}", err_msg);
+            return Err(err_msg.into());
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn run_cleanup(&self) {
         if self.auto_clean {
             if let Err(e) = self.auto_clean() {
@@ -266,6 +269,37 @@ impl Apt {
             }
         }
     }
+}
+
+/// Package names upgraded by `apt-get -s dist-upgrade`. Upgrades are printed as
+/// `Inst pkg [installed] (candidate ...)`; new installs lack the `[installed]`
+/// field and are skipped.
+#[cfg(any(target_os = "linux", test))]
+fn parse_simulated_upgrades(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            if fields.next() != Some("Inst") {
+                return None;
+            }
+            let name = fields.next()?;
+            fields
+                .next()
+                .filter(|installed| installed.starts_with('['))
+                .map(|_| name.to_string())
+        })
+        .collect()
+}
+
+/// Every package `apt-get -s dist-upgrade` would install, including new ones.
+#[cfg(any(target_os = "linux", test))]
+fn parse_simulated_installs(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("Inst "))
+        .filter_map(|rest| rest.split_whitespace().next().map(str::to_string))
+        .collect()
 }
 
 #[cfg(test)]
@@ -390,7 +424,7 @@ mod tests {
     async fn test_apt_get_updates_success() {
         let runner = MockRunner {
             success: true,
-            stdout: "Inst pkg1 (1.0)\nInst pkg2 (2.0)\n".to_string(),
+            stdout: "Inst pkg1 [0.9] (1.0 Debian:12/stable [amd64])\nInst pkg2 [1.9] (2.0 Debian:12/stable [amd64])\n".to_string(),
             stderr: "".to_string(),
         };
         let apt = Apt {
@@ -473,7 +507,7 @@ mod tests {
                 calls.push(format!("{} {}", program, args.join(" ")));
                 Ok(Output {
                     status: ExitStatus::from_raw(0),
-                    stdout: b"Inst pkg1 (1.0)\n".to_vec(),
+                    stdout: b"Inst pkg1 [0.9] (1.0 Debian:12/stable [amd64])\n".to_vec(),
                     stderr: b"".to_vec(),
                 })
             }
@@ -526,6 +560,51 @@ mod tests {
             let c = calls.lock().unwrap();
             assert!(c.iter().any(|s| s.contains("apt-get update")));
         }
+    }
+
+    #[test]
+    fn test_parse_simulated_upgrades_skips_new_installs() {
+        let stdout = "\
+NOTE: This is only a simulation!
+Reading package lists...
+The following NEW packages will be installed:
+  linux-image-6.1.0-18-amd64
+The following packages will be upgraded:
+  libssl3 openssl
+2 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.
+Inst linux-image-6.1.0-18-amd64 (6.1.76-1 Debian-Security:12/stable-security [amd64])
+Inst libssl3 [3.0.11-1~deb12u1] (3.0.11-1~deb12u2 Debian-Security:12/stable-security [amd64])
+Inst openssl [3.0.11-1~deb12u1] (3.0.11-1~deb12u2 Debian-Security:12/stable-security [amd64]) []
+Conf linux-image-6.1.0-18-amd64 (6.1.76-1 Debian-Security:12/stable-security [amd64])
+Conf libssl3 (3.0.11-1~deb12u2 Debian-Security:12/stable-security [amd64])
+Remv oldpkg [1.0]
+Inst
+";
+        assert_eq!(parse_simulated_upgrades(stdout), vec!["libssl3", "openssl"]);
+        assert_eq!(
+            parse_simulated_installs(stdout),
+            vec!["linux-image-6.1.0-18-amd64", "libssl3", "openssl"]
+        );
+        assert!(parse_simulated_upgrades("").is_empty());
+        assert!(parse_simulated_installs("").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_apt_status_excludes_new_installs_but_dry_run_lists_them() {
+        let runner = MockRunner {
+            success: true,
+            stdout: "Inst newpkg (1.0 Debian:12/stable [amd64])\nInst pkg1 [0.9] (1.0 Debian:12/stable [amd64])\n".to_string(),
+            stderr: "".to_string(),
+        };
+        let apt = Apt {
+            runner: Arc::new(runner),
+            auto_clean: false,
+            auto_remove: false,
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
+        };
+        assert_eq!(apt.get_updates().await.unwrap(), vec!["pkg1"]);
+        assert_eq!(apt.dry_run_upgrade().await.unwrap(), vec!["newpkg", "pkg1"]);
     }
 
     #[test]
