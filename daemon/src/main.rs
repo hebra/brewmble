@@ -205,6 +205,7 @@ struct AppState {
     upgrade_handle: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
     reboot: Arc<std::sync::Mutex<RebootState>>,
     updates: UpdateCache,
+    reboot_commands: &'static [RebootCommand],
 }
 
 /// Longest delay a client may request before a scheduled reboot.
@@ -360,6 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
         updates,
+        reboot_commands: reboot_commands(),
     };
     let shutdown_state = state.clone();
 
@@ -626,6 +628,7 @@ async fn run_scheduled_reboot<R: RebootRunner + Send + Sync>(
     reboot: Arc<std::sync::Mutex<RebootState>>,
     is_upgrading: Arc<AtomicBool>,
     runner: &R,
+    commands: &[RebootCommand],
 ) {
     if delay_secs > 0 {
         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
@@ -643,36 +646,50 @@ async fn run_scheduled_reboot<R: RebootRunner + Send + Sync>(
         }
         *current = RebootState::Rebooting;
     }
-    if !execute_reboot(runner).await {
+    if !execute_reboot(runner, commands).await {
         *lock_reboot(&reboot) = RebootState::Idle;
     }
 }
 
-/// Returns whether a reboot command succeeded.
-async fn execute_reboot<R: RebootRunner + Send + Sync>(runner: &R) -> bool {
-    match runner
-        .run("/usr/bin/sudo", &["-n", "/usr/bin/systemctl", "reboot"])
-        .await
-    {
-        Ok(status) if status.success() => {
-            info!("system reboot initiated via systemctl");
-            return true;
-        }
-        Ok(status) => error!("systemctl reboot failed: exit status {status}"),
-        Err(e) => error!("failed to execute systemctl reboot command: {e}"),
-    }
+/// A reboot command: program and arguments, run as given (sudoers rules match them exactly).
+type RebootCommand = (&'static str, &'static [&'static str]);
 
-    match runner
-        .run("/usr/bin/sudo", &["-n", "/usr/sbin/reboot"])
-        .await
-    {
-        Ok(status) if status.success() => {
-            info!("system reboot initiated via fallback");
-            return true;
-        }
-        Ok(status) => error!("failed to initiate reboot: fallback exit status {status}"),
-        Err(e) => error!("failed to execute fallback reboot command: {e}"),
+const LINUX_REBOOT_COMMANDS: &[RebootCommand] = &[
+    ("/usr/bin/sudo", &["-n", "/usr/bin/systemctl", "reboot"]),
+    ("/usr/bin/sudo", &["-n", "/usr/sbin/reboot"]),
+];
+
+const MACOS_REBOOT_COMMANDS: &[RebootCommand] =
+    &[("/usr/bin/sudo", &["-n", "/sbin/shutdown", "-r", "now"])];
+
+/// Reboot commands for this platform, tried in order. Empty where reboot is unsupported.
+fn reboot_commands() -> &'static [RebootCommand] {
+    if cfg!(target_os = "linux") {
+        LINUX_REBOOT_COMMANDS
+    } else if cfg!(target_os = "macos") {
+        MACOS_REBOOT_COMMANDS
+    } else {
+        &[]
     }
+}
+
+/// Tries each reboot command in turn and returns whether one succeeded.
+async fn execute_reboot<R: RebootRunner + Send + Sync>(
+    runner: &R,
+    commands: &[RebootCommand],
+) -> bool {
+    for (program, args) in commands {
+        let command = args.join(" ");
+        match runner.run(program, args).await {
+            Ok(status) if status.success() => {
+                info!("system reboot initiated via `{command}`");
+                return true;
+            }
+            Ok(status) => error!("`{command}` failed: exit status {status}"),
+            Err(e) => error!("failed to execute `{command}`: {e}"),
+        }
+    }
+    error!("failed to initiate reboot");
     false
 }
 
@@ -680,14 +697,11 @@ async fn reboot_handler(
     State(state): State<AppState>,
     Json(payload): Json<RebootRequest>,
 ) -> impl IntoResponse {
-    if !state.pm_available {
+    if state.reboot_commands.is_empty() {
         return (
-            StatusCode::PRECONDITION_FAILED,
+            StatusCode::NOT_IMPLEMENTED,
             Json(RebootResponse {
-                message: format!(
-                    "the system is not a {} system",
-                    state.package_manager.name()
-                ),
+                message: "reboot is not supported on this platform".to_string(),
             }),
         );
     }
@@ -736,9 +750,18 @@ async fn reboot_handler(
 
     let reboot = state.reboot.clone();
     let is_upgrading = state.is_upgrading.clone();
+    let commands = state.reboot_commands;
     tokio::spawn(async move {
         info!("scheduling system reboot in {delay}s");
-        run_scheduled_reboot(id, delay, reboot, is_upgrading, &TokioRebootRunner).await;
+        run_scheduled_reboot(
+            id,
+            delay,
+            reboot,
+            is_upgrading,
+            &TokioRebootRunner,
+            commands,
+        )
+        .await;
     });
 
     (
@@ -1010,6 +1033,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
         state
             .updates
@@ -1051,6 +1075,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -1088,6 +1113,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
         let app = Router::new()
             .route(PATH_HEALTH, get(health_handler))
@@ -1126,6 +1152,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
         let app = Router::new()
             .route(PATH_UPGRADE, post(full_upgrade_handler))
@@ -1164,6 +1191,7 @@ mod tests {
                 upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
                 reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
                 updates: UpdateCache::default(),
+                reboot_commands: reboot_commands(),
             };
             let app = Router::new()
                 .route("/status", get(status_handler))
@@ -1272,6 +1300,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
         let app = Router::new()
             .route(PATH_UPGRADE, post(full_upgrade_handler))
@@ -1320,6 +1349,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -1358,6 +1388,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -1396,6 +1427,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -1462,7 +1494,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_reboot_uses_sudo_n() {
         let runner = MockRebootRunner::new(vec![Ok(exit_success())]);
-        execute_reboot(&runner).await;
+        execute_reboot(&runner, LINUX_REBOOT_COMMANDS).await;
         let calls = runner.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "/usr/bin/sudo");
@@ -1472,7 +1504,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_reboot_falls_back_on_nonzero() {
         let runner = MockRebootRunner::new(vec![Ok(exit_failure()), Ok(exit_success())]);
-        execute_reboot(&runner).await;
+        execute_reboot(&runner, LINUX_REBOOT_COMMANDS).await;
         let calls = runner.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].1, vec!["-n", "/usr/bin/systemctl", "reboot"]);
@@ -1488,10 +1520,41 @@ mod tests {
             )),
             Ok(exit_success()),
         ]);
-        execute_reboot(&runner).await;
+        execute_reboot(&runner, LINUX_REBOOT_COMMANDS).await;
         let calls = runner.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].1, vec!["-n", "/usr/sbin/reboot"]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_reboot_macos_uses_shutdown() {
+        let runner = MockRebootRunner::new(vec![Ok(exit_success())]);
+        assert!(execute_reboot(&runner, MACOS_REBOOT_COMMANDS).await);
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "/usr/bin/sudo".to_string(),
+                vec!["-n", "/sbin/shutdown", "-r", "now"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            )]
+        );
+
+        let runner = MockRebootRunner::new(vec![Ok(exit_failure())]);
+        assert!(!execute_reboot(&runner, MACOS_REBOOT_COMMANDS).await);
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[test]
+    fn test_reboot_commands_match_platform() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(reboot_commands(), LINUX_REBOOT_COMMANDS);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(reboot_commands(), MACOS_REBOOT_COMMANDS);
+        } else {
+            assert!(reboot_commands().is_empty());
+        }
     }
 
     fn reboot_state(state: RebootState) -> Arc<std::sync::Mutex<RebootState>> {
@@ -1503,7 +1566,15 @@ mod tests {
         let runner = MockRebootRunner::new(vec![Ok(exit_success())]);
         let reboot = reboot_state(RebootState::Pending(7));
         let upgrading = Arc::new(AtomicBool::new(false));
-        run_scheduled_reboot(7, 0, reboot.clone(), upgrading.clone(), &runner).await;
+        run_scheduled_reboot(
+            7,
+            0,
+            reboot.clone(),
+            upgrading.clone(),
+            &runner,
+            LINUX_REBOOT_COMMANDS,
+        )
+        .await;
         assert_eq!(runner.calls().len(), 1);
         assert_eq!(*reboot.lock().unwrap(), RebootState::Rebooting);
         assert!(!upgrading.load(Ordering::SeqCst));
@@ -1519,6 +1590,7 @@ mod tests {
             reboot.clone(),
             Arc::new(AtomicBool::new(false)),
             &runner,
+            LINUX_REBOOT_COMMANDS,
         )
         .await;
         assert!(runner.calls().is_empty());
@@ -1535,6 +1607,7 @@ mod tests {
             reboot.clone(),
             Arc::new(AtomicBool::new(false)),
             &runner,
+            LINUX_REBOOT_COMMANDS,
         )
         .await;
         assert!(runner.calls().is_empty());
@@ -1546,7 +1619,15 @@ mod tests {
         let runner = MockRebootRunner::new(vec![]);
         let reboot = reboot_state(RebootState::Pending(7));
         let upgrading = Arc::new(AtomicBool::new(true));
-        run_scheduled_reboot(7, 0, reboot.clone(), upgrading, &runner).await;
+        run_scheduled_reboot(
+            7,
+            0,
+            reboot.clone(),
+            upgrading,
+            &runner,
+            LINUX_REBOOT_COMMANDS,
+        )
+        .await;
         assert!(runner.calls().is_empty());
         assert_eq!(*reboot.lock().unwrap(), RebootState::Idle);
     }
@@ -1561,6 +1642,7 @@ mod tests {
             reboot.clone(),
             Arc::new(AtomicBool::new(false)),
             &runner,
+            LINUX_REBOOT_COMMANDS,
         )
         .await;
         assert_eq!(runner.calls().len(), 2);
@@ -1575,8 +1657,15 @@ mod tests {
             let runner = runner.clone();
             let reboot = reboot.clone();
             tokio::spawn(async move {
-                run_scheduled_reboot(7, 60, reboot, Arc::new(AtomicBool::new(false)), &*runner)
-                    .await
+                run_scheduled_reboot(
+                    7,
+                    60,
+                    reboot,
+                    Arc::new(AtomicBool::new(false)),
+                    &*runner,
+                    LINUX_REBOOT_COMMANDS,
+                )
+                .await
             })
         };
         tokio::time::sleep(std::time::Duration::from_secs(59)).await;
@@ -1601,6 +1690,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         }
     }
 
@@ -1627,6 +1717,30 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    #[tokio::test]
+    async fn test_reboot_handler_unsupported_platform() {
+        let mut state = reboot_test_state(true);
+        state.reboot_commands = &[];
+        let app = reboot_app(state.clone());
+        assert_eq!(
+            send(&app, "POST", PATH_REBOOT, r#"{"delay_secs":60}"#).await,
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(*state.reboot.lock().unwrap(), RebootState::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_reboot_handler_does_not_need_package_manager() {
+        let mut state = reboot_test_state(true);
+        state.pm_available = false;
+        let app = reboot_app(state.clone());
+        assert_eq!(
+            send(&app, "POST", PATH_REBOOT, r#"{"delay_secs":3600}"#).await,
+            StatusCode::OK
+        );
+        assert_eq!(send(&app, "DELETE", PATH_REBOOT, "").await, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1689,6 +1803,7 @@ mod tests {
             state.reboot.clone(),
             state.is_upgrading.clone(),
             &runner,
+            LINUX_REBOOT_COMMANDS,
         )
         .await;
         assert_eq!(runner.calls().len(), 1);
@@ -1794,6 +1909,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -1950,6 +2066,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
 
         assert!(state.allow_reboot);
@@ -2077,6 +2194,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         }
     }
 
@@ -2254,6 +2372,7 @@ mod tests {
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
             updates: UpdateCache::default(),
+            reboot_commands: reboot_commands(),
         };
         let access = client_auth::ClientAccess::default();
         let app = build_router(state, access.clone());

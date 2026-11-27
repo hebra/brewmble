@@ -252,6 +252,12 @@ The `brewmbled` daemon runs as the `brewmble` user but needs to perform package 
    brewmble ALL=(root) NOPASSWD: /usr/bin/apt-get update, /usr/bin/apt-get -s dist-upgrade, /usr/bin/apt-get dist-upgrade -y -o Dpkg\:\:Options\:\:=--force-confdef -o Dpkg\:\:Options\:\:=--force-confold, /usr/bin/apt-get autoclean, /usr/bin/apt-get autoremove -y, /usr/bin/systemctl reboot, /usr/sbin/reboot
    ```
 
+   On macOS, `features.allow_reboot` instead needs this rule for the user the
+   Launch Agent runs as (replace `USERNAME`):
+   ```text
+   USERNAME ALL=(root) NOPASSWD: /sbin/shutdown -r now
+   ```
+
    Sudoers matches the resolved binary path and arguments exactly; for example,
    `sudo apt update` is not covered by the `/usr/bin/apt-get update` entry.
    Adjust the paths to match your distribution if necessary. Use `visudo` to
@@ -491,7 +497,7 @@ Only one upgrade can run at a time; the `is_upgrading` flag in `GET /status` rep
 
 ### `POST /node/reboot`
 
-Reboots the host (via `sudo systemctl reboot`, falling back to `sudo reboot`). Only allowed if `features.allow_reboot` is enabled in the configuration, and rejected while a full upgrade is running.
+Reboots the host: on Linux via `sudo -n /usr/bin/systemctl reboot`, falling back to `sudo -n /usr/sbin/reboot`; on macOS via `sudo -n /sbin/shutdown -r now`. Each needs a matching sudoers rule (see [Sudo Configuration](#sudo-configuration)). Only allowed if `features.allow_reboot` is enabled in the configuration, and rejected while a full upgrade is running. Other platforms get `501 NOT_IMPLEMENTED`.
 
 **Request:**
 ```json
@@ -524,8 +530,8 @@ Reboots the host (via `sudo systemctl reboot`, falling back to `sudo reboot`). O
 - `400 BAD_REQUEST`: `delay_secs` is greater than `3600`.
 - `403 FORBIDDEN`: Reboot is not enabled (`features.allow_reboot` is `false`).
 - `409 CONFLICT`: A reboot is already scheduled or in progress.
-- `412 PRECONDITION_FAILED`: The package manager is not available.
 - `423 LOCKED`: A full upgrade is currently running.
+- `501 NOT_IMPLEMENTED`: Reboot is not supported on this platform (only Linux and macOS are).
 
 ### `DELETE /node/reboot`
 

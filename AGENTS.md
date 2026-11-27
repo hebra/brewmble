@@ -34,7 +34,7 @@ This file provides guidance to agents when working with code in this repository.
 - Daemon requires paths to the cluster CA cert, daemon cert, and daemon key via the `tls:` section in the configuration file
 - CLI uses TOFU-style SHA-256 fingerprint pinning; the first successful connection to a node records its certificate fingerprint in `~/.brewmble.yaml`
 - CLI migration uses top-level `brewmble export`/`import` commands with passphrase-encrypted age files containing all profiles, pins, and global keyring credentials; imports replace rather than merge state unless run with `--dry-run`
-- Reboot feature invokes `/usr/bin/sudo -n /usr/bin/systemctl reboot` with fallback to `/usr/sbin/reboot`; configure a narrow sudoers rule for the daemon user
+- Reboot feature invokes `/usr/bin/sudo -n /usr/bin/systemctl reboot` with fallback to `/usr/sbin/reboot` on Linux, and `/usr/bin/sudo -n /sbin/shutdown -r now` on macOS (`reboot_commands()`); other platforms get 501, and reboot does not depend on the package manager being available; configure a narrow sudoers rule for the daemon user
 - Linux package management uses `apt-get` via `sudo`, including `dist-upgrade` for full upgrades; sudoers rules must match the documented absolute paths and exact arguments
 - Do not pass environment variables to `sudo` commands: `env_reset` drops `Command::env` values, and `/usr/bin/env VAR=value ...` sudoers entries are bypassable. `DEBIAN_FRONTEND` is unnecessary because apt-get runs without a tty and debconf uses defaults (see daemon/README.md)
 - The systemd unit must keep `NoNewPrivileges=false` and leave `CapabilityBoundingSet` unrestricted; restricting either prevents sudo elevation, and an empty capability set can make sudo-rs panic
