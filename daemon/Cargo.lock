@@ -285,6 +285,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2",
+ "shlex",
  "tempfile",
  "time",
  "tokio",

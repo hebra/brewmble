@@ -144,12 +144,10 @@ fn run_config_edit(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>
         config::init_config_file(&target_path, false)?;
     }
 
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    let mut parts = editor.split_whitespace();
-    let program = parts.next().unwrap_or("vi");
-    let extra_args: Vec<&str> = parts.collect();
-    let status = std::process::Command::new(program)
-        .args(extra_args)
+    let editor = std::env::var("EDITOR").unwrap_or_default();
+    let (program, extra_args) = editor_command(&editor)?;
+    let status = std::process::Command::new(&program)
+        .args(&extra_args)
         .arg(&target_path)
         .status()
         .map_err(|e| format!("Failed to launch editor '{program}': {e}"))?;
@@ -159,6 +157,25 @@ fn run_config_edit(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>
     }
 
     Ok(())
+}
+
+/// Splits `$EDITOR` into a program and its arguments. A path (containing `/`) to an
+/// existing file is used as-is, so unquoted paths with spaces work; anything else is split with
+/// shell quoting rules (`"/Applications/My Editor/bin/edit" --wait`). Empty means `vi`.
+fn editor_command(editor: &str) -> Result<(String, Vec<String>), String> {
+    let editor = editor.trim();
+    if editor.is_empty() {
+        return Ok(("vi".to_string(), Vec::new()));
+    }
+    if editor.contains('/') && Path::new(editor).is_file() {
+        return Ok((editor.to_string(), Vec::new()));
+    }
+    let mut parts = shlex::split(editor)
+        .filter(|parts| !parts.is_empty())
+        .ok_or_else(|| format!("Cannot parse $EDITOR '{editor}': unbalanced quotes"))?
+        .into_iter();
+    let program = parts.next().unwrap_or_default();
+    Ok((program, parts.collect()))
 }
 
 fn run_config_validate(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1015,6 +1032,41 @@ mod tests {
         fn auto_remove(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_editor_command_parsing() {
+        let cmd = |editor: &str| editor_command(editor).unwrap();
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(cmd(""), ("vi".to_string(), vec![]));
+        assert_eq!(cmd("  "), ("vi".to_string(), vec![]));
+        assert_eq!(cmd("nano"), ("nano".to_string(), vec![]));
+        assert_eq!(cmd("code --wait"), ("code".to_string(), args(&["--wait"])));
+        assert_eq!(
+            cmd(r#""/opt/My Editor/bin/edit" --wait -n"#),
+            (
+                "/opt/My Editor/bin/edit".to_string(),
+                args(&["--wait", "-n"])
+            )
+        );
+        assert_eq!(
+            cmd(r"/opt/My\ Editor/edit"),
+            ("/opt/My Editor/edit".to_string(), vec![])
+        );
+        assert!(editor_command(r#""/opt/My Editor"#).is_err());
+    }
+
+    #[test]
+    fn test_editor_command_existing_path_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let editor = dir.path().join("My Editor");
+        std::fs::write(&editor, "").unwrap();
+        let editor = editor.to_str().unwrap();
+        assert_eq!(
+            editor_command(editor).unwrap(),
+            (editor.to_string(), vec![])
+        );
     }
 
     #[tokio::test]
