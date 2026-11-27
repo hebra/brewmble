@@ -144,12 +144,16 @@ Brewmble uses mutual TLS (mTLS) for all CLI-to-daemon communication. A single cl
 The daemon normally runs as an unprivileged user. Linux package management and the optional reboot feature require elevated privileges through `sudo`, using well-known command paths.
 
 - **Linux package management**: The daemon uses `apt-get` for updates, upgrades, autoclean, and autoremove. Configure the exact commands as shown in the [daemon README](daemon/README.md#sudo-configuration); sudoers matches both the resolved binary path and its arguments.
-- **Reboot commands**: When `features.reboot` is enabled, the daemon uses:
-  - `/usr/bin/sudo -n /usr/bin/systemctl reboot`
-  - fallback: `/usr/bin/sudo -n /usr/sbin/reboot`
+- **Reboot commands**: When `features.allow_reboot` is enabled, the daemon uses:
+  - Linux: `/usr/bin/sudo -n /usr/bin/systemctl reboot`, falling back to `/usr/bin/sudo -n /usr/sbin/reboot`
+  - macOS: `/usr/bin/sudo -n /sbin/shutdown -r now`
+  - Other platforms reject reboot requests with `501 Not Implemented`.
 - **Recommended `sudoers` snippet** (use `visudo`):
   ```sudoers
+  # Linux
   brewmble ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /usr/sbin/reboot
+  # macOS
+  brewmble ALL=(root) NOPASSWD: /sbin/shutdown -r now
   ```
   Replace `brewmble` with the user the daemon runs as. Never grant a blanket `NOPASSWD: ALL` rule.
 - **Systemd unit hardening** (recommended):
