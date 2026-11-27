@@ -320,6 +320,7 @@ If no configuration file is found and no explicit path is passed, daemon startup
 # Server networking and mDNS settings
 server:
   # Port to listen on. If omitted, the daemon hunts for a free port starting at 4712.
+  # If set and already in use, the daemon fails to start instead of picking another port.
   port: 4712
 
   # Hostname for mDNS registration (default: system hostname).

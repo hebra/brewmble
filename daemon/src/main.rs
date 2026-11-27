@@ -20,7 +20,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
@@ -39,6 +38,34 @@ fn server_bind_ip(config: &config::DaemonConfig) -> IpAddr {
         .server
         .bind_address
         .unwrap_or_else(|| "0.0.0.0".parse().unwrap())
+}
+
+/// Binds the HTTPS listener that is later handed to the server, so the port
+/// advertised via mDNS is the one actually held. A configured port must be
+/// free; without one, ports from `start` upwards are tried while they are in use.
+fn bind_listener(
+    bind_ip: IpAddr,
+    configured_port: Option<u16>,
+    start: u16,
+) -> std::io::Result<std::net::TcpListener> {
+    let listener = match configured_port {
+        Some(port) => std::net::TcpListener::bind((bind_ip, port))?,
+        None => {
+            let mut port = start;
+            loop {
+                match std::net::TcpListener::bind((bind_ip, port)) {
+                    Ok(listener) => break listener,
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && port < u16::MAX => {
+                        warn!("port {port} is already in use, trying {}...", port + 1);
+                        port += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    };
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 #[derive(Parser, Debug)]
@@ -272,34 +299,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client_auth::spawn_reload_on_sighup(config_path.clone(), client_access.clone());
 
     let bind_ip = server_bind_ip(&daemon_config);
-    let http_port = if let Some(port) = daemon_config.server.port {
-        let addr = SocketAddr::from((bind_ip, port));
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
-            error!("failed to bind to port {port}: {e}");
+    let listener =
+        bind_listener(bind_ip, daemon_config.server.port, DEFAULT_PORT).map_err(|e| {
+            error!("failed to bind HTTPS listener on {bind_ip}: {e}");
             e
         })?;
-        drop(listener);
-        port
-    } else {
-        let mut port = DEFAULT_PORT;
-        loop {
-            let addr = SocketAddr::from((bind_ip, port));
-            match TcpListener::bind(addr).await {
-                Ok(listener) => {
-                    drop(listener);
-                    break port;
-                }
-                Err(e) => {
-                    if port == u16::MAX {
-                        error!("no free ports found");
-                        return Err(e.into());
-                    }
-                    warn!("port {port} is already in use, trying {}...", port + 1);
-                    port += 1;
-                }
-            }
-        }
-    };
+    let addr = listener.local_addr()?;
+    let http_port = addr.port();
 
     let hostname = daemon_config
         .server
@@ -357,12 +363,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ));
 
-    let addr = SocketAddr::from((bind_ip, http_port));
     info!("brewmble daemon listening on {}", addr);
 
     let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
     let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
-    let server = axum_server::bind_rustls(addr, rustls_config)
+    let server = axum_server::from_tcp_rustls(listener, rustls_config)?
         .map(client_auth::ClientIdentityAcceptor::new)
         .handle(handle.clone())
         .serve(app.into_make_service());
@@ -1701,32 +1706,48 @@ mod tests {
         assert!(!status.auto_remove);
     }
 
-    #[tokio::test]
-    async fn test_port_hunting() {
-        use tokio::net::TcpListener;
+    const LOOPBACK: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
-        // Bind to a random port first to simulate it being in use
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bound_addr = listener.local_addr().unwrap();
-        let bound_port = bound_addr.port();
+    #[test]
+    fn test_bind_listener_hunts_past_ports_in_use_and_keeps_listener() {
+        let occupied = std::net::TcpListener::bind((LOOPBACK, 0)).unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
 
-        // Now try to find a port starting from bound_port. It should find bound_port + 1 or higher.
-        let mut port = bound_port;
-        let found_port = loop {
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            match TcpListener::bind(addr).await {
-                Ok(l) => {
-                    break l.local_addr().unwrap().port();
-                }
-                Err(_) => {
-                    port += 1;
-                }
-            }
-        };
+        let listener = bind_listener(LOOPBACK, None, occupied_port).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port > occupied_port);
 
-        assert!(found_port > bound_port);
+        // The returned listener still holds the port; nothing else can take it.
+        let err = std::net::TcpListener::bind((LOOPBACK, port)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
 
-        drop(listener);
+    #[test]
+    fn test_bind_listener_configured_port_in_use_fails() {
+        let occupied = std::net::TcpListener::bind((LOOPBACK, 0)).unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+
+        let err = bind_listener(LOOPBACK, Some(occupied_port), DEFAULT_PORT).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn test_bind_listener_configured_port_is_bound() {
+        let probe = std::net::TcpListener::bind((LOOPBACK, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let listener = bind_listener(LOOPBACK, Some(port), DEFAULT_PORT).unwrap();
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
+
+    #[test]
+    fn test_bind_listener_hunting_stops_on_other_errors() {
+        // 192.0.2.1 (TEST-NET-1) is not assigned locally, so bind fails with
+        // AddrNotAvailable; hunting must not walk through the port range.
+        let unassigned: IpAddr = "192.0.2.1".parse().unwrap();
+        let err = bind_listener(unassigned, None, DEFAULT_PORT).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::AddrInUse);
     }
 
     #[test]
@@ -2124,14 +2145,17 @@ mod tests {
         let app = build_router(state, access.clone());
 
         let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
-        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let listener = bind_listener(LOOPBACK, None, DEFAULT_PORT).unwrap();
+        let port = listener.local_addr().unwrap().port();
         let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
-        let server = axum_server::bind_rustls(addr, rustls_config)
+        let server = axum_server::from_tcp_rustls(listener, rustls_config)
+            .unwrap()
             .map(client_auth::ClientIdentityAcceptor::new)
             .handle(handle.clone())
             .serve(app.into_make_service());
         tokio::spawn(server);
         let bound = handle.listening().await.unwrap();
+        assert_eq!(bound.port(), port);
         let base = format!("https://127.0.0.1:{}", bound.port());
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
