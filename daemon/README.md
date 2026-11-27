@@ -439,17 +439,18 @@ curl --cert client.pem --key client-key.pem --cacert ca.pem \
   "daemon_version": "0.3.0",
   "allow_reboot": false,
   "auto_clean": true,
-  "auto_remove": false
+  "auto_remove": false,
+  "checking": false
 }
 ```
 
 **Status codes:**
 
-- `200 OK`: Status returned. Until the first background check after startup finishes, `updates` is empty and `message` is `First update check is still running`.
+- `200 OK`: Status returned. Until the first background check after startup finishes, `checking` is `true`, `updates` is empty and `message` is `First update check is still running`; `brewmble status` lists such nodes separately instead of counting them as up to date.
 - `412 PRECONDITION_FAILED`: The detected package manager is not available on this system (e.g., no `apt` or `brew` found).
 - `500 INTERNAL_SERVER_ERROR`: The latest background update check failed.
 
-`GET /status` never runs the package manager. The daemon checks for updates in the background (`apt-get update` + `apt-get -s dist-upgrade`, or `brew update` + `brew outdated`) at startup, every `package_manager.update_interval_mins`, and after each full upgrade; `/status` returns the latest result.
+`GET /status` never runs the package manager. The daemon checks for updates in the background (`apt-get update` + `apt-get -s dist-upgrade`, or `brew update` + `brew outdated`) at startup, every `package_manager.update_interval_mins`, and after each full upgrade; `/status` returns the latest result. The post-upgrade check doesn't reset the interval schedule.
 
 Requests that take longer than 300 seconds get `408 REQUEST_TIMEOUT`, but the timeout doesn't stop the package-manager commands already running. On apt, dry-run requests and the background check share one running update check. A request that arrives while a check is running, including a retry after a 408, waits for that check instead of starting another one.
 

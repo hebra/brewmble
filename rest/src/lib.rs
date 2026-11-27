@@ -69,6 +69,10 @@ pub struct StatusResponse {
     pub auto_clean: bool,
     #[serde(default)]
     pub auto_remove: bool,
+    /// The daemon's first update check since startup is still running, so `updates`
+    /// is not known yet.
+    #[serde(default)]
+    pub checking: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -137,6 +141,7 @@ mod tests {
             allow_reboot: true,
             auto_clean: true,
             auto_remove: false,
+            checking: true,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"message\":\"All good\""));
@@ -155,6 +160,11 @@ mod tests {
         assert_eq!(decoded.allow_reboot, resp.allow_reboot);
         assert_eq!(decoded.auto_clean, resp.auto_clean);
         assert_eq!(decoded.auto_remove, resp.auto_remove);
+        assert!(decoded.checking);
+
+        let old: StatusResponse =
+            serde_json::from_str(r#"{"message":"m","updates":[],"is_upgrading":false}"#).unwrap();
+        assert!(!old.checking);
     }
 
     #[test]

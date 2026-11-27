@@ -5,6 +5,7 @@ use crate::package_manager::PackageManager;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 /// Result of the most recent background update check.
@@ -46,14 +47,18 @@ impl UpdateCache {
         self.refresh.notified().await;
     }
 
-    /// Checks for updates now, then again every `interval` or when a refresh is requested.
+    /// Checks for updates now, then again every `interval` and whenever a refresh is
+    /// requested. Requested checks don't move the interval schedule, so the cache TTL
+    /// in `get_updates` still expires on time.
     pub async fn run_refresh_loop(self, pm: Arc<Box<dyn PackageManager>>, interval: Duration) {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            self.refresh_once(pm.as_ref().as_ref()).await;
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                _ = ticker.tick() => {}
                 _ = self.refresh.notified() => info!("update check requested"),
             }
+            self.refresh_once(pm.as_ref().as_ref()).await;
         }
     }
 
@@ -170,6 +175,24 @@ mod tests {
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(cache.status(), UpdateStatus::Ready(vec!["pkg2".into()]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_requested_check_keeps_interval_schedule() {
+        let cache = UpdateCache::default();
+        let (pm, calls) = counting_pm(false);
+        tokio::spawn(cache.clone().run_refresh_loop(pm, Duration::from_secs(60)));
+        settle().await;
+
+        tokio::time::advance(Duration::from_secs(50)).await;
+        cache.request_refresh();
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // The scheduled check still runs 60 s after startup, not 60 s after the request.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]

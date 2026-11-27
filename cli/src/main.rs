@@ -848,6 +848,72 @@ fn run_discover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status_response(updates: &[&str], checking: bool) -> StatusResponse {
+        StatusResponse {
+            message: "m".to_string(),
+            updates: updates.iter().map(|u| u.to_string()).collect(),
+            is_upgrading: false,
+            daemon_version: None,
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
+            checking,
+        }
+    }
+
+    #[test]
+    fn test_describe_status_update_states() {
+        let (_, details, state) = describe_status(status_response(&[], true));
+        assert_eq!(state, NodeUpdates::Checking);
+        assert!(details.contains("first update check still running"));
+
+        let (_, details, state) = describe_status(status_response(&["vim"], false));
+        assert_eq!(state, NodeUpdates::Outdated);
+        assert!(details.contains("  - vim"));
+
+        let (_, details, state) = describe_status(status_response(&[], false));
+        assert_eq!(state, NodeUpdates::UpToDate);
+        assert!(details.contains("No updates available."));
+    }
+
+    #[test]
+    fn test_status_summary_does_not_report_checking_nodes_as_up_to_date() {
+        let report = |name: &str, failed, updates| (name.to_string(), failed, updates);
+
+        let lines = status_summary(&[
+            report("a", false, NodeUpdates::UpToDate),
+            report("b", false, NodeUpdates::Checking),
+        ]);
+        assert_eq!(
+            lines,
+            vec!["1 node(s) are still running their first update check: b"]
+        );
+
+        let lines = status_summary(&[
+            report("a", false, NodeUpdates::UpToDate),
+            report("c", true, NodeUpdates::Unknown),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "All nodes are up to date.",
+                "1 node(s) failed to respond: c"
+            ]
+        );
+
+        let lines = status_summary(&[
+            report("a", false, NodeUpdates::Outdated),
+            report("b", false, NodeUpdates::Checking),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "1 node(s) are outdated: a",
+                "1 node(s) are still running their first update check: b"
+            ]
+        );
+    }
     use clap::Parser;
     use mdns_sd::ServiceInfo;
 
@@ -1941,7 +2007,7 @@ fn run_status(
     drop(target_tx); // Close tx so rx finishes when discovery is done
 
     let seen_targets = Arc::new(Mutex::new(HashSet::new()));
-    let node_reports = Arc::new(Mutex::new(Vec::<(String, bool, bool)>::new()));
+    let node_reports = Arc::new(Mutex::new(Vec::<(String, bool, NodeUpdates)>::new()));
     let learned_pins = Mutex::new(Vec::new());
 
     let pb = if native_supported {
@@ -1994,7 +2060,7 @@ fn run_status(
                     fingerprint: None,
                 };
                 let node = saved_node.unwrap_or(&discovered_node);
-                let (status, message, details, failed, outdated) = match clients.connect(node) {
+                let (status, message, details, failed, updates) = match clients.connect(node) {
                     Ok((client, outcome)) => {
                         if let (Some(saved), PinOutcome::Learned(fp)) = (saved_node, outcome) {
                             learned_pins.lock().unwrap().push((saved, fp));
@@ -2006,7 +2072,7 @@ fn run_status(
                         String::new(),
                         String::new(),
                         true,
-                        false,
+                        NodeUpdates::Unknown,
                     ),
                 };
 
@@ -2032,7 +2098,7 @@ fn run_status(
                 node_reports
                     .lock()
                     .unwrap()
-                    .push((name.to_string(), failed, outdated));
+                    .push((name.to_string(), failed, updates));
                 pb.inc(1);
                 native.set_progress(pb.position(), pb.length());
             });
@@ -2050,34 +2116,8 @@ fn run_status(
     let reports = node_reports.lock().unwrap();
     if !reports.is_empty() {
         println!("Summary:");
-        let outdated_nodes: Vec<_> = reports
-            .iter()
-            .filter(|(_, _, outdated)| *outdated)
-            .map(|(name, _, _)| name.as_str())
-            .collect();
-
-        if outdated_nodes.is_empty() {
-            println!("- All nodes are up to date.");
-        } else {
-            println!(
-                "- {} node(s) are outdated: {}",
-                outdated_nodes.len(),
-                outdated_nodes.join(", ")
-            );
-        }
-
-        let failed_nodes: Vec<_> = reports
-            .iter()
-            .filter(|(_, failed, _)| *failed)
-            .map(|(name, _, _)| name.as_str())
-            .collect();
-
-        if !failed_nodes.is_empty() {
-            println!(
-                "- {} node(s) failed to respond: {}",
-                failed_nodes.len(),
-                failed_nodes.join(", ")
-            );
+        for line in status_summary(&reports) {
+            println!("- {line}");
         }
     }
 
@@ -2094,10 +2134,87 @@ fn run_status(
     clients.finish()
 }
 
+/// What a node's `/status` response says about pending updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeUpdates {
+    /// No usable status response.
+    Unknown,
+    UpToDate,
+    Outdated,
+    /// The daemon's first update check since startup is still running.
+    Checking,
+}
+
+fn status_summary(reports: &[(String, bool, NodeUpdates)]) -> Vec<String> {
+    let names = |pred: &dyn Fn(bool, NodeUpdates) -> bool| -> Vec<&str> {
+        reports
+            .iter()
+            .filter(|(_, failed, updates)| pred(*failed, *updates))
+            .map(|(name, _, _)| name.as_str())
+            .collect()
+    };
+    let outdated = names(&|_, u| u == NodeUpdates::Outdated);
+    let checking = names(&|_, u| u == NodeUpdates::Checking);
+    let failed = names(&|f, _| f);
+
+    let mut lines = Vec::new();
+    if outdated.is_empty() && checking.is_empty() {
+        lines.push("All nodes are up to date.".to_string());
+    }
+    if !outdated.is_empty() {
+        lines.push(format!(
+            "{} node(s) are outdated: {}",
+            outdated.len(),
+            outdated.join(", ")
+        ));
+    }
+    if !checking.is_empty() {
+        lines.push(format!(
+            "{} node(s) are still running their first update check: {}",
+            checking.len(),
+            checking.join(", ")
+        ));
+    }
+    if !failed.is_empty() {
+        lines.push(format!(
+            "{} node(s) failed to respond: {}",
+            failed.len(),
+            failed.join(", ")
+        ));
+    }
+    lines
+}
+
+/// Formats a successful `/status` response as (message, details, update state).
+fn describe_status(sr: StatusResponse) -> (String, String, NodeUpdates) {
+    let mut details = String::new();
+    if let Some(version) = sr.daemon_version {
+        details.push_str(&format!("Daemon version: {}\n", version));
+    }
+    details.push_str(&format!("Upgrading: {}\n", sr.is_upgrading));
+    details.push_str(&format!("Allow reboot: {}\n", sr.allow_reboot));
+    details.push_str(&format!("Auto clean: {}\n", sr.auto_clean));
+    details.push_str(&format!("Auto remove: {}\n", sr.auto_remove));
+    let updates = if sr.checking {
+        details.push_str("Updates: not known yet (first update check still running)\n");
+        NodeUpdates::Checking
+    } else if !sr.updates.is_empty() {
+        details.push_str("Updates:\n");
+        for update in &sr.updates {
+            details.push_str(&format!("  - {}\n", update));
+        }
+        NodeUpdates::Outdated
+    } else {
+        details.push_str("No updates available.\n");
+        NodeUpdates::UpToDate
+    };
+    (sr.message, details, updates)
+}
+
 fn query_status(
     client: &reqwest::blocking::Client,
     target: &str,
-) -> (String, String, String, bool, bool) {
+) -> (String, String, String, bool, NodeUpdates) {
     let url = resolve_url(target);
     let status_url = format!("{}{}", url, PATH_STATUS);
 
@@ -2107,32 +2224,15 @@ fn query_status(
             if resp.status().is_success() {
                 match resp.json::<StatusResponse>() {
                     Ok(sr) => {
-                        let message = sr.message;
-                        let mut details = String::new();
-                        if let Some(version) = sr.daemon_version {
-                            details.push_str(&format!("Daemon version: {}\n", version));
-                        }
-                        details.push_str(&format!("Upgrading: {}\n", sr.is_upgrading));
-                        details.push_str(&format!("Allow reboot: {}\n", sr.allow_reboot));
-                        details.push_str(&format!("Auto clean: {}\n", sr.auto_clean));
-                        details.push_str(&format!("Auto remove: {}\n", sr.auto_remove));
-                        if !sr.updates.is_empty() {
-                            details.push_str("Updates:\n");
-                            for update in &sr.updates {
-                                details.push_str(&format!("  - {}\n", update));
-                            }
-                        } else {
-                            details.push_str("No updates available.\n");
-                        }
-                        let outdated = !sr.updates.is_empty();
-                        (status, message, details, false, outdated)
+                        let (message, details, updates) = describe_status(sr);
+                        (status, message, details, false, updates)
                     }
                     Err(_) => (
                         status,
                         "Could not parse StatusResponse".to_string(),
                         "".to_string(),
                         false,
-                        false,
+                        NodeUpdates::Unknown,
                     ),
                 }
             } else {
@@ -2140,14 +2240,14 @@ fn query_status(
                     Ok(json) => {
                         let details = serde_json::to_string_pretty(&json)
                             .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string());
-                        (status, "".to_string(), details, false, false)
+                        (status, "".to_string(), details, false, NodeUpdates::Unknown)
                     }
                     Err(_) => (
                         status,
                         "Could not parse response as JSON".to_string(),
                         "".to_string(),
                         false,
-                        false,
+                        NodeUpdates::Unknown,
                     ),
                 }
             }
@@ -2157,7 +2257,7 @@ fn query_status(
             "".to_string(),
             "".to_string(),
             true,
-            false,
+            NodeUpdates::Unknown,
         ),
     }
 }

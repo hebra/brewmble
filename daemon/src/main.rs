@@ -449,6 +449,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
                 allow_reboot: config_flags.0,
                 auto_clean: config_flags.1,
                 auto_remove: config_flags.2,
+                checking: false,
             }),
         );
     }
@@ -464,6 +465,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
                 allow_reboot: config_flags.0,
                 auto_clean: config_flags.1,
                 auto_remove: config_flags.2,
+                checking: true,
             }),
         ),
         UpdateStatus::Ready(updates) => {
@@ -483,6 +485,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
                     allow_reboot: config_flags.0,
                     auto_clean: config_flags.1,
                     auto_remove: config_flags.2,
+                    checking: false,
                 }),
             )
         }
@@ -496,6 +499,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
                 allow_reboot: config_flags.0,
                 auto_clean: config_flags.1,
                 auto_remove: config_flags.2,
+                checking: false,
             }),
         ),
     }
@@ -1734,11 +1738,13 @@ mod tests {
         let (code, status) = status_for(None).await;
         assert_eq!(code, StatusCode::OK);
         assert!(status.updates.is_empty());
+        assert!(status.checking);
         assert_eq!(status.message, "First update check is still running");
 
         let (code, status) = status_for(Some(UpdateStatus::Ready(vec![]))).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(status.message, "System is up to date");
+        assert!(!status.checking);
 
         let (code, status) =
             status_for(Some(UpdateStatus::Ready(vec!["a".into(), "b".into()]))).await;
