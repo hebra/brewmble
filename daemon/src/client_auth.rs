@@ -105,7 +105,8 @@ impl Denial {
     }
 }
 
-/// Live client allow-list. `None` accepts every certificate signed by the cluster CA.
+/// Live client allow-list. `None` (`allowed_clients: "*"`) accepts every certificate
+/// signed by the cluster CA.
 #[derive(Debug, Clone, Default)]
 pub struct ClientAccess {
     allowed: Arc<RwLock<Option<HashSet<String>>>>,
@@ -145,14 +146,27 @@ impl ClientAccess {
 pub fn reload_allowed_clients(path: &Path, access: &ClientAccess) -> Result<(), String> {
     let cfg = config::load_config(path).map_err(|e| e.to_string())?;
     let allowed = config::allowed_client_fingerprints(&cfg.tls).map_err(|e| e.to_string())?;
-    match &allowed {
-        Some(list) => info!("client allow-list reloaded: {} certificate(s)", list.len()),
-        None => warn!(
-            "client allow-list reloaded: tls.allowed_clients is not set, any client certificate signed by the cluster CA is accepted"
-        ),
-    }
+    log_allow_list("reloaded", &cfg.tls, &allowed);
     access.replace(allowed);
     Ok(())
+}
+
+/// Logs the allow-list that just took effect, warning when it accepts any CA client
+/// or rejects every client.
+pub fn log_allow_list(action: &str, tls: &config::TlsConfig, allowed: &Option<HashSet<String>>) {
+    match allowed {
+        None => warn!("client allow-list {action}: {}", config::ANY_CLIENT_WARNING),
+        Some(_) if tls.allowed_clients.is_none() => {
+            warn!(
+                "client allow-list {action}: {}",
+                config::UNSET_ALLOW_LIST_WARNING
+            )
+        }
+        Some(list) if list.is_empty() => warn!(
+            "client allow-list {action}: tls.allowed_clients is empty; every client request will be rejected"
+        ),
+        Some(list) => info!("client allow-list {action}: {} certificate(s)", list.len()),
+    }
 }
 
 /// Reloads the allow-list from `path` every time the process receives SIGHUP.
@@ -464,8 +478,42 @@ mod tests {
         assert!(reload_allowed_clients(&path, &access).is_err());
         assert!(access.check(&reader(&b), ClientRole::Read).is_ok());
 
+        // Removing the key rejects every client instead of widening access.
         let path = write_config(dir.path(), "");
         reload_allowed_clients(&path, &access).unwrap();
+        assert_eq!(
+            access.check(&reader(&b), ClientRole::Read),
+            Err(Denial::NotAllowed)
+        );
+
+        // Only an explicit "*" accepts any client signed by the cluster CA.
+        let path = write_config(dir.path(), "  allowed_clients: \"*\"\n");
+        reload_allowed_clients(&path, &access).unwrap();
         assert!(access.check(&reader(&a), ClientRole::Read).is_ok());
+
+        let path = write_config(dir.path(), "  allowed_clients:\n");
+        reload_allowed_clients(&path, &access).unwrap();
+        assert_eq!(
+            access.check(&reader(&a), ClientRole::Read),
+            Err(Denial::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn test_log_allow_list_covers_every_state() {
+        let tls = |allowed: Option<Vec<String>>| config::TlsConfig {
+            ca_cert: "/ca.pem".into(),
+            cert: "/c.pem".into(),
+            key: "/k.pem".into(),
+            allowed_clients: allowed,
+        };
+        log_allow_list("active", &tls(Some(vec!["*".into()])), &None);
+        log_allow_list("active", &tls(None), &Some(HashSet::new()));
+        log_allow_list("active", &tls(Some(vec![])), &Some(HashSet::new()));
+        log_allow_list(
+            "active",
+            &tls(Some(vec!["aa".into()])),
+            &Some(HashSet::from(["aa".to_string()])),
+        );
     }
 }
