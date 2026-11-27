@@ -22,7 +22,7 @@ impl Brew {
             auto_clean,
             auto_remove,
             last_update: Mutex::new(None),
-            cache_ttl: Duration::from_secs(update_interval_mins * 60),
+            cache_ttl: super::cache_ttl(update_interval_mins),
         }
     }
 }

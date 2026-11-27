@@ -1,6 +1,14 @@
 use async_trait::async_trait;
 use std::io;
 use std::process::{Command, Output};
+use std::time::Duration;
+
+pub(crate) fn cache_ttl(update_interval_mins: u64) -> Duration {
+    update_interval_mins
+        .checked_mul(60)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::MAX)
+}
 
 #[async_trait]
 pub trait PackageManager: Send + Sync {

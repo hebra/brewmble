@@ -6,6 +6,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_UPDATE_INTERVAL_MINS: u64 = 360;
+pub const MAX_UPDATE_INTERVAL_MINS: u64 = 525_600; // one year
 
 fn default_update_interval_mins() -> u64 {
     DEFAULT_UPDATE_INTERVAL_MINS
@@ -302,7 +303,7 @@ features:
   auto_remove: false
 
 package_manager:
-  # Package manager cache update interval in minutes (default: 360)
+  # Package manager cache update interval in minutes (default: 360, max: 525600 = one year)
   update_interval_mins: 360
 "#
 }
@@ -360,6 +361,13 @@ pub fn validate_config(config: &DaemonConfig) -> ValidationReport {
         if port == 0 {
             report.errors.push("server.port cannot be 0".to_string());
         }
+    }
+
+    if config.package_manager.update_interval_mins > MAX_UPDATE_INTERVAL_MINS {
+        report.errors.push(format!(
+            "package_manager.update_interval_mins must be at most {MAX_UPDATE_INTERVAL_MINS} (one year), got {}",
+            config.package_manager.update_interval_mins
+        ));
     }
 
     match allowed_client_fingerprints(&config.tls) {
@@ -753,6 +761,24 @@ server:
         config.tls.allowed_clients =
             allowed.map(|list| list.into_iter().map(String::from).collect());
         config
+    }
+
+    #[test]
+    fn test_update_interval_mins_upper_bound() {
+        let interval_errors = |mins: u64| {
+            let mut config = config_with_allowed_clients(None);
+            config.package_manager.update_interval_mins = mins;
+            validate_config(&config)
+                .errors
+                .into_iter()
+                .filter(|e| e.contains("update_interval_mins"))
+                .count()
+        };
+        assert_eq!(interval_errors(0), 0);
+        assert_eq!(interval_errors(DEFAULT_UPDATE_INTERVAL_MINS), 0);
+        assert_eq!(interval_errors(MAX_UPDATE_INTERVAL_MINS), 0);
+        assert_eq!(interval_errors(MAX_UPDATE_INTERVAL_MINS + 1), 1);
+        assert_eq!(interval_errors(u64::MAX), 1);
     }
 
     #[test]
