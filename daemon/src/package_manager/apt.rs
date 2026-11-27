@@ -89,65 +89,7 @@ impl PackageManager for Apt {
 
     #[cfg(any(target_os = "linux", test))]
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let should_update = {
-            let last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
-            match *last_update {
-                Some(last) if self.cache_ttl.as_secs() > 0 => last.elapsed() >= self.cache_ttl,
-                _ => true,
-            }
-        };
-
-        if should_update {
-            info!("updating apt cache...");
-            let output = self.run_async("sudo", &["apt-get", "update"]).await?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let err_msg = if stderr.contains("Permission denied")
-                    || stderr.contains("Are you root")
-                {
-                    format!(
-                        "Permission denied when updating apt cache. Are you running as root? stderr: {}",
-                        stderr
-                    )
-                } else {
-                    format!(
-                        "Failed to update apt cache: {}. stderr: {}",
-                        output.status, stderr
-                    )
-                };
-                error!("{}", err_msg);
-                return Err(err_msg.into());
-            }
-            // Update the last update time
-            let mut last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
-            *last_update = Some(Instant::now());
-        } else {
-            info!(
-                "apt cache is still valid (TTL: {} mins), skipping update",
-                self.cache_ttl.as_secs() / 60
-            );
-        }
-
-        info!("determining available updates...");
-        // Use simulated dist-upgrade to find which packages would be upgraded.
-        // This requires sudo because apt needs to lock the cache even for simulated upgrades
-        // if run as a non-root user.
-        let output = self
-            .run_async("sudo", &["apt-get", "-s", "dist-upgrade"])
-            .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let err_msg = format!(
-                "Failed to determine available updates: {}. stderr: {}",
-                output.status, stderr
-            );
-            error!("{}", err_msg);
-            return Err(err_msg.into());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let updates = parse_simulated_upgrades(&stdout);
-
+        let updates = parse_simulated_upgrades(&self.simulate_dist_upgrade().await?);
         info!("found {} available updates", updates.len());
         Ok(updates)
     }
@@ -161,7 +103,9 @@ impl PackageManager for Apt {
     async fn dry_run_upgrade(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        self.get_updates().await
+        Ok(parse_simulated_installs(
+            &self.simulate_dist_upgrade().await?,
+        ))
     }
 
     #[cfg(all(not(target_os = "linux"), not(test)))]
@@ -250,6 +194,69 @@ impl PackageManager for Apt {
 }
 
 impl Apt {
+    #[cfg(any(target_os = "linux", test))]
+    async fn simulate_dist_upgrade(
+        &self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let should_update = {
+            let last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
+            match *last_update {
+                Some(last) if self.cache_ttl.as_secs() > 0 => last.elapsed() >= self.cache_ttl,
+                _ => true,
+            }
+        };
+
+        if should_update {
+            info!("updating apt cache...");
+            let output = self.run_async("sudo", &["apt-get", "update"]).await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let err_msg = if stderr.contains("Permission denied")
+                    || stderr.contains("Are you root")
+                {
+                    format!(
+                        "Permission denied when updating apt cache. Are you running as root? stderr: {}",
+                        stderr
+                    )
+                } else {
+                    format!(
+                        "Failed to update apt cache: {}. stderr: {}",
+                        output.status, stderr
+                    )
+                };
+                error!("{}", err_msg);
+                return Err(err_msg.into());
+            }
+            // Update the last update time
+            let mut last_update = self.last_update.lock().unwrap_or_else(|p| p.into_inner());
+            *last_update = Some(Instant::now());
+        } else {
+            info!(
+                "apt cache is still valid (TTL: {} mins), skipping update",
+                self.cache_ttl.as_secs() / 60
+            );
+        }
+
+        info!("determining available updates...");
+        // Use simulated dist-upgrade to find which packages would be upgraded.
+        // This requires sudo because apt needs to lock the cache even for simulated upgrades
+        // if run as a non-root user.
+        let output = self
+            .run_async("sudo", &["apt-get", "-s", "dist-upgrade"])
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let err_msg = format!(
+                "Failed to determine available updates: {}. stderr: {}",
+                output.status, stderr
+            );
+            error!("{}", err_msg);
+            return Err(err_msg.into());
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn run_cleanup(&self) {
         if self.auto_clean {
             if let Err(e) = self.auto_clean() {
@@ -282,6 +289,16 @@ fn parse_simulated_upgrades(stdout: &str) -> Vec<String> {
                 .filter(|installed| installed.starts_with('['))
                 .map(|_| name.to_string())
         })
+        .collect()
+}
+
+/// Every package `apt-get -s dist-upgrade` would install, including new ones.
+#[cfg(any(target_os = "linux", test))]
+fn parse_simulated_installs(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("Inst "))
+        .filter_map(|rest| rest.split_whitespace().next().map(str::to_string))
         .collect()
 }
 
@@ -564,11 +581,16 @@ Remv oldpkg [1.0]
 Inst
 ";
         assert_eq!(parse_simulated_upgrades(stdout), vec!["libssl3", "openssl"]);
+        assert_eq!(
+            parse_simulated_installs(stdout),
+            vec!["linux-image-6.1.0-18-amd64", "libssl3", "openssl"]
+        );
         assert!(parse_simulated_upgrades("").is_empty());
+        assert!(parse_simulated_installs("").is_empty());
     }
 
     #[tokio::test]
-    async fn test_apt_get_updates_excludes_new_installs() {
+    async fn test_apt_status_excludes_new_installs_but_dry_run_lists_them() {
         let runner = MockRunner {
             success: true,
             stdout: "Inst newpkg (1.0 Debian:12/stable [amd64])\nInst pkg1 [0.9] (1.0 Debian:12/stable [amd64])\n".to_string(),
@@ -582,6 +604,7 @@ Inst
             cache_ttl: Duration::from_secs(360 * 60),
         };
         assert_eq!(apt.get_updates().await.unwrap(), vec!["pkg1"]);
+        assert_eq!(apt.dry_run_upgrade().await.unwrap(), vec!["newpkg", "pkg1"]);
     }
 
     #[test]
