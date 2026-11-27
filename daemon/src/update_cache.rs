@@ -5,6 +5,7 @@ use crate::package_manager::PackageManager;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 /// Result of the most recent background update check.
@@ -46,13 +47,26 @@ impl UpdateCache {
         self.refresh.notified().await;
     }
 
-    /// Checks for updates now, then again every `interval` or when a refresh is requested.
+    /// Checks for updates now, then `interval` after each scheduled check finishes, and
+    /// whenever a refresh is requested. Scheduled checks start a full `interval` after
+    /// the previous one finished, so the `get_updates` cache TTL (started when the
+    /// metadata fetch finished) has expired by then; requested checks don't move them.
     pub async fn run_refresh_loop(self, pm: Arc<Box<dyn PackageManager>>, interval: Duration) {
+        let pm = pm.as_ref().as_ref();
+        let mut next_due = Instant::now();
         loop {
-            self.refresh_once(pm.as_ref().as_ref()).await;
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                _ = self.refresh.notified() => info!("update check requested"),
+                _ = tokio::time::sleep_until(next_due) => {
+                    self.refresh_once(pm).await;
+                    let now = Instant::now();
+                    next_due = now
+                        .checked_add(interval)
+                        .unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 24 * 3600));
+                }
+                _ = self.refresh.notified() => {
+                    info!("update check requested");
+                    self.refresh_once(pm).await;
+                }
             }
         }
     }
@@ -82,6 +96,7 @@ mod tests {
     struct CountingPm {
         calls: Arc<AtomicUsize>,
         fail: bool,
+        delay: Duration,
     }
 
     #[async_trait::async_trait]
@@ -99,6 +114,7 @@ mod tests {
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            tokio::time::sleep(self.delay).await;
             if self.fail {
                 return Err("apt exploded".into());
             }
@@ -121,10 +137,18 @@ mod tests {
     }
 
     fn counting_pm(fail: bool) -> (Arc<Box<dyn PackageManager>>, Arc<AtomicUsize>) {
+        slow_counting_pm(fail, Duration::ZERO)
+    }
+
+    fn slow_counting_pm(
+        fail: bool,
+        delay: Duration,
+    ) -> (Arc<Box<dyn PackageManager>>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let pm: Box<dyn PackageManager> = Box::new(CountingPm {
             calls: calls.clone(),
             fail,
+            delay,
         });
         (Arc::new(pm), calls)
     }
@@ -170,6 +194,45 @@ mod tests {
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(cache.status(), UpdateStatus::Ready(vec!["pkg2".into()]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_requested_check_keeps_interval_schedule() {
+        let cache = UpdateCache::default();
+        let (pm, calls) = counting_pm(false);
+        tokio::spawn(cache.clone().run_refresh_loop(pm, Duration::from_secs(60)));
+        settle().await;
+
+        tokio::time::advance(Duration::from_secs(50)).await;
+        cache.request_refresh();
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // The scheduled check still runs 60 s after startup, not 60 s after the request.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_next_check_waits_full_interval_after_previous_finished() {
+        let cache = UpdateCache::default();
+        let (pm, calls) = slow_counting_pm(false, Duration::from_secs(5));
+        tokio::spawn(cache.clone().run_refresh_loop(pm, Duration::from_secs(60)));
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The startup check finishes at 5 s, so the next one starts at 65 s, once a
+        // cache TTL equal to the interval has expired.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        settle().await;
+        tokio::time::advance(Duration::from_secs(55)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]
