@@ -159,15 +159,15 @@ fn run_config_edit(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// Splits `$EDITOR` into a program and its arguments. A value naming an existing file
-/// is used as-is, so unquoted paths with spaces work; anything else is split with
+/// Splits `$EDITOR` into a program and its arguments. A path (containing `/`) to an
+/// existing file is used as-is, so unquoted paths with spaces work; anything else is split with
 /// shell quoting rules (`"/Applications/My Editor/bin/edit" --wait`). Empty means `vi`.
 fn editor_command(editor: &str) -> Result<(String, Vec<String>), String> {
     let editor = editor.trim();
     if editor.is_empty() {
         return Ok(("vi".to_string(), Vec::new()));
     }
-    if Path::new(editor).is_file() {
+    if editor.contains('/') && Path::new(editor).is_file() {
         return Ok((editor.to_string(), Vec::new()));
     }
     let mut parts = shlex::split(editor)

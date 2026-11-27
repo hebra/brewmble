@@ -315,7 +315,7 @@ If no configuration file is found and no explicit path is passed, daemon startup
   ```bash
   brewmbled config edit
   ```
-  `$EDITOR` (default `vi`) may include arguments and follows shell quoting, e.g. `EDITOR='"/opt/My Editor/bin/edit" --wait'`. A value that names an existing file is used as the program even if it contains unquoted spaces.
+  `$EDITOR` (default `vi`) may include arguments and follows shell quoting, e.g. `EDITOR='"/opt/My Editor/bin/edit" --wait'`. A path (containing `/`) to an existing file is used as the program even if it contains unquoted spaces; bare names are looked up on `PATH`, as in a shell.
 - **Pre-flight validation** (verifies YAML syntax and TLS certificate/key presence):
   ```bash
   brewmbled config validate
