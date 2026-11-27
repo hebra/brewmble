@@ -24,7 +24,7 @@ This file provides guidance to agents when working with code in this repository.
 - CLI uses blocking HTTPS client (reqwest with blocking feature and rustls) while daemon uses async Axum framework over HTTPS
 - Rust edition: uses 2024 across all crates
 - Container builds use podman with ports 4712 (HTTPS) and 5353 (mDNS)
-- Daemon auto-hunts for free port starting from 4712 if server.port is not configured
+- Daemon auto-hunts for free port starting from 4712 if server.port is not configured (only past `AddrInUse`); an explicitly configured port that is in use is a startup error. The bound listener is kept and passed to `axum_server::from_tcp_rustls` (see `bind_listener`), so mDNS advertises the port actually held
 - Daemon binds to `server.bind_address` (default 0.0.0.0) for both port probing and the HTTPS listener
 - API authentication is performed via mutual TLS (mTLS); the X-API-Key header has been removed
 - Client authorization: the daemon checks each request's client certificate against the optional `tls.allowed_clients` SHA-256 fingerprint list (reloaded on SIGHUP) and the role in its subject `OU=brewmble-role:read|operator` (see daemon/src/client_auth.rs); `read` covers /health and /status, `operator` also upgrade and reboot, and certificates without a role are `read`
