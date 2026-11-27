@@ -19,6 +19,7 @@ This file provides guidance to agents when working with code in this repository.
 - BREWMBLE_TIMEOUT env var accepts both seconds (integer) or humantime format (e.g., "1m", "30s")
 - BREWMBLE_NATIVE_PROGRESS env var controls native terminal progress bars (unset or 1 to enable, 0 to disable); enabled by default
 - Daemon caches 'apt-get update' and 'brew update' results based on their respective update intervals (default 360 mins configured via package_manager.update_interval_mins) - see get_updates()
+- Homebrew refuses to run as root, so `Brew::is_available` reports false when the daemon's effective uid is 0 (and when `brew --version` exits non-zero); on Linux the daemon then falls back to apt
 - Long-running package-manager subprocesses are wrapped in `tokio::task::spawn_blocking` and share an `Arc<dyn CommandRunner>` for testability
 - `brewmbled config validate` checks TLS file presence, certificate/key pair-match, expiry, and required ExtendedKeyUsage (ServerAuth)
 - CLI uses blocking HTTPS client (reqwest with blocking feature and rustls) while daemon uses async Axum framework over HTTPS

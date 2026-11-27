@@ -13,6 +13,8 @@ pub struct Brew {
     pub auto_remove: bool,
     pub last_update: Mutex<Option<Instant>>,
     pub cache_ttl: Duration,
+    /// Homebrew refuses to run as root, so brew is unusable when this is set.
+    pub running_as_root: bool,
 }
 
 impl Brew {
@@ -23,8 +25,14 @@ impl Brew {
             auto_remove,
             last_update: Mutex::new(None),
             cache_ttl: super::cache_ttl(update_interval_mins),
+            running_as_root: running_as_root(),
         }
     }
+}
+
+fn running_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
 }
 
 impl Default for Brew {
@@ -86,7 +94,16 @@ impl PackageManager for Brew {
     }
 
     fn is_available(&self) -> bool {
-        self.run_brew(&["--version"]).is_ok()
+        let Ok(output) = self.run_brew(&["--version"]) else {
+            return false;
+        };
+        if self.running_as_root {
+            warn!(
+                "Homebrew is installed but refuses to run as root; run brewmbled as the user that owns the Homebrew installation"
+            );
+            return false;
+        }
+        output.status.success()
     }
 
     async fn get_updates(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
@@ -285,6 +302,7 @@ mod tests {
             auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
+            running_as_root: false,
         };
         assert_eq!(brew.version(), "Homebrew 3.3.16");
     }
@@ -302,6 +320,7 @@ mod tests {
             auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
+            running_as_root: false,
         };
         let updates = brew.get_updates().await.unwrap();
         assert_eq!(updates, vec!["pkg1", "pkg2"]);
@@ -320,6 +339,7 @@ mod tests {
             auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
+            running_as_root: false,
         };
         let result = brew.get_updates().await;
         assert!(result.is_err());
@@ -339,6 +359,7 @@ mod tests {
             auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
+            running_as_root: false,
         };
         let updates = brew.dry_run_upgrade().await.unwrap();
         assert_eq!(updates, vec!["pkg1", "pkg2"]);
@@ -357,6 +378,7 @@ mod tests {
             auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
+            running_as_root: false,
         };
         assert!(brew.full_upgrade().await.is_ok());
     }
@@ -390,6 +412,7 @@ mod tests {
             auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(60), // 1 minute
+            running_as_root: false,
         };
 
         // First call - should run update
@@ -421,6 +444,7 @@ mod tests {
             auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(0),
+            running_as_root: false,
         };
         let _ = brew2.get_updates().await.unwrap();
         {
@@ -458,6 +482,7 @@ mod tests {
             auto_remove: true,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
+            running_as_root: false,
         };
 
         assert!(brew.full_upgrade().await.is_ok());
@@ -497,6 +522,7 @@ mod tests {
             auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
+            running_as_root: false,
         };
 
         assert!(brew.full_upgrade().await.is_ok());
@@ -544,6 +570,7 @@ mod tests {
             auto_remove: false,
             last_update: Mutex::new(None),
             cache_ttl: Duration::from_secs(360 * 60),
+            running_as_root: false,
         };
 
         assert!(brew.full_upgrade().await.is_ok());
@@ -551,5 +578,53 @@ mod tests {
         let c = calls.lock().unwrap();
         assert!(c.iter().any(|s| s.contains("brew upgrade")));
         assert!(c.iter().any(|s| s.contains("brew cleanup")));
+    }
+
+    fn brew_for_availability(runner: Option<MockRunner>, running_as_root: bool) -> Brew {
+        struct NotFoundRunner;
+        impl CommandRunner for NotFoundRunner {
+            fn run(&self, _program: &str, _args: &[&str]) -> io::Result<Output> {
+                Err(io::Error::new(io::ErrorKind::NotFound, "brew not found"))
+            }
+        }
+        Brew {
+            runner: match runner {
+                Some(runner) => Arc::new(runner),
+                None => Arc::new(NotFoundRunner),
+            },
+            auto_clean: false,
+            auto_remove: false,
+            last_update: Mutex::new(None),
+            cache_ttl: Duration::from_secs(360 * 60),
+            running_as_root,
+        }
+    }
+
+    fn version_runner(success: bool) -> MockRunner {
+        MockRunner {
+            success,
+            stdout: "Homebrew 4.4.0\n".to_string(),
+            stderr: "".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_brew_is_available() {
+        assert!(brew_for_availability(Some(version_runner(true)), false).is_available());
+    }
+
+    #[test]
+    fn test_brew_is_unavailable_when_version_fails() {
+        assert!(!brew_for_availability(Some(version_runner(false)), false).is_available());
+    }
+
+    #[test]
+    fn test_brew_is_unavailable_when_not_installed() {
+        assert!(!brew_for_availability(None, false).is_available());
+    }
+
+    #[test]
+    fn test_brew_is_unavailable_as_root() {
+        assert!(!brew_for_availability(Some(version_runner(true)), true).is_available());
     }
 }
