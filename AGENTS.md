@@ -45,7 +45,7 @@ This file provides guidance to agents when working with code in this repository.
 - Service discovery timeout handling with flume channels (see cli/src/main.rs discover_targets)
 - TabWriter for formatted CLI output with custom padding (2 spaces)
 - IPv6 addresses in URLs must be wrapped in brackets: `http://[::1]:4712` (see resolve_url function)
-- mDNS instance name format: "brewmbled-{hostname}" where hostname is first part before dot
+- mDNS instance name format: "brewmbled-{hostname}" where hostname is first part before dot; when the hostname has more labels, "-{8 hex chars of SHA-256 of the lowercased full hostname}" is appended to avoid collisions (see mdns_instance_name)
 - Daemon uses AtomicBool for is_upgrading state to prevent concurrent upgrades
 - Reboots go through `AppState.reboot` (`RebootState`: Idle/Pending/Rebooting): one pending reboot at a time, `delay_secs` capped at `MAX_REBOOT_DELAY_SECS`, upgrades refused unless Idle, and `run_scheduled_reboot` re-checks the upgrade lock after the delay; `DELETE /node/reboot` cancels
 - Full upgrade spawns tokio task and returns immediately (fire-and-forget pattern)

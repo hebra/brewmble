@@ -753,9 +753,25 @@ fn mdns_properties(hostname: &str) -> Vec<(&str, &str)> {
     vec![("id", hostname), (TXT_TLS, TXT_TLS_VALUE)]
 }
 
+/// mDNS instance name: `brewmbled-{first label}`, plus a short hash of the full
+/// hostname when it has more labels, so `node1.a.example` and `node1.b.example`
+/// don't collide on the same LAN.
+fn mdns_instance_name(hostname: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let hostname = hostname.trim_end_matches('.');
+    match hostname.split_once('.') {
+        Some((first_label, _)) => {
+            let digest = Sha256::digest(hostname.to_ascii_lowercase().as_bytes());
+            let suffix: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+            format!("brewmbled-{first_label}-{suffix}")
+        }
+        None => format!("brewmbled-{hostname}"),
+    }
+}
+
 fn mdns_host_name(hostname: &str) -> String {
-    let instance_hostname = hostname.split('.').next().unwrap_or(hostname);
-    format!("brewmbled-{instance_hostname}.local.")
+    format!("{}.local.", mdns_instance_name(hostname))
 }
 
 fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<ServiceDaemon> {
@@ -770,8 +786,7 @@ fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<S
         }
     };
 
-    let instance_hostname = hostname.split('.').next().unwrap_or(hostname);
-    let instance = format!("brewmbled-{instance_hostname}");
+    let instance = mdns_instance_name(hostname);
     let host_name = mdns_host_name(hostname);
     let properties = mdns_properties(hostname);
 
@@ -1941,7 +1956,29 @@ mod tests {
         assert_eq!(mdns_host_name("node1"), "brewmbled-node1.local.");
         assert_eq!(
             mdns_host_name("node1.example.com"),
-            "brewmbled-node1.local."
+            format!("{}.local.", mdns_instance_name("node1.example.com"))
+        );
+    }
+
+    #[test]
+    fn test_mdns_instance_name() {
+        assert_eq!(mdns_instance_name("node1"), "brewmbled-node1");
+        assert_eq!(mdns_instance_name("node1."), "brewmbled-node1");
+
+        let a = mdns_instance_name("node1.rack-a.example");
+        let b = mdns_instance_name("node1.rack-b.example");
+        assert_ne!(a, b, "hosts sharing a first label must not collide");
+        for name in [&a, &b] {
+            let suffix = name.strip_prefix("brewmbled-node1-").unwrap();
+            assert_eq!(suffix.len(), 8);
+            assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+
+        assert_eq!(a, mdns_instance_name("node1.rack-a.example."));
+        assert_eq!(
+            a,
+            mdns_instance_name("node1.Rack-A.Example"),
+            "the hash ignores DNS case"
         );
     }
 
