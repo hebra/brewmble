@@ -29,7 +29,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod client_auth;
 pub mod config;
 mod package_manager;
+mod update_cache;
 use package_manager::{PackageManager, get_package_manager};
+use update_cache::{UpdateCache, UpdateStatus};
 
 const DEFAULT_PORT: u16 = 4712;
 
@@ -202,6 +204,7 @@ struct AppState {
     pm_version: String,
     upgrade_handle: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
     reboot: Arc<std::sync::Mutex<RebootState>>,
+    updates: UpdateCache,
 }
 
 /// Longest delay a client may request before a scheduled reboot.
@@ -337,22 +340,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let package_manager: Arc<Box<dyn PackageManager>> = Arc::new(pm);
+    let updates = UpdateCache::default();
+    if pm_available {
+        tokio::spawn(updates.clone().run_refresh_loop(
+            package_manager.clone(),
+            update_cache::refresh_interval(daemon_config.package_manager.update_interval_mins),
+        ));
+    }
+
     let state = AppState {
         is_upgrading: Arc::new(AtomicBool::new(false)),
         allow_reboot: daemon_config.features.allow_reboot,
         auto_clean: daemon_config.features.auto_clean,
         auto_remove: daemon_config.features.auto_remove,
-        package_manager: Arc::new(pm),
+        package_manager,
         pm_available,
         pm_version,
         upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
         reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+        updates,
     };
     let shutdown_state = state.clone();
 
     // A 408 only drops the request future; package-manager commands already
     // running in `spawn_blocking` (and `sudo apt-get` children) keep going.
-    // Apt update checks run as a shared task that later requests join.
+    // `/status` only reads the background update check; dry-run apt checks
+    // run as a shared task that later requests join.
     let app = build_router(state, client_access).layer((
         TraceLayer::new_for_http(),
         TimeoutLayer::with_status_code(
@@ -439,8 +453,20 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         );
     }
 
-    match state.package_manager.get_updates().await {
-        Ok(updates) => {
+    match state.updates.status() {
+        UpdateStatus::Pending => (
+            StatusCode::OK,
+            Json(StatusResponse {
+                message: "First update check is still running".to_string(),
+                updates: Vec::new(),
+                is_upgrading,
+                daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                allow_reboot: config_flags.0,
+                auto_clean: config_flags.1,
+                auto_remove: config_flags.2,
+            }),
+        ),
+        UpdateStatus::Ready(updates) => {
             let count = updates.len();
             let message = if count == 0 {
                 "System is up to date".to_string()
@@ -460,7 +486,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
                 }),
             )
         }
-        Err(err) => (
+        UpdateStatus::Failed(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(StatusResponse {
                 message: format!("Failed to check for updates: {}", err),
@@ -551,6 +577,7 @@ async fn full_upgrade_handler(
         if let Err(e) = result {
             error!("failed to execute full upgrade: {e}");
         }
+        state.updates.request_refresh();
     });
 
     if let Ok(mut guard) = state.upgrade_handle.lock() {
@@ -978,7 +1005,11 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
+        state
+            .updates
+            .set(UpdateStatus::Ready(vec!["pkg1".to_string()]));
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
             .with_state(state);
@@ -1015,6 +1046,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -1051,6 +1083,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
         let app = Router::new()
             .route(PATH_HEALTH, get(health_handler))
@@ -1088,6 +1121,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
         let app = Router::new()
             .route(PATH_UPGRADE, post(full_upgrade_handler))
@@ -1125,6 +1159,7 @@ mod tests {
                 pm_version: "test".to_string(),
                 upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
                 reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+                updates: UpdateCache::default(),
             };
             let app = Router::new()
                 .route("/status", get(status_handler))
@@ -1232,6 +1267,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
         let app = Router::new()
             .route(PATH_UPGRADE, post(full_upgrade_handler))
@@ -1279,6 +1315,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -1316,6 +1353,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -1353,6 +1391,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
         let app = Router::new()
             .route(PATH_REBOOT, post(reboot_handler))
@@ -1557,6 +1596,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         }
     }
 
@@ -1666,6 +1706,72 @@ mod tests {
         );
     }
 
+    async fn status_for(update_status: Option<UpdateStatus>) -> (StatusCode, StatusResponse) {
+        let state = router_test_state();
+        if let Some(update_status) = update_status {
+            state.updates.set(update_status);
+        }
+        let app = Router::new()
+            .route(PATH_STATUS, get(status_handler))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(PATH_STATUS)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let code = response.status();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        (code, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_status_handler_reads_background_check_only() {
+        // The mock package manager would report "pkg1"; /status must not call it.
+        let (code, status) = status_for(None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(status.updates.is_empty());
+        assert_eq!(status.message, "First update check is still running");
+
+        let (code, status) = status_for(Some(UpdateStatus::Ready(vec![]))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(status.message, "System is up to date");
+
+        let (code, status) =
+            status_for(Some(UpdateStatus::Ready(vec!["a".into(), "b".into()]))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(status.updates, vec!["a", "b"]);
+        assert_eq!(status.message, "System has 2 outdated packages");
+
+        let (code, status) = status_for(Some(UpdateStatus::Failed("boom".into()))).await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status.message, "Failed to check for updates: boom");
+    }
+
+    #[tokio::test]
+    async fn test_full_upgrade_requests_update_refresh() {
+        let state = router_test_state();
+        let (status, _) = full_upgrade_handler(
+            State(state.clone()),
+            Json(UpgradeRequest { dry_run: false }),
+        )
+        .await
+        .into_response()
+        .into_parts();
+        assert_eq!(status.status, StatusCode::OK);
+        let handle = state.upgrade_handle.lock().unwrap().take().unwrap();
+        handle.await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.updates.refresh_requested(),
+        )
+        .await
+        .expect("upgrade should request an update check");
+    }
+
     #[tokio::test]
     async fn test_status_handler_exposes_config_flags() {
         let state = AppState {
@@ -1681,6 +1787,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
         let app = Router::new()
             .route(PATH_STATUS, get(status_handler))
@@ -1836,6 +1943,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
 
         assert!(state.allow_reboot);
@@ -1962,6 +2070,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         }
     }
 
@@ -2138,6 +2247,7 @@ mod tests {
             pm_version: "1.0.0".to_string(),
             upgrade_handle: Arc::new(std::sync::Mutex::new(None)),
             reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+            updates: UpdateCache::default(),
         };
         let access = client_auth::ClientAccess::default();
         let app = build_router(state, access.clone());
