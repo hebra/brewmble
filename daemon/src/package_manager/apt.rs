@@ -28,7 +28,7 @@ impl Apt {
             #[cfg(any(target_os = "linux", test))]
             last_update: Mutex::new(None),
             #[cfg(any(target_os = "linux", test))]
-            cache_ttl: Duration::from_secs(update_interval_mins * 60),
+            cache_ttl: super::cache_ttl(update_interval_mins),
         }
     }
 
@@ -539,6 +539,18 @@ mod tests {
         assert_eq!(apt_default.cache_ttl, Duration::from_secs(360 * 60));
         assert!(!apt_default.auto_clean);
         assert!(!apt_default.auto_remove);
+    }
+
+    #[test]
+    fn test_cache_ttl_saturates_instead_of_overflowing() {
+        assert_eq!(super::super::cache_ttl(0), Duration::ZERO);
+        assert_eq!(super::super::cache_ttl(2), Duration::from_secs(120));
+        assert_eq!(
+            super::super::cache_ttl(u64::MAX / 60),
+            Duration::from_secs(u64::MAX / 60 * 60)
+        );
+        assert_eq!(super::super::cache_ttl(u64::MAX / 60 + 1), Duration::MAX);
+        assert_eq!(Apt::new(false, false, u64::MAX).cache_ttl, Duration::MAX);
     }
 
     #[tokio::test]
