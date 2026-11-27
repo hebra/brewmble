@@ -42,18 +42,6 @@ impl Apt {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
     }
-
-    async fn run_async_with_env(
-        &self,
-        program: &'static str,
-        args: &'static [&'static str],
-        env: Vec<(String, String)>,
-    ) -> io::Result<Output> {
-        let runner = self.runner.clone();
-        tokio::task::spawn_blocking(move || runner.run_with_env(program, args, &env))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-    }
 }
 
 impl Default for Apt {
@@ -61,6 +49,18 @@ impl Default for Apt {
         Self::new(false, false, 360)
     }
 }
+
+pub(crate) const FULL_UPGRADE_SUDO_ARGS: &[&str] = &[
+    "/usr/bin/env",
+    "DEBIAN_FRONTEND=noninteractive",
+    "/usr/bin/apt-get",
+    "dist-upgrade",
+    "-y",
+    "-o",
+    "Dpkg::Options::=--force-confdef",
+    "-o",
+    "Dpkg::Options::=--force-confold",
+];
 
 #[async_trait]
 impl PackageManager for Apt {
@@ -117,22 +117,9 @@ impl PackageManager for Apt {
 
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("starting apt full upgrade");
-        let env = vec![("DEBIAN_FRONTEND".to_string(), "noninteractive".to_string())];
-        let output = self
-            .run_async_with_env(
-                "sudo",
-                &[
-                    "apt-get",
-                    "dist-upgrade",
-                    "-y",
-                    "-o",
-                    "Dpkg::Options::=--force-confdef",
-                    "-o",
-                    "Dpkg::Options::=--force-confold",
-                ],
-                env,
-            )
-            .await;
+        // sudo's env_reset drops variables set on the sudo process itself, so
+        // DEBIAN_FRONTEND is passed through `env` as part of the sudoers command.
+        let output = self.run_async("sudo", FULL_UPGRADE_SUDO_ARGS).await;
 
         match output {
             Ok(output) => {
@@ -666,7 +653,7 @@ Inst
         assert!(apt.full_upgrade().await.is_ok());
 
         let c = calls.lock().unwrap();
-        assert!(c.iter().any(|s| s == "sudo apt-get dist-upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"));
+        assert!(c.iter().any(|s| s == "sudo /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get dist-upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"));
         assert!(c.iter().any(|s| s.contains("apt-get autoclean")));
         assert!(c.iter().any(|s| s.contains("apt-get autoremove")));
     }
@@ -754,5 +741,19 @@ Inst
         let c = calls.lock().unwrap();
         assert!(c.iter().any(|s| s.contains("apt-get dist-upgrade")));
         assert!(c.iter().any(|s| s.contains("apt-get autoclean")));
+    }
+
+    #[test]
+    fn test_full_upgrade_passes_debian_frontend_on_sudo_command_line() {
+        // A variable set on the sudo process is dropped by env_reset; it must be
+        // part of the argv that sudo runs.
+        assert_eq!(
+            &FULL_UPGRADE_SUDO_ARGS[..3],
+            &[
+                "/usr/bin/env",
+                "DEBIAN_FRONTEND=noninteractive",
+                "/usr/bin/apt-get"
+            ]
+        );
     }
 }

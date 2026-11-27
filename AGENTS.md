@@ -36,6 +36,7 @@ This file provides guidance to agents when working with code in this repository.
 - CLI migration uses top-level `brewmble export`/`import` commands with passphrase-encrypted age files containing all profiles, pins, and global keyring credentials; imports replace rather than merge state unless run with `--dry-run`
 - Reboot feature invokes `/usr/bin/sudo -n /usr/bin/systemctl reboot` with fallback to `/usr/sbin/reboot`; configure a narrow sudoers rule for the daemon user
 - Linux package management uses `apt-get` via `sudo`, including `dist-upgrade` for full upgrades; sudoers rules must match the documented absolute paths and exact arguments
+- sudo's `env_reset` drops variables set on the sudo process (`Command::env`), so pass required variables as part of the sudo command line via `/usr/bin/env VAR=value /usr/bin/<cmd>` (see `FULL_UPGRADE_SUDO_ARGS` in apt.rs) and document the exact entry in daemon/README.md
 - The systemd unit must keep `NoNewPrivileges=false` and leave `CapabilityBoundingSet` unrestricted; restricting either prevents sudo elevation, and an empty capability set can make sudo-rs panic
 
 ## Project Coding Rules (Non-Obvious Only)

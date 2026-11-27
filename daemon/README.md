@@ -249,7 +249,7 @@ The `brewmbled` daemon runs as the `brewmble` user but needs to perform package 
 
 2. **Add the following content**:
    ```text
-   brewmble ALL=(root) NOPASSWD: /usr/bin/apt-get update, /usr/bin/apt-get -s dist-upgrade, /usr/bin/apt-get dist-upgrade -y -o Dpkg\:\:Options\:\:=--force-confdef -o Dpkg\:\:Options\:\:=--force-confold, /usr/bin/apt-get autoclean, /usr/bin/apt-get autoremove -y, /usr/bin/systemctl reboot, /usr/sbin/reboot
+   brewmble ALL=(root) NOPASSWD: /usr/bin/apt-get update, /usr/bin/apt-get -s dist-upgrade, /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get dist-upgrade -y -o Dpkg\:\:Options\:\:=--force-confdef -o Dpkg\:\:Options\:\:=--force-confold, /usr/bin/apt-get autoclean, /usr/bin/apt-get autoremove -y, /usr/bin/systemctl reboot, /usr/sbin/reboot
    ```
 
    Sudoers matches the resolved binary path and arguments exactly; for example,
@@ -258,6 +258,14 @@ The `brewmbled` daemon runs as the `brewmble` user but needs to perform package 
    validate the file before saving. Existing deployments upgrading from a
    release that used `apt full-upgrade` must update this rule before triggering
    their next upgrade.
+
+   The full upgrade runs through `/usr/bin/env` so that
+   `DEBIAN_FRONTEND=noninteractive` survives sudo's `env_reset`; without it,
+   debconf can stop at an interactive prompt and the upgrade hangs. Deployments
+   upgrading from a release that ran `sudo apt-get dist-upgrade ...` directly must
+   replace that entry with the `/usr/bin/env ...` one above. Do not grant `SETENV`
+   or a bare `/usr/bin/env` entry instead: either lets the daemon user set
+   arbitrary environment variables or run any command as root.
 
 3. **Set correct permissions**:
    The file must be owned by `root:root` and have strict permissions:

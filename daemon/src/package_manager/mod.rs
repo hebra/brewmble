@@ -26,15 +26,6 @@ pub trait PackageManager: Send + Sync {
 
 pub trait CommandRunner: Send + Sync {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Output>;
-
-    fn run_with_env(
-        &self,
-        program: &str,
-        args: &[&str],
-        _env: &[(String, String)],
-    ) -> io::Result<Output> {
-        self.run(program, args)
-    }
 }
 
 pub struct RealCommandRunner;
@@ -42,20 +33,6 @@ pub struct RealCommandRunner;
 impl CommandRunner for RealCommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
         Command::new(program).args(args).output()
-    }
-
-    fn run_with_env(
-        &self,
-        program: &str,
-        args: &[&str],
-        env: &[(String, String)],
-    ) -> io::Result<Output> {
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        cmd.output()
     }
 }
 
