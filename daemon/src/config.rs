@@ -57,24 +57,56 @@ pub struct TlsConfig {
     pub ca_cert: PathBuf,
     pub cert: PathBuf,
     pub key: PathBuf,
-    /// SHA-256 fingerprints of the client certificates allowed to call the API.
-    /// When unset, every client certificate signed by the cluster CA is accepted.
-    /// A key with no value (`allowed_clients:`) is an empty list and rejects every client.
+    /// SHA-256 fingerprints of the client certificates allowed to call the API,
+    /// or `"*"` to accept every client certificate signed by the cluster CA.
+    /// When unset or empty (`allowed_clients:`), every client is rejected.
     #[serde(
         default,
-        deserialize_with = "deserialize_present_list",
+        deserialize_with = "deserialize_allowed_clients",
+        serialize_with = "serialize_allowed_clients",
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_clients: Option<Vec<String>>,
 }
 
-fn deserialize_present_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+/// `tls.allowed_clients` value that accepts any client certificate signed by the cluster CA.
+pub const ALLOW_ANY_CLIENT: &str = "*";
+
+fn deserialize_allowed_clients<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Some(
-        Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default(),
-    ))
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ListOrAny {
+        List(Option<Vec<String>>),
+        Any(String),
+    }
+
+    match ListOrAny::deserialize(deserializer)? {
+        ListOrAny::List(list) => Ok(Some(list.unwrap_or_default())),
+        ListOrAny::Any(value) if value.trim() == ALLOW_ANY_CLIENT => {
+            Ok(Some(vec![ALLOW_ANY_CLIENT.to_string()]))
+        }
+        ListOrAny::Any(value) => Err(serde::de::Error::custom(format!(
+            "tls.allowed_clients must be a list of fingerprints or \"{ALLOW_ANY_CLIENT}\", got '{value}'"
+        ))),
+    }
+}
+
+fn serialize_allowed_clients<S>(
+    value: &Option<Vec<String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value.as_deref() {
+        Some([entry]) if entry.trim() == ALLOW_ANY_CLIENT => {
+            serializer.serialize_str(ALLOW_ANY_CLIENT)
+        }
+        _ => value.serialize(serializer),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -229,13 +261,22 @@ pub fn load_config(path: &Path) -> Result<DaemonConfig, ConfigError> {
     Ok(config)
 }
 
-/// Parses `tls.allowed_clients` into normalized fingerprints.
+/// Parses `tls.allowed_clients` into normalized fingerprints. Returns `None` for
+/// `"*"` (any client signed by the cluster CA) and an empty set when it is unset.
 pub fn allowed_client_fingerprints(
     tls: &TlsConfig,
 ) -> Result<Option<HashSet<String>>, ConfigError> {
     let Some(entries) = &tls.allowed_clients else {
-        return Ok(None);
+        return Ok(Some(HashSet::new()));
     };
+    if entries.iter().any(|e| e.trim() == ALLOW_ANY_CLIENT) {
+        if entries.len() == 1 {
+            return Ok(None);
+        }
+        return Err(ConfigError::Validation(vec![format!(
+            "tls.allowed_clients: \"{ALLOW_ANY_CLIENT}\" cannot be combined with fingerprints"
+        )]));
+    }
     let mut invalid = Vec::new();
     let mut allowed = HashSet::new();
     for entry in entries {
@@ -287,9 +328,11 @@ tls:
   # SHA-256 fingerprints of the client certificates allowed to call the API, as printed
   # by `brewmble cert issue --kind client`. Remove an entry and reload the daemon
   # (SIGHUP, e.g. `systemctl reload brewmbled`) to revoke that certificate.
-  # If omitted, any client certificate signed by the cluster CA is accepted.
+  # If omitted or empty, every client is rejected. Set it to "*" to accept any client
+  # certificate signed by the cluster CA (the daemon logs a warning).
   # allowed_clients:
   #   - "ab:cd:...:ef"
+  # allowed_clients: "*"
 
 features:
   # Allow the daemon to reboot the host when requested via the API (default: false)
@@ -353,6 +396,9 @@ pub fn init_config_file(path: &Path, force: bool) -> Result<(), Box<dyn std::err
     write_config_atomically(path, default_config_template())?;
     Ok(())
 }
+pub const ANY_CLIENT_WARNING: &str = "tls.allowed_clients is \"*\"; the daemon accepts any client certificate signed by the cluster CA";
+pub const UNSET_ALLOW_LIST_WARNING: &str = "tls.allowed_clients is not set; every client request will be rejected (list client fingerprints, or set it to \"*\" to accept any client certificate signed by the cluster CA)";
+
 pub fn validate_config(config: &DaemonConfig) -> ValidationReport {
     let mut report = ValidationReport::default();
 
@@ -363,10 +409,10 @@ pub fn validate_config(config: &DaemonConfig) -> ValidationReport {
     }
 
     match allowed_client_fingerprints(&config.tls) {
-        Ok(None) => report.warnings.push(
-            "tls.allowed_clients is not set; any client certificate signed by the cluster CA is accepted"
-                .to_string(),
-        ),
+        Ok(None) => report.warnings.push(ANY_CLIENT_WARNING.to_string()),
+        Ok(Some(_)) if config.tls.allowed_clients.is_none() => {
+            report.warnings.push(UNSET_ALLOW_LIST_WARNING.to_string())
+        }
         Ok(Some(allowed)) if allowed.is_empty() => report.warnings.push(
             "tls.allowed_clients is empty; every client request will be rejected".to_string(),
         ),
@@ -761,13 +807,31 @@ server:
         let normalized = (0..32).map(|_| "ab").collect::<Vec<_>>().join(":");
 
         let config = config_with_allowed_clients(None);
-        assert_eq!(allowed_client_fingerprints(&config.tls).unwrap(), None);
+        assert_eq!(
+            allowed_client_fingerprints(&config.tls).unwrap(),
+            Some(HashSet::new())
+        );
         let report = validate_config(&config);
         assert!(
             report
                 .warnings
+                .contains(&UNSET_ALLOW_LIST_WARNING.to_string())
+        );
+
+        let config = config_with_allowed_clients(Some(vec!["*"]));
+        assert_eq!(allowed_client_fingerprints(&config.tls).unwrap(), None);
+        let report = validate_config(&config);
+        assert!(report.warnings.contains(&ANY_CLIENT_WARNING.to_string()));
+        assert!(!report.errors.iter().any(|e| e.contains("allowed_clients")));
+
+        let config = config_with_allowed_clients(Some(vec!["*", &fp]));
+        assert!(allowed_client_fingerprints(&config.tls).is_err());
+        let report = validate_config(&config);
+        assert!(
+            report
+                .errors
                 .iter()
-                .any(|w| w.contains("allowed_clients is not set"))
+                .any(|e| e.contains("cannot be combined with fingerprints"))
         );
 
         let config = config_with_allowed_clients(Some(vec![]));
@@ -821,6 +885,39 @@ server:
         let config = config_with_allowed_clients(None);
         let yaml = serde_yaml_ng::to_string(&config).unwrap();
         assert!(!yaml.contains("allowed_clients"));
+    }
+
+    #[test]
+    fn test_allowed_clients_any_sentinel() {
+        let base = "tls:\n  ca_cert: /ca.pem\n  cert: /c.pem\n  key: /k.pem\n";
+        for value in ["\"*\"", "'*'", "[\"*\"]"] {
+            let config: DaemonConfig =
+                serde_yaml_ng::from_str(&format!("{base}  allowed_clients: {value}\n")).unwrap();
+            assert_eq!(config.tls.allowed_clients, Some(vec!["*".to_string()]));
+            assert_eq!(allowed_client_fingerprints(&config.tls).unwrap(), None);
+
+            let yaml = serde_yaml_ng::to_string(&config).unwrap();
+            assert!(yaml.contains("allowed_clients: '*'"), "{yaml}");
+            let reparsed: DaemonConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(reparsed, config);
+        }
+
+        let err = serde_yaml_ng::from_str::<DaemonConfig>(&format!(
+            "{base}  allowed_clients: everyone\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("got 'everyone'"), "{err}");
+    }
+
+    #[test]
+    fn test_default_template_rejects_all_clients() {
+        let config: DaemonConfig = serde_yaml_ng::from_str(default_config_template()).unwrap();
+        assert_eq!(config.tls.allowed_clients, None);
+        assert_eq!(
+            allowed_client_fingerprints(&config.tls).unwrap(),
+            Some(HashSet::new())
+        );
+        assert!(default_config_template().contains("# allowed_clients: \"*\""));
     }
 
     #[test]

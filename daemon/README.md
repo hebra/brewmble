@@ -344,9 +344,9 @@ tls:
   key: "/etc/brewmble/tls/daemon-key.pem"
 
   # SHA-256 fingerprints of the client certificates allowed to call the API
-  # (as printed by `brewmble cert issue --kind client`). Optional; if omitted,
-  # any client certificate signed by the cluster CA is accepted.
-  # Reload the daemon (SIGHUP) after editing this list.
+  # (as printed by `brewmble cert issue --kind client`). If omitted or empty,
+  # every client is rejected; set `allowed_clients: "*"` to accept any client
+  # certificate signed by the cluster CA. Reload the daemon (SIGHUP) after editing.
   allowed_clients:
     - "ab:cd:...:ef"
 
@@ -373,7 +373,7 @@ All API endpoints require a valid client certificate signed by the cluster CA. T
 
 Each request is then authorized against the client certificate:
 
-- **Allow-list**: If `tls.allowed_clients` is set, only certificates whose SHA-256 fingerprint is listed are accepted; others get `403 Forbidden`. Remove a fingerprint and reload the daemon (`systemctl reload brewmbled` or `kill -HUP <pid>`) to revoke that certificate. If the reloaded file is invalid, the daemon logs an error and keeps the previous list.
+- **Allow-list**: Only certificates whose SHA-256 fingerprint is listed in `tls.allowed_clients` are accepted; others get `403 Forbidden`. If the key is missing or empty, every client is rejected. `allowed_clients: "*"` accepts any certificate signed by the cluster CA, and the daemon logs a warning when it loads that setting. Remove a fingerprint and reload the daemon (`systemctl reload brewmbled` or `kill -HUP <pid>`) to revoke that certificate; removing the whole key on reload rejects every client rather than opening access. If the reloaded file is invalid, the daemon logs an error and keeps the previous list.
 - **Roles**: The role in the certificate subject (`OU=brewmble-role:<role>`, set by `brewmble cert issue --kind client --role <role>`) decides which endpoints it may call:
 
   | Endpoint | `read` | `operator` |

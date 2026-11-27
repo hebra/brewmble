@@ -52,7 +52,7 @@ Communication between the CLI and Daemon occurs over HTTPS using a RESTful API s
 ### Authentication
 Security is handled exclusively via mutual TLS (mTLS); there are no API keys.
 - **Cluster CA**: The CLI manages a single self-signed cluster CA stored in the OS keyring (`brewmble ca init`).
-- **Daemon**: Reads the paths to the cluster CA certificate, its own certificate, and its private key from the `tls:` section of `brewmbled.yaml`. It serves HTTPS and requires a client certificate signed by the cluster CA. Each request is then checked against the optional `tls.allowed_clients` fingerprint list (reloaded on `SIGHUP`) and against the role in the certificate subject (`OU=brewmble-role:read|operator`): `read` covers `/health` and `/status`, `operator` also covers upgrade and reboot.
+- **Daemon**: Reads the paths to the cluster CA certificate, its own certificate, and its private key from the `tls:` section of `brewmbled.yaml`. It serves HTTPS and requires a client certificate signed by the cluster CA. Each request is then checked against the `tls.allowed_clients` fingerprint list (reloaded on `SIGHUP`; unset rejects every client, `"*"` accepts any CA-signed client) and against the role in the certificate subject (`OU=brewmble-role:read|operator`): `read` covers `/health` and `/status`, `operator` also covers upgrade and reboot.
 - **CLI**: Uses its own client certificate from the keyring (`brewmble cert issue --kind client`) to connect to every daemon. Hostname verification is disabled; only the CA chain is checked.
 - **Behavior**: If the client cannot present a valid certificate, the TLS handshake fails before any HTTP request is made.
 
@@ -78,7 +78,7 @@ Security is handled exclusively via mutual TLS (mTLS); there are no API keys.
 ### Upgrade Flow
 1. User executes `brewmble node --full-upgrade <node>`.
 2. CLI sends a `POST /packages/full-upgrade` request to the target daemon with a JSON body: `{"dry_run": false}`.
-3. The TLS handshake authenticates the CLI's client certificate against the cluster CA; the daemon then checks the certificate's fingerprint against `tls.allowed_clients` (if set) and requires the `operator` role.
+3. The TLS handshake authenticates the CLI's client certificate against the cluster CA; the daemon then checks the certificate's fingerprint against `tls.allowed_clients` (unless it is `"*"`) and requires the `operator` role.
 4. If `dry_run` is `true`, the daemon simulates the upgrade and returns the list of packages that would be changed.
 5. If `dry_run` is `false`, the daemon sets an `is_upgrading` flag (AtomicBool) to prevent concurrent upgrades.
 6. Daemon spawns a background task to perform the upgrade (e.g., `apt-get dist-upgrade -y` or `brew upgrade`), optionally followed by `autoclean`/`autoremove` cleanup steps.

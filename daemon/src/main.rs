@@ -288,12 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Loaded configuration from {}", config_path.display());
 
     let allowed_clients = config::allowed_client_fingerprints(&daemon_config.tls)?;
-    match &allowed_clients {
-        Some(list) => info!("client allow-list active: {} certificate(s)", list.len()),
-        None => warn!(
-            "tls.allowed_clients is not set; any client certificate signed by the cluster CA is accepted"
-        ),
-    }
+    client_auth::log_allow_list("active", &daemon_config.tls, &allowed_clients);
     let client_access = client_auth::ClientAccess::new(allowed_clients);
     #[cfg(unix)]
     client_auth::spawn_reload_on_sighup(config_path.clone(), client_access.clone());
