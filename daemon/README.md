@@ -448,6 +448,8 @@ curl --cert client.pem --key client-key.pem --cacert ca.pem \
 - `412 PRECONDITION_FAILED`: The detected package manager is not available on this system (e.g., no `apt` or `brew` found).
 - `500 INTERNAL_SERVER_ERROR`: Checking for updates failed.
 
+Requests that take longer than 300 seconds get `408 REQUEST_TIMEOUT`, but the timeout doesn't stop the package-manager commands already running. On apt, `/status` and dry-run requests share one running update check (`apt-get update` when the cache is stale, then `apt-get -s dist-upgrade`). A request that arrives while a check is running, including a retry after a 408, waits for that check instead of starting another one.
+
 ### `POST /packages/full-upgrade`
 
 Triggers a full system upgrade (e.g., `apt-get dist-upgrade -y` or `brew upgrade`). This operation is asynchronous; the endpoint returns immediately while the upgrade runs in the background.

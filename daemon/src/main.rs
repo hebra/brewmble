@@ -355,6 +355,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let shutdown_state = state.clone();
 
+    // A 408 only drops the request future; package-manager commands already
+    // running in `spawn_blocking` (and `sudo apt-get` children) keep going.
+    // Apt update checks run as a shared task that later requests join.
     let app = build_router(state, client_access).layer((
         TraceLayer::new_for_http(),
         TimeoutLayer::with_status_code(
