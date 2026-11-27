@@ -381,17 +381,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("https server error: {err}");
     }
 
-    if let Ok(mut guard) = shutdown_state.upgrade_handle.lock() {
-        if let Some(handle) = guard.take() {
-            let abort_handle = handle.abort_handle();
-            let timeout = tokio::time::Duration::from_secs(30);
-            match tokio::time::timeout(timeout, handle).await {
-                Ok(Ok(())) => info!("upgrade task finished cleanly"),
-                Ok(Err(e)) => error!("upgrade task panicked or was cancelled: {e}"),
-                Err(_) => {
-                    abort_handle.abort();
-                    error!("upgrade task did not finish in time; aborted");
-                }
+    let upgrade_handle = shutdown_state
+        .upgrade_handle
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(handle) = upgrade_handle {
+        let abort_handle = handle.abort_handle();
+        let timeout = tokio::time::Duration::from_secs(30);
+        match tokio::time::timeout(timeout, handle).await {
+            Ok(Ok(())) => info!("upgrade task finished cleanly"),
+            Ok(Err(e)) => error!("upgrade task panicked or was cancelled: {e}"),
+            Err(_) => {
+                abort_handle.abort();
+                error!("upgrade task did not finish in time; aborted");
             }
         }
     }
@@ -555,9 +558,10 @@ async fn full_upgrade_handler(
         }
     });
 
-    if let Ok(mut guard) = state.upgrade_handle.lock() {
-        *guard = Some(handle);
-    }
+    *state
+        .upgrade_handle
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(handle);
 
     (
         StatusCode::OK,
@@ -1117,6 +1121,59 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_full_upgrade_handler_records_handle_when_mutex_poisoned() {
+        let upgrade_handle: Arc<std::sync::Mutex<Option<JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let poisoner = upgrade_handle.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison upgrade_handle");
+        })
+        .join();
+        assert!(upgrade_handle.is_poisoned());
+
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+            allow_reboot: false,
+            auto_clean: false,
+            auto_remove: false,
+            package_manager: Arc::new(Box::new(MockPackageManager {
+                name: "mock".to_string(),
+                available: true,
+            })),
+            pm_available: true,
+            pm_version: "1.0.0".to_string(),
+            upgrade_handle: upgrade_handle.clone(),
+            reboot: Arc::new(std::sync::Mutex::new(RebootState::Idle)),
+        };
+        let app = Router::new()
+            .route(PATH_UPGRADE, post(full_upgrade_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(PATH_UPGRADE)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&UpgradeRequest { dry_run: false }).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let handle = upgrade_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .expect("upgrade task handle must be recorded so shutdown can await it");
+        handle.await.unwrap();
     }
 
     #[tokio::test]
