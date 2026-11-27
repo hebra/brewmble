@@ -840,6 +840,19 @@ fn build_router(state: AppState, access: client_auth::ClientAccess) -> Router {
     read_routes.merge(operator_routes).with_state(state)
 }
 
+/// Trust anchors for client certificates: every certificate in the CA PEM bundle,
+/// so clients issued by any CA in it (e.g. during CA rotation) are accepted.
+fn client_ca_roots(ca_pem: &str) -> Result<rustls::RootCertStore, Box<dyn std::error::Error>> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()) {
+        roots.add(cert.map_err(|e| format!("failed to parse CA cert: {e}"))?)?;
+    }
+    if roots.is_empty() {
+        return Err("CA cert file is empty".into());
+    }
+    Ok(roots)
+}
+
 pub(crate) fn load_tls_config(
     ca_path: &Path,
     cert_path: &Path,
@@ -860,13 +873,7 @@ pub(crate) fn load_tls_config(
         )
     })?;
 
-    let ca_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("failed to parse CA cert: {e}"))?;
-    let ca_cert = ca_certs.into_iter().next().ok_or("CA cert file is empty")?;
-
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca_cert)?;
+    let roots = client_ca_roots(&ca_pem)?;
 
     let daemon_certs: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_pem.as_bytes())
@@ -1906,6 +1913,47 @@ mod tests {
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_client_ca_roots_trusts_every_ca_in_bundle() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (old_ca, _) = generate_test_ca("old-ca");
+        // generate_test_leaf issues from an issuer named "test-ca".
+        let (new_ca, new_key) = generate_test_ca("test-ca");
+        let (client_cert, _) = generate_test_leaf(
+            "test-client",
+            &new_ca,
+            &new_key,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        );
+
+        let roots = client_ca_roots(&format!("{old_ca}{new_ca}")).unwrap();
+        assert_eq!(roots.len(), 2);
+
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let client_der = rustls_pemfile::certs(&mut client_cert.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        verifier
+            .verify_client_cert(&client_der, &[], rustls::pki_types::UnixTime::now())
+            .expect("client issued by the second CA in the bundle must be trusted");
+
+        let only_old = rustls::server::WebPkiClientVerifier::builder(Arc::new(
+            client_ca_roots(&old_ca).unwrap(),
+        ))
+        .build()
+        .unwrap();
+        assert!(
+            only_old
+                .verify_client_cert(&client_der, &[], rustls::pki_types::UnixTime::now())
+                .is_err()
+        );
+
+        assert!(client_ca_roots("").is_err());
     }
 
     fn generate_test_ca(cn: &str) -> (String, String) {
