@@ -363,7 +363,8 @@ features:
 
 # Package manager backend caching
 package_manager:
-  # Cache update interval in minutes (default: 360, set to 0 to update on every status check)
+  # Minutes between background update checks; GET /status returns the latest result
+  # (default: 360, minimum: 1)
   update_interval_mins: 360
 ```
 
@@ -444,11 +445,13 @@ curl --cert client.pem --key client-key.pem --cacert ca.pem \
 
 **Status codes:**
 
-- `200 OK`: Status returned.
+- `200 OK`: Status returned. Until the first background check after startup finishes, `updates` is empty and `message` is `First update check is still running`.
 - `412 PRECONDITION_FAILED`: The detected package manager is not available on this system (e.g., no `apt` or `brew` found).
-- `500 INTERNAL_SERVER_ERROR`: Checking for updates failed.
+- `500 INTERNAL_SERVER_ERROR`: The latest background update check failed.
 
-Requests that take longer than 300 seconds get `408 REQUEST_TIMEOUT`, but the timeout doesn't stop the package-manager commands already running. On apt, `/status` and dry-run requests share one running update check (`apt-get update` when the cache is stale, then `apt-get -s dist-upgrade`). A request that arrives while a check is running, including a retry after a 408, waits for that check instead of starting another one.
+`GET /status` never runs the package manager. The daemon checks for updates in the background (`apt-get update` + `apt-get -s dist-upgrade`, or `brew update` + `brew outdated`) at startup, every `package_manager.update_interval_mins`, and after each full upgrade; `/status` returns the latest result.
+
+Requests that take longer than 300 seconds get `408 REQUEST_TIMEOUT`, but the timeout doesn't stop the package-manager commands already running. On apt, dry-run requests and the background check share one running update check. A request that arrives while a check is running, including a retry after a 408, waits for that check instead of starting another one.
 
 ### `POST /packages/full-upgrade`
 

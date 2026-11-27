@@ -345,7 +345,8 @@ features:
   auto_remove: false
 
 package_manager:
-  # Package manager cache update interval in minutes (default: 360)
+  # Minutes between background update checks (`apt-get update` / `brew update`).
+  # GET /status returns the latest result. Minimum 1 (default: 360)
   update_interval_mins: 360
 "#
 }
@@ -406,6 +407,13 @@ pub fn validate_config(config: &DaemonConfig) -> ValidationReport {
         if port == 0 {
             report.errors.push("server.port cannot be 0".to_string());
         }
+    }
+
+    if config.package_manager.update_interval_mins == 0 {
+        report.errors.push(
+            "package_manager.update_interval_mins must be at least 1 (updates are checked in the background on this interval)"
+                .to_string(),
+        );
     }
 
     match allowed_client_fingerprints(&config.tls) {
@@ -885,6 +893,28 @@ server:
         let config = config_with_allowed_clients(None);
         let yaml = serde_yaml_ng::to_string(&config).unwrap();
         assert!(!yaml.contains("allowed_clients"));
+    }
+
+    #[test]
+    fn test_update_interval_must_be_at_least_one_minute() {
+        let mut config = config_with_allowed_clients(None);
+        config.package_manager.update_interval_mins = 0;
+        let report = validate_config(&config);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("update_interval_mins must be at least 1"))
+        );
+
+        config.package_manager.update_interval_mins = 1;
+        let report = validate_config(&config);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| e.contains("update_interval_mins"))
+        );
     }
 
     #[test]

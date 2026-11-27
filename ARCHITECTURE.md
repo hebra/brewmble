@@ -71,7 +71,7 @@ Security is handled exclusively via mutual TLS (mTLS); there are no API keys.
 1. User executes `brewmble status --all`.
 2. CLI browses mDNS to find all `brewmbled` instances.
 3. For each discovered instance, the CLI sends a `GET /status` request (concurrently).
-4. Each `brewmbled` queries the local package manager. On Linux, it runs `apt-get update` (on macOS, `brew update`) only if the cache is older than the configured `package_manager.update_interval_mins` (default: 360 minutes). It then runs `apt-get -s dist-upgrade` (or the Homebrew equivalent) to determine available updates.
+4. Each `brewmbled` returns the result of its latest background update check without running the package manager. A background task runs `apt-get update` + `apt-get -s dist-upgrade` (on macOS, `brew update` + `brew outdated`) at startup, every `package_manager.update_interval_mins` (default: 360 minutes, minimum 1), and after each full upgrade.
 5. `brewmbled` returns a JSON response with the update count and details.
 6. CLI aggregates and displays the results in a formatted table.
 
