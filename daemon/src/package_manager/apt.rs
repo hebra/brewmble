@@ -42,18 +42,6 @@ impl Apt {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
     }
-
-    async fn run_async_with_env(
-        &self,
-        program: &'static str,
-        args: &'static [&'static str],
-        env: Vec<(String, String)>,
-    ) -> io::Result<Output> {
-        let runner = self.runner.clone();
-        tokio::task::spawn_blocking(move || runner.run_with_env(program, args, &env))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-    }
 }
 
 impl Default for Apt {
@@ -61,6 +49,17 @@ impl Default for Apt {
         Self::new(false, false, 360)
     }
 }
+
+/// Must match the `dist-upgrade` entry of the documented sudoers rule exactly.
+pub(crate) const FULL_UPGRADE_SUDO_ARGS: &[&str] = &[
+    "apt-get",
+    "dist-upgrade",
+    "-y",
+    "-o",
+    "Dpkg::Options::=--force-confdef",
+    "-o",
+    "Dpkg::Options::=--force-confold",
+];
 
 #[async_trait]
 impl PackageManager for Apt {
@@ -177,22 +176,9 @@ impl PackageManager for Apt {
 
     async fn full_upgrade(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("starting apt full upgrade");
-        let env = vec![("DEBIAN_FRONTEND".to_string(), "noninteractive".to_string())];
-        let output = self
-            .run_async_with_env(
-                "sudo",
-                &[
-                    "apt-get",
-                    "dist-upgrade",
-                    "-y",
-                    "-o",
-                    "Dpkg::Options::=--force-confdef",
-                    "-o",
-                    "Dpkg::Options::=--force-confold",
-                ],
-                env,
-            )
-            .await;
+        // No DEBIAN_FRONTEND: sudo's env_reset would drop it, and without a tty
+        // debconf already falls back to the defaults (see daemon/README.md).
+        let output = self.run_async("sudo", FULL_UPGRADE_SUDO_ARGS).await;
 
         match output {
             Ok(output) => {
@@ -663,5 +649,22 @@ mod tests {
         let c = calls.lock().unwrap();
         assert!(c.iter().any(|s| s.contains("apt-get dist-upgrade")));
         assert!(c.iter().any(|s| s.contains("apt-get autoclean")));
+    }
+
+    #[test]
+    fn test_full_upgrade_command_matches_documented_sudoers_rule() {
+        let readme = include_str!("../../README.md");
+        let documented = "/usr/bin/apt-get dist-upgrade -y -o Dpkg\\:\\:Options\\:\\:=--force-confdef -o Dpkg\\:\\:Options\\:\\:=--force-confold,";
+        assert!(readme.contains(documented));
+        let expected = documented
+            .trim_start_matches("/usr/bin/")
+            .trim_end_matches(',')
+            .replace("\\:", ":");
+        assert_eq!(FULL_UPGRADE_SUDO_ARGS.join(" "), expected);
+        assert!(
+            !FULL_UPGRADE_SUDO_ARGS
+                .iter()
+                .any(|a| a.contains("DEBIAN_FRONTEND"))
+        );
     }
 }
