@@ -755,16 +755,24 @@ fn mdns_properties(hostname: &str) -> Vec<(&str, &str)> {
 
 /// mDNS instance name: `brewmbled-{first label}`, plus a short hash of the full
 /// hostname when it has more labels, so `node1.a.example` and `node1.b.example`
-/// don't collide on the same LAN.
+/// don't collide on the same LAN. The first label is shortened as needed to keep
+/// the name within the 63-byte DNS label limit.
 fn mdns_instance_name(hostname: &str) -> String {
     use sha2::{Digest, Sha256};
+    const MAX_DNS_LABEL_LEN: usize = 63;
 
     let hostname = hostname.trim_end_matches('.');
     match hostname.split_once('.') {
         Some((first_label, _)) => {
             let digest = Sha256::digest(hostname.to_ascii_lowercase().as_bytes());
             let suffix: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
-            format!("brewmbled-{first_label}-{suffix}")
+            let mut end = first_label
+                .len()
+                .min(MAX_DNS_LABEL_LEN - "brewmbled--".len() - suffix.len());
+            while !first_label.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("brewmbled-{}-{suffix}", &first_label[..end])
         }
         None => format!("brewmbled-{hostname}"),
     }
@@ -1980,6 +1988,13 @@ mod tests {
             mdns_instance_name("node1.Rack-A.Example"),
             "the hash ignores DNS case"
         );
+
+        let long_label = "n".repeat(50);
+        let long_a = mdns_instance_name(&format!("{long_label}.rack-a.example"));
+        let long_b = mdns_instance_name(&format!("{long_label}.rack-b.example"));
+        assert_eq!(long_a.len(), 63);
+        assert!(long_a.starts_with(&format!("brewmbled-{}-", "n".repeat(44))));
+        assert_ne!(long_a, long_b);
     }
 
     #[test]
